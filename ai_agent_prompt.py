@@ -21,6 +21,7 @@ import locale
 import signal
 import sys
 import difflib, re
+import threading
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -373,7 +374,11 @@ def smart_decode(data):
 
 
 def run_bash(command, timeout=10):
-    """执行一条 bash 命令，打印人类可读结果，返回 json.dumps 后的字符串"""
+    """执行一条 bash 命令，打印人类可读结果，返回 json.dumps 后的字符串
+    
+    使用 Popen + 进程组 + watchdog 线程实现真正的超时机制，
+    即使用户跑了交互命令（top、python、read 等）也能强制结束。
+    """
     global interrupted
     # 🛡️ 类型护盾！防止 DeepSeek 模型乱传参数
     if not isinstance(command, str) or not command.strip():
@@ -392,16 +397,117 @@ def run_bash(command, timeout=10):
         return json.dumps(result_dict)
 
     print(f"\n🔮 发动魔法，咒语: {command}, 超时时间: {timeout}s\n", flush=True)
+
+    # ====== 新方案：使用 Popen + 进程组 + watchdog 线程 ======
     try:
-        result = subprocess.run(
+        # 创建子进程，设置新的进程组，这样我们可以杀整个进程树
+        # Unix: 用 preexec_fn=os.setsid 创建新会话（进程组）
+        # Windows: 用 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+        extra_kwargs = {}
+        if sys.platform == "win32":
+            extra_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            extra_kwargs["preexec_fn"] = os.setsid
+        proc = subprocess.Popen(
             command,
             shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **extra_kwargs
         )
-        stdout = smart_decode(result.stdout)
-        stderr = smart_decode(result.stderr)
-        code = result.returncode
+
+        result_container = {
+            "stdout": b"",
+            "stderr": b"",
+            "timed_out": False,
+            "exception": None
+        }
+
+        def watchdog():
+            """看门狗线程：超时后强杀进程组"""
+            import time as _time
+            _time.sleep(timeout)
+            if proc.poll() is None:
+                # 进程还在跑，强杀！
+                result_container["timed_out"] = True
+                try:
+                    # 先尝试杀进程树
+                    if sys.platform == "win32":
+                        # Windows: 用 taskkill 杀进程树
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=5
+                        )
+                    else:
+                        # Unix/Linux: 杀进程组（负 PID 表示进程组）
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    # 如果上面失败，至少杀进程自己
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                # 确保读取剩余输出（防止管道死锁）
+                try:
+                    stdout_remain, stderr_remain = proc.communicate(timeout=3)
+                    if result_container["stdout"] == b"":
+                        result_container["stdout"] = stdout_remain
+                    if result_container["stderr"] == b"":
+                        result_container["stderr"] = stderr_remain
+                except Exception:
+                    pass
+
+        # 启动看门狗线程
+        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        watchdog_thread.start()
+
+        # 主线程读取输出（有超时机制在 watchdog 里）
+        try:
+            stdout_data, stderr_data = proc.communicate(timeout=timeout + 5)
+            result_container["stdout"] = stdout_data
+            result_container["stderr"] = stderr_data
+        except subprocess.TimeoutExpired:
+            # communicate 超时，但 watchdog 已经或即将杀掉进程
+            # 等待进程结束
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # 实在等不到就暴力
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                proc.wait()
+            # 读取剩余输出
+            try:
+                stdout_data, stderr_data = proc.communicate(timeout=3)
+                if result_container["stdout"] == b"":
+                    result_container["stdout"] = stdout_data
+                if result_container["stderr"] == b"":
+                    result_container["stderr"] = stderr_data
+            except Exception:
+                pass
+
+        # 等待看门狗线程结束（最多等 2 秒）
+        watchdog_thread.join(timeout=2)
+
+        if result_container["timed_out"]:
+            stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
+            stderr = smart_decode(result_container["stderr"]) if result_container["stderr"] else ""
+            result_dict = {"stdout": stdout, "stderr": f"命令执行超时（{timeout}秒），已强制终止\n{stderr}".strip(), "code": -1}
+            print(
+                f"魔法结果:\n    \n"
+                f"魔法报错:\n    命令执行超时（{timeout}秒），已强制终止\n"
+                f"退出状态: -1",
+                flush=True
+            )
+            return json.dumps(result_dict)
+
+        # 正常完成
+        stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
+        stderr = smart_decode(result_container["stderr"]) if result_container["stderr"] else ""
+        code = proc.returncode
         result_dict = {
             "stdout": stdout,
             "stderr": stderr,
@@ -416,16 +522,7 @@ def run_bash(command, timeout=10):
             flush=True
         )
         return json.dumps(result_dict)
-    except subprocess.TimeoutExpired:
-        result_dict = {"stdout": "", "stderr": f"命令执行超时（{timeout}秒）", "code": -1}
-        print(
-            "魔法结果:\n    \n"
-            "魔法报错:\n"
-            f"    命令执行超时（{timeout}秒）\n"
-            "退出状态: -1",
-            flush=True
-        )
-        return json.dumps(result_dict)
+
     except Exception as e:
         result_dict = {"stdout": "", "stderr": f"命令执行异常: {str(e)}", "code": -2}
         print(
