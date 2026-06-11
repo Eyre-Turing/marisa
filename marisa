@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# 脚本所在目录（不 cd，让用户可以在任意目录下使用）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+export PYTHONUTF8=1
+export PYTHONUNBUFFERED=1
+
+# 检测 Python
+_PYTHON=""
+if type python3 >/dev/null 2>&1; then
+    _PYTHON="python3"
+elif type python >/dev/null 2>&1; then
+    _PYTHON="python"
+else
+    echo "DA☆ZE☆！既没找到 python3 也没找到 python，这可没法施法了！"
+    exit 1
+fi
+
+# 检测 winpty（可选，用来绕过 MSYS2 管道缓冲）
+_WINPTY=""
+if type winpty >/dev/null 2>&1; then
+    _WINPTY="winpty"
+fi
+
+# 发动魔法！
+$_WINPTY $_PYTHON "$SCRIPT_DIR/ai_agent_prompt.py"
