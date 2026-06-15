@@ -324,7 +324,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "edit_file_match",
-            "description": "通过内容锚定来编辑文件！传入要匹配的旧内容（作为锚定）和新内容（替换后的内容），工具会自动在文件中找到唯一匹配的位置进行替换。如果匹配不到或匹配到多个位置会报错，并返回详细信息供AI调整。替代 edit_file_lines 在不确定行号时使用。注意：只有当你能确定文件中有且仅有一处匹配时才使用此工具！",
+            "description": "通过内容锚定来编辑文件，可以理解为类似执行伪代码 file(filename).replace(old_content, new_content) ，把文件里的旧内容完全替换为新内容。传入要匹配的旧内容（作为锚定）和新内容（替换后的内容），工具会自动在文件中找到唯一匹配的位置进行替换。如果匹配不到或匹配到多个位置会报错，并返回详细信息供AI调整。替代 edit_file_lines 在不确定行号时使用。注意：只有当你能确定文件中有且仅有一处匹配时才使用此工具！",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -334,11 +334,11 @@ tools = [
                     },
                     "old_content": {
                         "type": "string",
-                        "description": "用于锚定位置的旧内容，必须精确匹配文件中的一段连续文本，且只能匹配到唯一位置"
+                        "description": "用于锚定位置的旧内容，必须精确匹配文件中的一段连续文本，且只能匹配到唯一位置。这部分内容会完全替换为new_content的内容"
                     },
                     "new_content": {
                         "type": "string",
-                        "description": "替换成的新内容，将替换 old_content 匹配到的位置"
+                        "description": "替换成的新内容，将替换 old_content 匹配到的位置。会完全替换old_content的内容，所以如果old_content如果仅做为锚定而不想修改，请在这个参数里把old_content的内容也带上"
                     }
                 },
                 "required": ["filename", "old_content", "new_content"]
@@ -1089,6 +1089,14 @@ def main():
                             "arguments": json.dumps(args)
                         }
                     })
+
+                # 🛡️ 防御：如果tool_calls_list是空的，当作没有tool_calls处理
+                if not tool_calls_list:
+                    assistant_msg = {"role": "assistant", "content": content}
+                    if reasoning_content:
+                        assistant_msg["reasoning_content"] = reasoning_content
+                    messages.append(assistant_msg)
+                    break
 
                 assistant_msg = {
                     "role": "assistant",
