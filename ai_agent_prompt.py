@@ -37,7 +37,8 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_agent
 DEFAULT_CONFIG = {
     "api_key": "",
     "base_url": "https://api.deepseek.com",
-    "model": "deepseek-chat"
+    "model": "deepseek-chat",
+    "protocol": "openai"
 }
 
 _config_cache = None
@@ -62,7 +63,7 @@ def load_config(force_reload=False):
             need_save = True
 
     # 检查必要字段，缺失则提示输入
-    for key in ["api_key", "base_url", "model"]:
+    for key in ["api_key", "base_url", "model", "protocol"]:
         if key not in config or not config[key]:
             need_save = True
             if key == "api_key":
@@ -79,6 +80,14 @@ def load_config(force_reload=False):
                 print(f"🤖 请选择模型名称 (model) [默认: {default}]：", end="", flush=True)
                 value = sys.stdin.readline().strip()
                 config[key] = value if value else default
+            elif key == "protocol":
+                default = DEFAULT_CONFIG["protocol"]
+                print(f"🔄 请选择协议 (protocol) [默认: {default}, 支持 openai / anthropic]：", end="", flush=True)
+                value = sys.stdin.readline().strip().lower()
+                if value and value in ("openai", "anthropic"):
+                    config[key] = value
+                else:
+                    config[key] = default
 
     if need_save:
         save_config(config)
@@ -159,13 +168,27 @@ def get_context_aware_messages(msg_list):
 # ============================================================
 #  1. 调用 DeepSeek Chat API（纯标准库，不依赖 openai）
 # ============================================================
-def call_deepseek_api(messages, tools=None, tool_choice="auto"):
-    """直接构造 HTTP 请求调用 API（从 ai_agent_config.json 读取参数）"""
+def call_api(messages, tools=None, tool_choice="auto"):
+    """
+    根据配置中的 protocol 字段，调用 OpenAI 风格或 Anthropic 风格的 API。
+    直接构造 HTTP 请求（从 ai_agent_config.json 读取参数）。
+    """
     config = load_config()
     api_key = config.get("api_key")
     if not api_key:
         raise ValueError("API 密钥未配置！请检查 ai_agent_config.json 文件。")
 
+    protocol = config.get("protocol", "openai").lower()
+
+    if protocol == "anthropic":
+        return _call_anthropic_api(config, messages, tools)
+    else:
+        return _call_openai_api(config, messages, tools, tool_choice)
+
+
+def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
+    """OpenAI 风格 API 调用（兼容 DeepSeek 等）"""
+    api_key = config["api_key"]
     url = config.get("base_url", DEFAULT_CONFIG["base_url"]).rstrip("/")
     if not url.endswith("/chat/completions"):
         if url.endswith("/v1"):
@@ -209,6 +232,193 @@ def call_deepseek_api(messages, tools=None, tool_choice="auto"):
 
     return msg, reasoning_content
 
+
+def _call_anthropic_api(config, messages, tools=None):
+    """
+    Anthropic 风格 API 调用。
+    将内部 OpenAI 格式的 messages 转换为 Anthropic 格式，
+    并处理响应中的 tool_use content blocks。
+    """
+    api_key = config["api_key"]
+    url = config.get("base_url", "https://api.anthropic.com").rstrip("/")
+    if not url.endswith("/messages"):
+        if url.endswith("/v1"):
+            url = url + "/messages"
+        else:
+            url = url + "/v1/messages"
+
+    model = config.get("model", "claude-3-5-sonnet-20241022")
+
+    # ---------- 转换消息格式 ----------
+    # Anthropic 的 system prompt 是单独参数，不在 messages 里
+    system_prompt = None
+    anthropic_messages = []
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "system":
+            # Anthropic 的 system 是顶层参数
+            system_prompt = content
+            continue
+        elif role == "user":
+            # 检查是否是 tool_result（Anthropic 的 tool_result 用 role: user + content blocks）
+            if isinstance(content, list):
+                # 已经是 Anthropic 格式的 content blocks，直接使用
+                anthropic_messages.append({"role": "user", "content": content})
+            else:
+                anthropic_messages.append({"role": "user", "content": content})
+        elif role == "assistant":
+            # 检查是否有 tool_calls
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                # 构建 Anthropic 格式的 content blocks
+                content_blocks = []
+                if content:
+                    content_blocks.append({"type": "text", "text": content})
+                for tc in tool_calls:
+                    try:
+                        tc_args = json.loads(tc["function"]["arguments"])
+                    except (json.JSONDecodeError, KeyError):
+                        tc_args = {}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "input": tc_args
+                    })
+                anthropic_messages.append({"role": "assistant", "content": content_blocks})
+            else:
+                anthropic_messages.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            # 将 OpenAI 的 tool role 转换为 Anthropic 的 user role + tool_result block
+            tool_call_id = msg.get("tool_call_id", "")
+            tool_name = msg.get("name", "")
+            tool_content = msg.get("content", "")
+            
+            # 尝试解析 tool_content 为 JSON（因为我们的工具返回的都是 JSON 字符串）
+            try:
+                tool_content_parsed = json.loads(tool_content)
+                # 如果是 JSON 对象，提取关键信息供 Anthropic 使用
+                if isinstance(tool_content_parsed, dict):
+                    anthropic_messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_call_id,
+                                "content": tool_content
+                            }
+                        ]
+                    })
+                else:
+                    anthropic_messages.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_call_id,
+                                "content": str(tool_content_parsed)
+                            }
+                        ]
+                    })
+            except (json.JSONDecodeError, TypeError):
+                # 不是 JSON，直接当文本
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_call_id,
+                            "content": tool_content
+                        }
+                    ]
+                })
+
+    # ---------- 转换工具定义 ----------
+    anthropic_tools = None
+    if tools:
+        anthropic_tools = []
+        for tool in tools:
+            if tool.get("type") == "function":
+                func = tool.get("function", {})
+                anthropic_tools.append({
+                    "name": func.get("name", ""),
+                    "description": func.get("description", ""),
+                    "input_schema": func.get("parameters", {"type": "object", "properties": {}})
+                })
+
+    # ---------- 构建请求体 ----------
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01"
+    }
+
+    payload = {
+        "model": model,
+        "max_tokens": 8192,
+        "messages": anthropic_messages,
+    }
+    if system_prompt:
+        payload["system"] = system_prompt
+    if anthropic_tools:
+        payload["tools"] = anthropic_tools
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Anthropic API 请求失败 (HTTP {e.code}): {error_body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {e.reason}")
+
+    # ---------- 转换响应为 OpenAI 格式（方便上层统一处理） ----------
+    # Anthropic 响应结构：
+    # {
+    #   "content": [{"type": "text", "text": "..."}, {"type": "tool_use", "id": "...", "name": "...", "input": {...}}],
+    #   "role": "assistant",
+    #   ...
+    # }
+    
+    msg = {"role": "assistant", "content": "", "tool_calls": None}
+    reasoning_content = None
+
+    content_blocks = result.get("content", [])
+    text_parts = []
+    tool_calls_list = []
+
+    for block in content_blocks:
+        block_type = block.get("type", "")
+        if block_type == "text":
+            text_parts.append(block.get("text", ""))
+        elif block_type == "tool_use":
+            tool_calls_list.append({
+                "id": block.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {}))
+                }
+            })
+
+    msg["content"] = "".join(text_parts)
+    if tool_calls_list:
+        msg["tool_calls"] = tool_calls_list
+
+    # 提取 stop_reason 作为额外信息
+    stop_reason = result.get("stop_reason", "")
+    if stop_reason == "end_turn":
+        pass  # 正常结束
+    elif stop_reason == "tool_use":
+        pass  # 有工具调用，已处理
+
+    return msg, reasoning_content
 
 # ============================================================
 #  2. 工具定义 & 执行
@@ -1046,7 +1256,7 @@ def main():
                     # ✨ 关键改动：使用 get_context_aware_messages 包装
                     # 如果上下文超过阈值，会自动追加一条 system 提醒
                     api_messages = get_context_aware_messages(messages)
-                    msg, reasoning_content = call_deepseek_api(api_messages, tools=tools)
+                    msg, reasoning_content = call_api(api_messages, tools=tools)
                 except Exception as e:
                     print(f"\n💥 API调用翻车了: {e}\n", flush=True)
                     break
