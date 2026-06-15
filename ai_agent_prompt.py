@@ -968,6 +968,8 @@ def create_prompt_session():
         # 在提示语中说明操作方式
         prompt_continuation="   ",
     )
+
+    session.app.paste_mode = lambda: True
     
     return session
 
