@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 兴趣使然的AI Agent —— 魔理沙风格
 使用 prompt_toolkit 支持多行输入！
@@ -486,6 +487,31 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "read_file_lines",
+            "description": "读取文件中指定行范围的内容，返回带行号的文本。行号从1开始。用于在编辑文件前确认某几行的实际内容，或配合 edit_file_match 的模糊匹配结果来定位精确文本。返回为一个json，有filename、content、start_line、end_line、total_lines、success、err字段。content为带行号前缀的文本（格式如 '  1 | hello'），方便确认行号和内容对应关系",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "欲读取文件的完整文件名"
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "起始行号（从1开始），不传则默认为1"
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "结束行号（包含，从1开始），不传则默认为文件末尾"
+                    }
+                },
+                "required": ["filename"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "compress",
             "description": "压缩对话历史！传入压缩后的完整 messages 列表来替换当前对话历史（会清空旧历史）。注意：①必须保留 system prompt 作为第一条消息！②建议保留最近 2-3 轮完整对话以确保连贯性，更早的内容用一段摘要替代。③摘要中要涵盖之前讨论过的关键信息。",
             "parameters": {
@@ -505,7 +531,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "edit_file_lines",
-            "description": "编辑文件中指定行范围的内容，并以 git diff 风格展示改动。行号从1开始计数。修改前会备份原始行内容，成功返回 unified diff 格式的差异。注意：只有当你完全确认原文件待改动的开始行号和结束行号时才可以使用此工具。",
+            "description": "编辑文件中指定行范围的内容，并以 git diff 风格展示改动。行号从1开始计数。成功返回 unified diff 格式的差异。⚠️重要提示：①如果之前读取过文件但之后又做过编辑，行号可能已变化，请先用 read_file_lines 重新确认行号。②不要连续多次编辑同一文件而不重新读取——行号会漂移。③如果不确定行号，请改用 edit_file_match 工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -534,7 +560,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "edit_file_match",
-            "description": "通过内容锚定来编辑文件，可以理解为类似执行伪代码 file(filename).replace(old_content, new_content) ，把文件里的旧内容完全替换为新内容。传入要匹配的旧内容（作为锚定）和新内容（替换后的内容），工具会自动在文件中找到唯一匹配的位置进行替换。如果匹配不到或匹配到多个位置会报错，并返回详细信息供AI调整。替代 edit_file_lines 在不确定行号时使用。注意：只有当你能确定文件中有且仅有一处匹配时才使用此工具！",
+            "description": "通过内容锚定来编辑文件，类似执行伪代码 file(filename).replace(old_content, new_content)。工具会在文件中找到唯一匹配 old_content 的位置并替换为 new_content。如果匹配不到会自动做模糊搜索，返回最相似位置的实际内容供你调整。⚠️重要技巧：①请先用 read_full_file 或 read_file_lines 读取文件，然后从返回结果中**原样复制**要修改的那段文本作为 old_content——不要自己手写 old_content，否则极易因空格/缩进差异导致匹配失败。②如果匹配到多个位置，会报错并列出所有匹配行号，请用 read_file_lines 查看后扩大 old_content 上下文使其唯一。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -544,11 +570,11 @@ tools = [
                     },
                     "old_content": {
                         "type": "string",
-                        "description": "用于锚定位置的旧内容，必须精确匹配文件中的一段连续文本，且只能匹配到唯一位置。这部分内容会完全替换为new_content的内容"
+                        "description": "文件中要被替换的那段原文。必须与文件中的内容完全一致（包括空格、缩进、换行）。强烈建议从 read_full_file 或 read_file_lines 的返回结果中复制，不要自己手写"
                     },
                     "new_content": {
                         "type": "string",
-                        "description": "替换成的新内容，将替换 old_content 匹配到的位置。会完全替换old_content的内容，所以如果old_content如果仅做为锚定而不想修改，请在这个参数里把old_content的内容也带上"
+                        "description": "替换成的新内容。会完全替换 old_content 匹配到的位置，所以如果 old_content 中有不需修改的部分，请在新内容中也保留那些部分"
                     }
                 },
                 "required": ["filename", "old_content", "new_content"]
@@ -815,6 +841,84 @@ def read_full_file(filename):
         return json.dumps(result_dict)
 
 
+def read_file_lines(filename, start_line=1, end_line=None):
+    """读取文件指定行范围，返回带行号的内容，返回 json.dumps 后的字符串"""
+    global interrupted
+    if interrupted:
+        result_dict = {"filename": filename, "content": "", "start_line": 0, "end_line": 0, "total_lines": 0, "success": 0, "err": "用户中断了魔法吟唱"}
+        print(f"\n{result_dict['err']}\n", flush=True)
+        return json.dumps(result_dict)
+
+    # 类型护盾
+    if not isinstance(filename, str) or not filename.strip():
+        result_dict = {"filename": str(filename), "content": "", "start_line": 0, "end_line": 0, "total_lines": 0, "success": 0, "err": f"无效的filename参数: {repr(filename)}"}
+        print(f"\n{result_dict['err']}\n", flush=True)
+        return json.dumps(result_dict)
+
+    try:
+        start_line = int(start_line) if start_line is not None else 1
+    except (TypeError, ValueError):
+        start_line = 1
+
+    try:
+        with open(filename, "rb") as f:
+            raw_data = f.read()
+        content = smart_decode(raw_data)
+        all_lines = content.splitlines(keepends=True)
+        total_lines = len(all_lines)
+
+        # 处理 end_line 默认值和类型
+        if end_line is None:
+            end_line = total_lines
+        else:
+            try:
+                end_line = int(end_line)
+            except (TypeError, ValueError):
+                end_line = total_lines
+
+        # 范围校验
+        if start_line < 1:
+            start_line = 1
+        if end_line < start_line:
+            end_line = start_line
+        actual_end = min(end_line, total_lines)
+
+        # 构建带行号前缀的内容
+        selected = all_lines[start_line-1:actual_end]
+        # 计算行号的宽度，用于对齐
+        width = len(str(actual_end))
+        numbered_lines = []
+        for i, line in enumerate(selected, start=start_line):
+            # 去掉行尾换行再加，保证格式统一
+            numbered_lines.append(f"{i:>{width}} | {line.rstrip(chr(10)).rstrip(chr(13))}")
+        numbered_content = '\n'.join(numbered_lines)
+
+        result_dict = {
+            "filename": filename,
+            "content": numbered_content,
+            "start_line": start_line,
+            "end_line": actual_end,
+            "total_lines": total_lines,
+            "success": 1,
+            "err": ""
+        }
+        print(
+            f"读取文件行: {filename} (第{start_line}~{actual_end}行, 共{total_lines}行)\n"
+            f"是否成功: 1",
+            flush=True
+        )
+        return json.dumps(result_dict)
+    except Exception as e:
+        result_dict = {"filename": filename, "content": "", "start_line": 0, "end_line": 0, "total_lines": 0, "success": 0, "err": str(e)}
+        print(
+            f"读取文件行: {filename}\n"
+            f"是否成功: 0\n"
+            f"报错: {str(e)}",
+            flush=True
+        )
+        return json.dumps(result_dict)
+
+
 def compress(compressed_messages):
     """
     压缩上下文工具！
@@ -1029,19 +1133,58 @@ def edit_file_match(filename, old_content, new_content):
         count = original_text.count(old_content)
         
         if count == 0:
-            # 没找到！报错并给出文件的部分内容供AI参考
-            # 显示文件的前后各一部分，帮助AI调试
-            preview = ""
-            if len(original_text) > 500:
-                preview = original_text[:250] + "\n......\n" + original_text[-250:]
+            # 没找到精确匹配！做模糊搜索，找最相似的位置
+            file_lines = original_text.splitlines()
+            old_lines_stripped = [l.strip() for l in old_content.splitlines()]
+            old_line_count = len(old_lines_stripped)
+
+            best_ratio = 0
+            best_start = -1
+            best_actual = ""
+
+            if old_line_count > 0 and len(file_lines) >= old_line_count:
+                # 滑动窗口：对每个可能的起始行，比较相同行数的片段
+                for i in range(len(file_lines) - old_line_count + 1):
+                    candidate_lines = file_lines[i:i + old_line_count]
+                    candidate_text = '\n'.join(candidate_lines)
+                    ratio = difflib.SequenceMatcher(
+                        None, candidate_text, old_content.strip()
+                    ).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_start = i + 1  # 转为1-based行号
+                        best_actual = '\n'.join(candidate_lines)
+
+            if best_ratio > 0.5 and best_start > 0:
+                # 找到了较相似的位置，返回实际内容供模型调整
+                # 展示匹配位置前后各2行的带行号上下文
+                ctx_start = max(0, best_start - 3)
+                ctx_end = min(len(file_lines), best_start - 1 + old_line_count + 2)
+                width = len(str(ctx_end))
+                numbered_context = '\n'.join(
+                    f"{i+1:>{width}} | {file_lines[i]}"
+                    for i in range(ctx_start, ctx_end)
+                )
+                err_msg = (
+                    f"在文件 {filename} 中未找到精确匹配，但发现最相似位置（相似度{best_ratio:.0%}）\n"
+                    f"最相似位置: 第{best_start}~{best_start + old_line_count - 1}行\n"
+                    f"该位置的实际内容（带行号上下文）:\n{numbered_context}\n\n"
+                    f"你提供的 old_content:\n{old_content[:500]}{'...' if len(old_content) > 500 else ''}\n\n"
+                    f"请使用 read_file_lines 读取上述行号的精确内容，然后用实际内容作为 old_content 重新调用。"
+                )
             else:
-                preview = original_text
-            err_msg = (
-                f"在文件 {filename} 中未找到匹配的内容！\n"
-                f"要匹配的内容: {repr(old_content[:100])}{'...' if len(old_content) > 100 else ''}\n"
-                f"请检查 old_content 是否与文件中的内容完全一致（包括空格、缩进、换行符等）。\n"
-                f"以下为文件内容预览（前后各250字符）：\n{preview}"
-            )
+                # 相似度太低或文件比 old_content 行数还少，回退到原始预览
+                preview = ""
+                if len(original_text) > 500:
+                    preview = original_text[:250] + "\n......\n" + original_text[-250:]
+                else:
+                    preview = original_text
+                err_msg = (
+                    f"在文件 {filename} 中未找到匹配的内容，且模糊搜索也未发现相似位置！\n"
+                    f"要匹配的内容: {repr(old_content[:100])}{'...' if len(old_content) > 100 else ''}\n"
+                    f"请检查 old_content 是否与文件中的内容完全一致（包括空格、缩进、换行符等）。\n"
+                    f"以下为文件内容预览（前后各250字符）：\n{preview}"
+                )
             result_dict = {"filename": filename, "success": 0, "err": err_msg, "diff": ""}
             print(f"\n{result_dict['err']}\n", flush=True)
             return json.dumps(result_dict)
@@ -1065,8 +1208,7 @@ def edit_file_match(filename, old_content, new_content):
                 f"在文件 {filename} 中找到 {count} 处匹配的内容！\n"
                 f"要匹配的内容: {repr(old_content[:100])}{'...' if len(old_content) > 100 else ''}\n"
                 f"匹配到的位置（行号）: {positions}\n"
-                f"请提供更精确的 old_content（增加更多上下文内容以确保唯一匹配），"
-                f"或者使用 edit_file_lines 工具（如果知道精确行号）进行修改。"
+                f"请用 read_file_lines 查看这些位置的实际内容，然后扩大 old_content 的上下文使其唯一匹配。"
             )
             result_dict = {"filename": filename, "success": 0, "err": err_msg, "diff": ""}
             print(f"\n{result_dict['err']}\n", flush=True)
@@ -1146,6 +1288,7 @@ tool_func_map = {
     "run_bash": run_bash,
     "write_full_file": write_full_file,
     "read_full_file": read_full_file,
+    "read_file_lines": read_file_lines,
     "compress": compress,
     "edit_file_lines": edit_file_lines,
     "edit_file_match": edit_file_match,
@@ -1343,7 +1486,12 @@ def main():
                     # 判断是否是终止型工具（如 compress）
                     is_terminal = tool_name in TERMINAL_TOOLS
 
-                    tool_result = func(**args)
+                    # 🔧 try-except 容错：大模型传错参数名时把报错返回给它自己整改
+                    try:
+                        tool_result = func(**args)
+                    except (TypeError, Exception) as e:
+                        tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
+                        print(f"\n⚠️ 工具 {tool_name} 调用失败: {e}\n", flush=True)
 
                     # 如果被中断了，不把结果加入对话
                     if interrupted:
