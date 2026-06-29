@@ -23,6 +23,8 @@ import signal
 import sys
 import difflib, re
 import threading
+import datetime
+import pathlib
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -167,6 +169,71 @@ def get_context_aware_messages(msg_list):
 
 
 # ============================================================
+#  日志记录 — 每次 API 返回后记录 messages 快照到单个文件
+# ============================================================
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
+# 日志文件路径，在 main() 启动时初始化
+_log_file = None
+_err_log_file = None
+
+
+def _ensure_log_dir():
+    """确保 log 目录存在"""
+    pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def _timestamp():
+    """生成时间戳，格式同 date +%Y-%m-%d_%H-%M-%S_%N"""
+    now = datetime.datetime.now()
+    nanos = f"{now.microsecond:06d}000"
+    return now.strftime(f"%Y-%m-%d_%H-%M-%S") + f"_{nanos}"
+
+
+def init_logger():
+    """程序启动时初始化日志文件路径（以启动时间命名）"""
+    global _log_file, _err_log_file
+    _ensure_log_dir()
+    ts = _timestamp()
+    _log_file = os.path.join(LOG_DIR, f"{ts}.log")
+    _err_log_file = os.path.join(LOG_DIR, f"{ts}.err.log")
+    # 写一条启动标记
+    try:
+        with open(_log_file, "w", encoding="utf-8") as f:
+            f.write(f"===== Session started at {ts} =====\n")
+    except Exception:
+        pass
+
+
+def save_messages_snapshot(msg_list):
+    """把当前 messages 追加到日志文件中"""
+    if _log_file is None:
+        return
+    try:
+        data = json.dumps(msg_list, ensure_ascii=False, indent=2)
+        with open(_log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- snapshot {_timestamp()} ---\n")
+            f.write(data)
+            f.write("\n")
+    except Exception:
+        pass  # 日志写入失败不影响主流程
+
+
+def save_error_snapshot(msg_list, error_msg):
+    """出错时保存 messages 到 err 日志文件"""
+    if _err_log_file is None:
+        return
+    try:
+        data = json.dumps(msg_list, ensure_ascii=False, indent=2)
+        with open(_err_log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n--- error {_timestamp()} ---\n")
+            f.write(data)
+            f.write(f"\n===== ERROR =====\n{error_msg}\n")
+    except Exception:
+        pass  # 日志写入失败不影响主流程
+
+
+# ============================================================
 #  1. 调用 DeepSeek Chat API（纯标准库，不依赖 openai）
 # ============================================================
 def call_api(messages, tools=None, tool_choice="auto"):
@@ -181,10 +248,16 @@ def call_api(messages, tools=None, tool_choice="auto"):
 
     protocol = config.get("protocol", "openai").lower()
 
-    if protocol == "anthropic":
-        return _call_anthropic_api(config, messages, tools)
-    else:
-        return _call_openai_api(config, messages, tools, tool_choice)
+    try:
+        if protocol == "anthropic":
+            result = _call_anthropic_api(config, messages, tools)
+        else:
+            result = _call_openai_api(config, messages, tools, tool_choice)
+        return result
+    except Exception as e:
+        # 出错时保存 err 日志
+        save_error_snapshot(messages, str(e))
+        raise
 
 
 def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
@@ -1340,6 +1413,9 @@ def main():
     # 加载 API 配置（如果配置文件不存在或字段缺失，会提示用户输入）
     load_config()
 
+    # 初始化日志（以程序启动时间命名）
+    init_logger()
+
     system_prompt = (
         "你是一个兴趣使然的AI Agent，请模仿东方project的魔理沙来回复问题"
     )
@@ -1421,8 +1497,8 @@ def main():
                     if reasoning_content:
                         assistant_msg["reasoning_content"] = reasoning_content
                     messages.append(assistant_msg)
+                    save_messages_snapshot(messages)
                     break
-
                 # ---- 把tool_calls合并到一条assistant消息里 ----
                 tool_calls_list = []
                 for tool in tool_calls:
@@ -1449,8 +1525,8 @@ def main():
                     if reasoning_content:
                         assistant_msg["reasoning_content"] = reasoning_content
                     messages.append(assistant_msg)
+                    save_messages_snapshot(messages)
                     break
-
                 assistant_msg = {
                     "role": "assistant",
                     "content": content,
@@ -1464,7 +1540,7 @@ def main():
                 # ---------- 逐个执行工具 ----------
                 terminal_tool_called = False  # 标记是否调用了终止型工具
 
-                for tool in tool_calls:
+                for tool in tool_calls_list:
                     # 每次执行工具前检查中断
                     if interrupted:
                         break
@@ -1519,8 +1595,8 @@ def main():
 
                 # 如果调用了终止型工具，跳出整个工具循环
                 if terminal_tool_called:
+                    save_messages_snapshot(messages)
                     break
-
                 # 如果被中断，跳出工具循环
                 if interrupted:
                     # 从 assistant 消息位置开始全部删除，防止下轮API报400
