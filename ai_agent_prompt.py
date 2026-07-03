@@ -671,6 +671,18 @@ tools = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_code_path",
+            "description": "获取当前 AI Agent 主程序文件（ai_agent_prompt.py）所在的完整目录路径。当你需要读取或修改自己的代码、查看自己的文件结构时可以使用此工具获取基准路径。返回值为一个 json，有 path（字符串，目录路径）和 success（数字，1为成功）字段。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
 ]
 
 
@@ -678,6 +690,17 @@ tools = [
 # 因为这类工具（如 compress）会修改全局 messages 状态，
 # 后续的 tool response 追加和 API 调用会基于错误的上文继续执行
 TERMINAL_TOOLS = {"compress"}
+
+
+def get_code_path():
+    """获取当前 AI Agent 主程序文件所在的目录路径
+
+    返回一个 json 字符串，包含 path（目录路径）和 success（1为成功）字段。
+    """
+    path = os.path.dirname(os.path.abspath(__file__))
+    result = {"path": path, "success": 1}
+    print(f"\n📂 我的代码在: {path}\n", flush=True)
+    return json.dumps(result)
 
 
 def smart_decode(data):
@@ -1684,6 +1707,7 @@ tool_func_map = {
     "edit_file_lines": edit_file_lines,
     "edit_file_match": edit_file_match,
     "load_skill": load_skill,
+    "get_code_path": get_code_path,
 }
 
 
