@@ -1582,8 +1582,10 @@ def load_skill(task_description):
 
     # ---- 构造子 Agent 的 System Prompt ----
     skills_list_str = "\n".join(f"  - {s}" for s in available_skills)
+    # ---- 构造子 Agent 的 System Prompt ----
+    skills_list_str = "\n".join(f"  - {s}" for s in available_skills)
     sub_system_prompt = (
-        "你是一个技能检索助手。你的任务是根据用户描述的需求，从技能库中找出最匹配的技能并读取其内容。\n"
+        "你是一个技能检索助手。你的任务是根据用户描述的需求，从技能库中找出最匹配的技能。\n"
         "\n"
         f"可用技能文件（位于 skills/ 目录下，均为 .md 格式）：\n"
         f"{skills_list_str}\n"
@@ -1591,16 +1593,29 @@ def load_skill(task_description):
         "请按以下步骤操作：\n"
         "1. 分析用户的需求描述，判断需要哪些技能\n"
         "2. 使用 list_skills 工具查看可用技能列表（确认最新情况）\n"
-        "3. 使用 read_full_file 工具读取最匹配的一个或多个技能文件\n"
-        "4. 如果觉得需要多个技能，可以读取多个文件\n"
-        "5. 最后在回复中总结：你选择了哪些技能、为什么选择它们\n"
+        "3. 如果不确定某个技能的内容是否匹配，可以使用 read_full_file 工具读取来确认\n"
+        "4. 确定最终匹配的技能列表\n"
         "\n"
         "注意：\n"
         "- 技能文件名（不含 .md）大致反映了其内容领域\n"
-        "- 如果拿不准某个技能是否匹配，可以先读来看看内容再判断\n"
-        "- 可以同时加载多个技能（如问题涉及多个领域）\n"
+        "- 可以匹配多个技能（如问题涉及多个领域）\n"
         "- 尽量精准匹配，不要加载无关的技能\n"
+        "- 如果没有匹配的技能，matched_skills 列表返回空 []\n"
         f"- 技能文件路径格式: {SKILLS_DIR.replace(chr(92), '/')}/<技能名>.md\n"
+        "\n"
+        "### ⚠️ 重要：输出格式要求\n"
+        "\n"
+        "在完成分析后，你的最终回复**必须**按以下格式输出（纯文本，非 JSON 代码块）：\n"
+        "\n"
+        "---MATCHED_SKILLS_JSON_START---\n"
+        '{"matched_skills": ["技能名1", "技能名2"], "reasoning": "选择理由简要说明"}\n'
+        "---MATCHED_SKILLS_JSON_END---\n"
+        "\n"
+        "其中：\n"
+        "- matched_skills: 你认为匹配的技能名列表（从可用技能中选择），不匹配则为 []\n"
+        "- reasoning: 简短说明为什么选择这些技能（或为什么没有匹配）\n"
+        "\n"
+        "在 JSON 块之前可以自由发挥写分析过程，但 JSON 块必须出现在最终回复中。\n"
     )
 
     # ---- 子 Agent 的 tools（只有读相关工具 + list_skills）----
@@ -1646,7 +1661,7 @@ def load_skill(task_description):
     # ---- 构建子 Agent 的消息列表 ----
     sub_messages = [
         {"role": "system", "content": sub_system_prompt},
-        {"role": "user", "content": f"需求描述：{task}\n\n请分析上述需求，找到最匹配的技能文件并读取其内容。"}
+        {"role": "user", "content": f"需求描述：{task}\n\n请分析上述需求，确定哪些技能匹配（或没有匹配），然后按输出格式要求输出 JSON 结果。"}
     ]
 
     # ---- 子 Agent 的多轮工具调用循环 ----
@@ -1713,66 +1728,72 @@ def load_skill(task_description):
         result_dict = {"success": 0, "err": err_msg}
         return json.dumps(result_dict)
 
-    # ---- 从子 Agent 的最终回复中提取它读取了哪些技能 ----
-    # 子 Agent 最后一条 assistant 消息包含了它读取的内容和选择说明
-    # 我们直接把子 Agent 读取到的内容（通过 read_full_file 已经输出到终端了）
-    # 以及它的选择理由提取出来
+    # ---- 从子 Agent 的最终回复中提取 JSON 格式的匹配结果 ----
+    # 子 Agent 的回复格式为：
+    # ---MATCHED_SKILLS_JSON_START---
+    # {"matched_skills": ["skill1", "skill2"], "reasoning": "说明"}
+    # ---MATCHED_SKILLS_JSON_END---
 
-    # 收集子 Agent 读取过的文件内容
-    loaded_contents = []
-    loaded_skill_names = set()
-    for msg in sub_messages:
-        if msg.get("role") == "tool":
-            try:
-                data = json.loads(msg.get("content", "{}"))
-                if isinstance(data, dict) and data.get("success") == 1 and "content" in data:
-                    # 从文件名推断技能名
-                    # 文件名可能是绝对路径（含 SKILLS_DIR）或相对路径（skills/xxx.md）
-                    fname = data.get("filename", "")
-                    # 先尝试从 skills 目录名推断
-                    skill_name = None
-                    # 情况1: 绝对路径，含 SKILLS_DIR
-                    if fname.endswith(".md"):
-                        if SKILLS_DIR in fname:
-                            skill_name = os.path.basename(fname)[:-3]
-                        else:
-                            # 情况2: 相对路径如 skills/magic.md 或 magic.md
-                            basename = os.path.basename(fname)
-                            if basename.endswith(".md"):
-                                skill_name = basename[:-3]
-                    if skill_name:
-                        loaded_skill_names.add(skill_name)
-                        loaded_contents.append({
-                            "skill_name": skill_name,
-                            "content": data["content"],
-                            "size": len(data["content"])
-                        })
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    # 子 Agent 的最终总结
     final_reasoning = ""
+    matched_skills = []
+
     for msg in reversed(sub_messages):
         if msg.get("role") == "assistant" and msg.get("content", "").strip():
             final_reasoning = msg["content"]
             break
 
+    if final_reasoning:
+        # 从 final_reasoning 中提取 JSON 块
+        json_match = re.search(
+            r'---MATCHED_SKILLS_JSON_START---\s*(.*?)\s*---MATCHED_SKILLS_JSON_END---',
+            final_reasoning,
+            re.DOTALL
+        )
+        if json_match:
+            try:
+                json_str = json_match.group(1).strip()
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict) and isinstance(parsed.get("matched_skills"), list):
+                    matched_skills = parsed["matched_skills"]
+                    # 验证技能名合法性：只保留确实存在的技能
+                    available = set(_list_available_skills())
+                    matched_skills = [s for s in matched_skills if s in available]
+            except (json.JSONDecodeError, TypeError):
+                matched_skills = []
+
+    # ---- 主Agent根据子Agent的匹配结果，自己读取技能文件并加载 ----
+    loaded_contents = []
+    if matched_skills:
+        for skill_name in matched_skills:
+            skill_file = os.path.join(SKILLS_DIR, f"{skill_name}.md")
+            try:
+                with open(skill_file, "rb") as f:
+                    raw_data = f.read()
+                content = smart_decode(raw_data)
+                loaded_contents.append({
+                    "skill_name": skill_name,
+                    "content": content,
+                    "size": len(content)
+                })
+                print(f"读取技能文件: {skill_file}\n文件大小: {len(raw_data)} 字节\n是否成功: 1", flush=True)
+            except Exception as e:
+                print(f"读取技能文件: {skill_file}\n是否成功: 0\n报错: {str(e)}", flush=True)
+
     # ---- 将技能内容追加到全局 messages ----
-    if not loaded_contents:
-        # 子 Agent 没读到任何文件，但可能有总结说明
-        # 把它的最终回复作为参考信息加入
+    if not matched_skills or not loaded_contents:
+        # 没有匹配的技能，只把子Agent的分析结论加入上下文做参考
         if final_reasoning:
             messages.append({
                 "role": "system",
                 "content": f"===== 技能检索结果 =====\n\n{final_reasoning}\n\n===== 技能检索结束 ====="
             })
         result_dict = {
-            "success": 1,
-            "message": "子Agent未读取到具体技能文件，但已将其分析结论加入上下文",
+            "success": 0,
+            "message": "未找到匹配的技能（技能库中没有与需求相关的技能文件）",
             "reasoning": final_reasoning[:500] if final_reasoning else "",
             "skills_loaded": []
         }
-        print(f"   📖 子Agent分析已加入上下文（未加载具体技能文件）\n", flush=True)
+        print(f"   📖 子Agent分析已加入上下文（未找到匹配技能，success=0）\n", flush=True)
         return json.dumps(result_dict)
 
     # 将读取到的技能内容逐个追加到全局 messages
