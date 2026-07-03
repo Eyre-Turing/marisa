@@ -411,6 +411,46 @@ def _call_anthropic_api(config, messages, tools=None):
                 })
 
 
+    # ---------- 🔗 合并连续的 tool_result user 消息 ----------
+    # Anthropic API 要求：同一组 tool_use 对应的所有 tool_result 必须合并到
+    # 紧随 assistant 之后的一条 user 消息中，不能拆成多条独立的 user 消息
+    merged_anthropic_messages = []
+    i = 0
+    while i < len(anthropic_messages):
+        msg = anthropic_messages[i]
+        if msg["role"] == "user":
+            content_blocks = msg.get("content", "")
+            if isinstance(content_blocks, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content_blocks
+            ):
+                # 这是一条 tool_result 消息，检查后面是否还有连续的 tool_result 消息
+                merged_blocks = list(content_blocks)
+                j = i + 1
+                while j < len(anthropic_messages):
+                    next_msg = anthropic_messages[j]
+                    if next_msg["role"] == "user":
+                        next_content = next_msg.get("content", "")
+                        if isinstance(next_content, list) and any(
+                            isinstance(b, dict) and b.get("type") == "tool_result"
+                            for b in next_content
+                        ):
+                            # 合并 tool_result blocks
+                            for block in next_content:
+                                if isinstance(block, dict) and block.get("type") == "tool_result":
+                                    merged_blocks.append(block)
+                            j += 1
+                            continue
+                    break
+                if j > i + 1:
+                    print(f"   🔗 合并 {j - i} 条连续的 tool_result user 消息", flush=True)
+                merged_anthropic_messages.append({"role": "user", "content": merged_blocks})
+                i = j
+                continue
+        merged_anthropic_messages.append(msg)
+        i += 1
+    anthropic_messages = merged_anthropic_messages
+
     # ---------- 🔒 校验：修复孤立的 tool_use（缺少紧跟着的 tool_result） ----------
     # Anthropic API 要求每个 tool_use 后面必须紧跟着一个 tool_result
     # 如果因为消息损坏或中断导致 tool_use 没有配对的 tool_result，API 会报 400
