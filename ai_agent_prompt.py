@@ -410,6 +410,49 @@ def _call_anthropic_api(config, messages, tools=None):
                     ]
                 })
 
+
+    # ---------- 🔒 校验：修复孤立的 tool_use（缺少紧跟着的 tool_result） ----------
+    # Anthropic API 要求每个 tool_use 后面必须紧跟着一个 tool_result
+    # 如果因为消息损坏或中断导致 tool_use 没有配对的 tool_result，API 会报 400
+    fixed_anthropic_messages = []
+    i = 0
+    while i < len(anthropic_messages):
+        msg = anthropic_messages[i]
+        if msg["role"] == "assistant":
+            content_blocks = msg.get("content", "")
+            if isinstance(content_blocks, list):
+                # 检查这个 assistant 消息中是否有 tool_use
+                has_tool_use = any(
+                    isinstance(b, dict) and b.get("type") == "tool_use"
+                    for b in content_blocks
+                )
+                if has_tool_use:
+                    # 检查下一条消息是不是 tool_result（即 role=user 且 content 包含 tool_result）
+                    next_has_result = False
+                    if i + 1 < len(anthropic_messages):
+                        next_msg = anthropic_messages[i + 1]
+                        if next_msg["role"] == "user":
+                            next_content = next_msg.get("content", "")
+                            if isinstance(next_content, list):
+                                next_has_result = any(
+                                    isinstance(b, dict) and b.get("type") == "tool_result"
+                                    for b in next_content
+                                )
+                    
+                    if not next_has_result:
+                        # ⚡ 孤立 tool_use！跳过这个 assistant 消息
+                        # 同时也跳过它之后可能跟着的 user 文本消息（如果有的话）
+                        print("   ⚠️ 检测到孤立的 tool_use，已自动跳过修复", flush=True)
+                        i += 1
+                        # 跳过后续的 user 消息（直到遇到下一个 assistant 或结尾）
+                        while i < len(anthropic_messages) and anthropic_messages[i]["role"] == "user":
+                            i += 1
+                        continue
+        
+        fixed_anthropic_messages.append(msg)
+        i += 1
+    
+    anthropic_messages = fixed_anthropic_messages
     # ---------- 转换工具定义 ----------
     anthropic_tools = None
     if tools:
@@ -1839,6 +1882,13 @@ def main():
                     msg, reasoning_content = call_api(api_messages, tools=tools)
                 except Exception as e:
                     print(f"\n💥 API调用翻车了: {e}\n", flush=True)
+                    # 🧹 回滚：如果最后一条消息是 assistant（含 tool_use），删掉它
+                    # 避免留下孤立的 tool_use 导致后续 API 调用持续报 400
+                    if len(messages) > 1 and messages[-1].get("role") == "assistant":
+                        last_msg = messages[-1]
+                        if last_msg.get("tool_calls"):
+                            print("   🧹 检测到孤立的 tool_use，自动回滚最后一条消息", flush=True)
+                            messages.pop()
                     break
 
                 # 再次检查 —— API 调用过程中可能被中断
