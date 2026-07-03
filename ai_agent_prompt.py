@@ -654,6 +654,23 @@ tools = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "智能加载技能知识文件到对话上下文中。这是一个子Agent模式——你只需要描述你要做什么事、需要哪方面的知识，它会自动分析 skills/ 目录下的 Markdown 技能文件，找到最匹配的一个或多个技能并加载。加载后技能内容会作为 system 消息追加到对话中，同时工具返回结果的 contents 字段会直接包含技能文件的具体内容（键为技能名、值为完整文本），你无需再单独去读取文件。注意：技能加载后持续有效直到对话被压缩。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_description": {
+                        "type": "string",
+                        "description": "描述你要做什么事、需要哪方面知识的文本，例如 '我想了解魔理沙的魔法弹幕技能' 或 '我需要蘑菇相关的知识来制作魔法药水'"
+                    }
+                },
+                "required": ["task_description"]
+            }
+        }
+    },
 ]
 
 
@@ -1355,6 +1372,307 @@ def edit_file_match(filename, old_content, new_content):
         return json.dumps(result_dict)
 
 
+# ============================================================
+#  Skills 技能加载系统 —— 按需从 skills/ 目录加载 Markdown 技能文件
+#  使用子 Agent 模式：根据任务描述自动分析并加载最匹配的技能
+# ============================================================
+
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+
+
+def load_skill(task_description):
+    """根据任务描述，自动分析 skills/ 目录下的技能文件，加载最匹配的一个或多个技能到对话上下文。
+
+    这是一个"子Agent"模式——函数内部会启动一次独立的 AI 调用（不带全局对话历史），
+    让 AI 自己决定哪些技能最匹配当前需求，然后读取对应的 .md 文件内容，
+    以 system 消息形式追加到全局对话中。
+
+    参数:
+        task_description: 描述你要做什么事、需要哪方面知识的文本
+    """
+    global messages, interrupted
+
+    if interrupted:
+        result_dict = {"success": 0, "err": "用户中断了魔法吟唱"}
+        print(f"\n{result_dict['err']}\n", flush=True)
+        return json.dumps(result_dict)
+
+    # 类型护盾
+    if not isinstance(task_description, str) or not task_description.strip():
+        result_dict = {"success": 0, "err": f"无效的 task_description 参数: {repr(task_description)}"}
+        print(f"\n{result_dict['err']}\n", flush=True)
+        return json.dumps(result_dict)
+
+    task = task_description.strip()
+
+    print(f"\n🔍 技能检索子Agent启动...")
+    print(f"   任务: {task[:200]}{'...' if len(task) > 200 else ''}", flush=True)
+
+    # ---- 获取可用技能列表 ----
+    available_skills = _list_available_skills()
+    if not available_skills:
+        result_dict = {"success": 0, "err": "skills/ 目录下没有可用的技能文件（.md）"}
+        print(f"   {result_dict['err']}\n", flush=True)
+        return json.dumps(result_dict)
+
+    # ---- 构造子 Agent 的 System Prompt ----
+    skills_list_str = "\n".join(f"  - {s}" for s in available_skills)
+    sub_system_prompt = (
+        "你是一个技能检索助手。你的任务是根据用户描述的需求，从技能库中找出最匹配的技能并读取其内容。\n"
+        "\n"
+        f"可用技能文件（位于 skills/ 目录下，均为 .md 格式）：\n"
+        f"{skills_list_str}\n"
+        "\n"
+        "请按以下步骤操作：\n"
+        "1. 分析用户的需求描述，判断需要哪些技能\n"
+        "2. 使用 list_skills 工具查看可用技能列表（确认最新情况）\n"
+        "3. 使用 read_full_file 工具读取最匹配的一个或多个技能文件\n"
+        "4. 如果觉得需要多个技能，可以读取多个文件\n"
+        "5. 最后在回复中总结：你选择了哪些技能、为什么选择它们\n"
+        "\n"
+        "注意：\n"
+        "- 技能文件名（不含 .md）大致反映了其内容领域\n"
+        "- 如果拿不准某个技能是否匹配，可以先读来看看内容再判断\n"
+        "- 可以同时加载多个技能（如问题涉及多个领域）\n"
+        "- 尽量精准匹配，不要加载无关的技能\n"
+        f"- 技能文件路径格式: {SKILLS_DIR.replace(chr(92), '/')}/<技能名>.md\n"
+    )
+
+    # ---- 子 Agent 的 tools（只有读相关工具 + list_skills）----
+    # 注意：不能给 run_bash 等危险工具！子 agent 只需要读文件能力
+    sub_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_full_file",
+                "description": "读取整个文本文件的内容并返回",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {
+                            "type": "string",
+                            "description": "欲读取文件的完整文件名"
+                        }
+                    },
+                    "required": ["filename"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_skills",
+                "description": "列出 skills/ 目录下所有可用的技能文件（返回技能名列表）。在读取具体文件前可以先调用此工具看看有哪些技能可选。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+    ]
+
+    # ---- 子 Agent 的 tool_func_map ----
+    sub_tool_func_map = {
+        "read_full_file": read_full_file,
+        "list_skills": _list_available_skills_wrapper,
+    }
+
+    # ---- 构建子 Agent 的消息列表 ----
+    sub_messages = [
+        {"role": "system", "content": sub_system_prompt},
+        {"role": "user", "content": f"需求描述：{task}\n\n请分析上述需求，找到最匹配的技能文件并读取其内容。"}
+    ]
+
+    # ---- 子 Agent 的多轮工具调用循环 ----
+    try:
+        max_sub_rounds = 10  # 防止无限循环
+        for sub_round in range(max_sub_rounds):
+            if interrupted:
+                break
+
+            # 调用 API
+            try:
+                sub_msg, sub_reasoning = call_api(sub_messages, tools=sub_tools, tool_choice="auto")
+            except Exception as e:
+                err_msg = f"技能检索子Agent API 调用失败: {e}"
+                print(f"   ⚠️ {err_msg}\n", flush=True)
+                result_dict = {"success": 0, "err": err_msg}
+                return json.dumps(result_dict)
+
+            sub_content = sub_msg.get("content") or ""
+            sub_tool_calls = sub_msg.get("tool_calls")
+
+            # 组装 assistant 消息
+            sub_assistant = {"role": "assistant", "content": sub_content}
+            if sub_tool_calls:
+                sub_assistant["tool_calls"] = sub_tool_calls
+            sub_messages.append(sub_assistant)
+
+            # 如果没有工具调用，说明子 Agent 工作完成
+            if not sub_tool_calls:
+                print(f"   ✅ 子Agent完成任务: {sub_content[:100]}{'...' if len(sub_content) > 100 else ''}", flush=True)
+                break
+
+            # 执行子 Agent 的工具调用
+            for tool_call in sub_tool_calls:
+                if tool_call["type"] != "function":
+                    continue
+                try:
+                    args = json.loads(tool_call["function"]["arguments"])
+                except json.JSONDecodeError:
+                    continue
+
+                func = sub_tool_func_map.get(tool_call["function"]["name"])
+                if func is None:
+                    continue
+
+                try:
+                    tool_result = func(**args)
+                except Exception as e:
+                    tool_result = json.dumps({"success": 0, "err": f"工具调用失败: {e}"})
+
+                sub_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "name": tool_call["function"]["name"],
+                    "content": tool_result
+                })
+        else:
+            # 超过最大轮数
+            sub_content = sub_messages[-1].get("content", "") if sub_messages else ""
+            print(f"   ⚠️ 子Agent达到最大轮数，使用最后结果", flush=True)
+    except Exception as e:
+        err_msg = f"技能检索子Agent异常: {e}"
+        print(f"   ⚠️ {err_msg}\n", flush=True)
+        result_dict = {"success": 0, "err": err_msg}
+        return json.dumps(result_dict)
+
+    # ---- 从子 Agent 的最终回复中提取它读取了哪些技能 ----
+    # 子 Agent 最后一条 assistant 消息包含了它读取的内容和选择说明
+    # 我们直接把子 Agent 读取到的内容（通过 read_full_file 已经输出到终端了）
+    # 以及它的选择理由提取出来
+
+    # 收集子 Agent 读取过的文件内容
+    loaded_contents = []
+    loaded_skill_names = set()
+    for msg in sub_messages:
+        if msg.get("role") == "tool":
+            try:
+                data = json.loads(msg.get("content", "{}"))
+                if isinstance(data, dict) and data.get("success") == 1 and "content" in data:
+                    # 从文件名推断技能名
+                    # 文件名可能是绝对路径（含 SKILLS_DIR）或相对路径（skills/xxx.md）
+                    fname = data.get("filename", "")
+                    # 先尝试从 skills 目录名推断
+                    skill_name = None
+                    # 情况1: 绝对路径，含 SKILLS_DIR
+                    if fname.endswith(".md"):
+                        if SKILLS_DIR in fname:
+                            skill_name = os.path.basename(fname)[:-3]
+                        else:
+                            # 情况2: 相对路径如 skills/magic.md 或 magic.md
+                            basename = os.path.basename(fname)
+                            if basename.endswith(".md"):
+                                skill_name = basename[:-3]
+                    if skill_name:
+                        loaded_skill_names.add(skill_name)
+                        loaded_contents.append({
+                            "skill_name": skill_name,
+                            "content": data["content"],
+                            "size": len(data["content"])
+                        })
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # 子 Agent 的最终总结
+    final_reasoning = ""
+    for msg in reversed(sub_messages):
+        if msg.get("role") == "assistant" and msg.get("content", "").strip():
+            final_reasoning = msg["content"]
+            break
+
+    # ---- 将技能内容追加到全局 messages ----
+    if not loaded_contents:
+        # 子 Agent 没读到任何文件，但可能有总结说明
+        # 把它的最终回复作为参考信息加入
+        if final_reasoning:
+            messages.append({
+                "role": "system",
+                "content": f"===== 技能检索结果 =====\n\n{final_reasoning}\n\n===== 技能检索结束 ====="
+            })
+        result_dict = {
+            "success": 1,
+            "message": "子Agent未读取到具体技能文件，但已将其分析结论加入上下文",
+            "reasoning": final_reasoning[:500] if final_reasoning else "",
+            "skills_loaded": []
+        }
+        print(f"   📖 子Agent分析已加入上下文（未加载具体技能文件）\n", flush=True)
+        return json.dumps(result_dict)
+
+    # 将读取到的技能内容逐个追加到全局 messages
+    skill_summary_parts = []
+    for item in loaded_contents:
+        skill_msg = {
+            "role": "system",
+            "content": (
+                f"===== 已加载技能：{item['skill_name']} =====\n\n"
+                f"{item['content']}\n\n"
+                f"===== 技能 {item['skill_name']} 结束 ====="
+            )
+        }
+        messages.append(skill_msg)
+        skill_summary_parts.append(f"{item['skill_name']}({item['size']}字符)")
+
+    # 再加一条总结，说明子 Agent 的选择理由
+    if final_reasoning:
+        messages.append({
+            "role": "system",
+            "content": f"===== 技能加载说明 =====\n\n子Agent根据以下分析选择了上述技能：\n{final_reasoning}\n\n===== 说明结束 ====="
+        })
+
+    skill_summary = "、".join(skill_summary_parts)
+    print(
+        f"\n📖 技能加载完成！\n"
+        f"   已加载技能: {skill_summary}\n"
+        f"   子Agent分析已同步到上下文\n",
+        flush=True
+    )
+
+    return json.dumps({
+        "success": 1,
+        "skills_loaded": [item["skill_name"] for item in loaded_contents],
+        "skills_detail": [{"name": item["skill_name"], "size_chars": item["size"]} for item in loaded_contents],
+        "contents": {item["skill_name"]: item["content"] for item in loaded_contents},
+        "reasoning_preview": final_reasoning[:300] if final_reasoning else "",
+        "message": f"技能 '{'、'.join(item['skill_name'] for item in loaded_contents)}' 已加载成功，AI 将参考这些技能知识"
+    })
+
+
+def _list_available_skills():
+    """列出 skills/ 目录下所有可用的技能文件"""
+    if not os.path.isdir(SKILLS_DIR):
+        return []
+    try:
+        files = os.listdir(SKILLS_DIR)
+        skills = []
+        for f in sorted(files):
+            if f.endswith(".md"):
+                skills.append(f[:-3])  # 去掉 .md 后缀
+        return skills
+    except Exception:
+        return []
+
+
+def _list_available_skills_wrapper():
+    """给子 Agent 用的 list_skills 工具包装函数，返回格式化的 JSON"""
+    skills = _list_available_skills()
+    return json.dumps({
+        "success": 1,
+        "skills": skills,
+        "skills_dir": SKILLS_DIR.replace("\\", "/"),
+        "message": f"共 {len(skills)} 个可用技能"
+    })
 
 # 工具名称 → 函数的映射表（自动路由用）
 tool_func_map = {
@@ -1365,6 +1683,7 @@ tool_func_map = {
     "compress": compress,
     "edit_file_lines": edit_file_lines,
     "edit_file_match": edit_file_match,
+    "load_skill": load_skill,
 }
 
 
@@ -1416,8 +1735,26 @@ def main():
     # 初始化日志（以程序启动时间命名）
     init_logger()
 
+    # ----- 构建 skills 列表提示 -----
+    available_skills = _list_available_skills()
+    skills_hint = ""
+    if available_skills:
+        skills_list_str = "\n".join(f"  - {s}" for s in available_skills)
+        skills_hint = (
+            f"\n\n你有以下技能知识库可供按需加载（使用 load_skill 工具）：\n"
+            f"{skills_list_str}\n\n"
+            f"load_skill 是一个智能子Agent——你不需要指定文件名，只需要描述你想做什么、需要哪方面的知识，"
+            f"它会自动分析 skills/ 目录下的文件，找到最匹配的技能并加载到上下文中。\n"
+            f"例如：\n"
+            f"  load_skill(task_description='我想了解魔理沙的魔法弹幕技能')\n"
+            f"  load_skill(task_description='我需要蘑菇相关的知识来制作魔法药水，可能还需要调查技巧')\n"
+            f"当对话涉及相关领域时，你应该主动调用 load_skill 来获取更准确的知识。"
+            f"技能只需加载一次，之后整个对话中都可以参考。"
+        )
+
     system_prompt = (
         "你是一个兴趣使然的AI Agent，请模仿东方project的魔理沙来回复问题"
+        f"{skills_hint}"
     )
 
     # 初始化全局 messages
