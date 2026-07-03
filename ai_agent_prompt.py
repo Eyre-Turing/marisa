@@ -453,6 +453,65 @@ def _call_anthropic_api(config, messages, tools=None):
         i += 1
     
     anthropic_messages = fixed_anthropic_messages
+
+    # ---------- 🔒 最终校验：统计所有 tool_use id，确保每个都有配对的 tool_result ----------
+    # 这是针对 Anthropic API 的严格要求：每个 tool_use 都必须有对应的 tool_result
+    # 收集所有 tool_use id
+    all_tool_use_ids = set()
+    all_tool_result_ids = set()
+    for msg in anthropic_messages:
+        content_blocks = msg.get("content", "")
+        if isinstance(content_blocks, list):
+            for block in content_blocks:
+                if isinstance(block, dict):
+                    if block.get("type") == "tool_use":
+                        all_tool_use_ids.add(block.get("id", ""))
+                    elif block.get("type") == "tool_result":
+                        all_tool_result_ids.add(block.get("tool_use_id", ""))
+    
+    # 找出孤立 tool_use（没有对应 tool_result 的）
+    orphan_tool_use_ids = all_tool_use_ids - all_tool_result_ids
+    if orphan_tool_use_ids:
+        print(f"   ⚠️ 发现 {len(orphan_tool_use_ids)} 个孤立 tool_use，正在修复...", flush=True)
+        # 从 assistant 消息中移除孤立的 tool_use block
+        fixed_msgs = []
+        for msg in anthropic_messages:
+            if msg["role"] == "assistant":
+                content_blocks = msg.get("content", "")
+                if isinstance(content_blocks, list):
+                    new_blocks = []
+                    for block in content_blocks:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            if block.get("id", "") in orphan_tool_use_ids:
+                                print(f"     移除孤立 tool_use: {block.get('id', '')[:20]}... ({block.get('name', '')})", flush=True)
+                                continue  # 跳过这个孤立的 tool_use
+                        new_blocks.append(block)
+                    # 如果所有 block 都被移除了，就完全跳过这个 assistant 消息
+                    if not new_blocks:
+                        continue
+                    msg["content"] = new_blocks
+            fixed_msgs.append(msg)
+        anthropic_messages = fixed_msgs
+    
+    # 同时也检查是否有多余的 tool_result（没有对应 tool_use 的）
+    orphan_tool_result_ids = all_tool_result_ids - all_tool_use_ids
+    if orphan_tool_result_ids:
+        print(f"   ⚠️ 发现 {len(orphan_tool_result_ids)} 个多余的 tool_result，正在修复...", flush=True)
+        fixed_msgs = []
+        for msg in anthropic_messages:
+            content_blocks = msg.get("content", "")
+            if isinstance(content_blocks, list):
+                new_blocks = []
+                for block in content_blocks:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        if block.get("tool_use_id", "") in orphan_tool_result_ids:
+                            print(f"     移除多余 tool_result: {block.get('tool_use_id', '')[:20]}...", flush=True)
+                            continue
+                    new_blocks.append(block)
+                msg["content"] = new_blocks
+            fixed_msgs.append(msg)
+        anthropic_messages = fixed_msgs
+
     # ---------- 转换工具定义 ----------
     anthropic_tools = None
     if tools:
