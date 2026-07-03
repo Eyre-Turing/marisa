@@ -1541,6 +1541,60 @@ def edit_file_match(filename, old_content, new_content):
 #  Skills 技能加载系统 —— 按需从 skills/ 目录加载 Markdown 技能文件
 #  使用子 Agent 模式：根据任务描述自动分析并加载最匹配的技能
 # ============================================================
+#  Messages 顺序修复 —— 把插队到 tool_calls 和 tool 之间的消息挪到后面
+# ============================================================
+
+def _fix_messages_tool_order(msg_list):
+    """修复 messages 中 tool_calls 和 tool 响应之间被插队的消息顺序。
+
+    OpenAI 协议规范：assistant（带 tool_calls）必须紧跟 role: tool 的消息。
+    如果中间被 system 等其他消息插队，把后面的 tool 消息移动上来。
+
+    参数:
+        msg_list: 要修复的 messages 列表（直接修改原列表）
+
+    返回:
+        bool: 是否做了修复
+    """
+    fixed = False
+    i = 0
+    while i < len(msg_list):
+        msg = msg_list[i]
+        # 找到带 tool_calls 的 assistant 消息
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            j = i + 1
+            # 收集插队的消息（非tool的消息）
+            interleaving = []
+            while j < len(msg_list):
+                next_msg = msg_list[j]
+                if next_msg.get("role") == "tool":
+                    # 找到了 tool 消息，看看之前有没有插队的
+                    if interleaving:
+                        # 有插队！把这个 tool 消息移到 interleaving 之前
+                        tool_msg = msg_list.pop(j)
+                        msg_list.insert(i + 1, tool_msg)
+                        fixed = True
+                        # 重置，重新检查
+                        break
+                    else:
+                        # 没插队，正常，继续找下一个 tool（可能有多个 tool_calls）
+                        j += 1
+                        continue
+                else:
+                    # 不是 tool 消息，记录为插队消息
+                    interleaving.append(next_msg)
+                    j += 1
+            else:
+                # 没找到 tool 消息（可能是未完成的 tool_calls）
+                pass
+        i += 1
+    return fixed
+
+
+# ============================================================
+#  Skills 技能加载系统 —— 按需从 skills/ 目录加载 Markdown 技能文件
+#  使用子 Agent 模式：根据任务描述自动分析并加载最匹配的技能
+# ============================================================
 
 SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
@@ -1996,6 +2050,12 @@ def main():
                     break
 
                 try:
+                    # ✨ 修复 tool_calls 和 tool 响应之间被插队的消息顺序
+                    # 这是因为 load_skill 等工具在执行时可能会向 messages 中插入 system 消息，
+                    # 导致 assistant（带 tool_calls）后面不是紧跟着 tool 响应，违反 OpenAI 协议规范
+                    if _fix_messages_tool_order(messages):
+                        print("   🗟 已修复 tool_calls 和 tool 响应之间的消息顺序", flush=True)
+
                     # ✨ 关键改动：使用 get_context_aware_messages 包装
                     # 如果上下文超过阈值，会自动追加一条 system 提醒
                     api_messages = get_context_aware_messages(messages)
