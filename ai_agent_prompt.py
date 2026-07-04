@@ -1596,7 +1596,68 @@ def _fix_messages_tool_order(msg_list):
 #  使用子 Agent 模式：根据任务描述自动分析并加载最匹配的技能
 # ============================================================
 
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+# Skills 目录配置：同时支持启动目录（CWD）和代码目录下的 skills/
+# 启动目录的 skills/ 优先级更高，同名技能文件以启动目录的版本为准
+# 在 main() 启动时初始化
+CWD_SKILLS_DIR = None   # 启动目录下的 skills/
+CODE_SKILLS_DIR = None  # 代码目录下的 skills/
+
+
+def _init_skills_dirs():
+    """初始化两个 skills 目录路径，并返回合并后的技能列表"""
+    global CWD_SKILLS_DIR, CODE_SKILLS_DIR
+    
+    # 启动目录下的 skills/
+    cwd_dir = os.path.join(os.getcwd(), "skills")
+    CWD_SKILLS_DIR = cwd_dir if os.path.isdir(cwd_dir) else None
+    
+    # 代码目录下的 skills/
+    code_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+    CODE_SKILLS_DIR = code_dir if os.path.isdir(code_dir) else None
+
+
+def _scan_skills(dir_path):
+    """扫描指定目录下的 .md 文件，返回技能名列表"""
+    if not dir_path or not os.path.isdir(dir_path):
+        return []
+    try:
+        result = []
+        for f in sorted(os.listdir(dir_path)):
+            if f.endswith(".md"):
+                result.append(f[:-3])
+        return result
+    except Exception:
+        return []
+
+
+def _merge_skills():
+    """合并两个 skills 目录的技能列表，启动目录优先（同名覆盖）"""
+    cwd_skills = _scan_skills(CWD_SKILLS_DIR)
+    code_skills = _scan_skills(CODE_SKILLS_DIR)
+    
+    # 启动目录优先：如果启动目录有同名技能，代码目录的被覆盖
+    # 用 dict 去重，启动目录的先插入，代码目录的后插入会覆盖
+    merged = {}
+    for s in code_skills:
+        merged[s] = "code"
+    for s in cwd_skills:
+        merged[s] = "cwd"
+    
+    # 保持排序稳定：按名字排序
+    return [(s, merged[s]) for s in sorted(merged.keys())]
+
+
+def _resolve_skill_file(skill_name):
+    """根据技能名返回实际文件路径（启动目录优先）"""
+    if CWD_SKILLS_DIR:
+        fpath = os.path.join(CWD_SKILLS_DIR, f"{skill_name}.md")
+        if os.path.isfile(fpath):
+            return fpath
+    if CODE_SKILLS_DIR:
+        fpath = os.path.join(CODE_SKILLS_DIR, f"{skill_name}.md")
+        if os.path.isfile(fpath):
+            return fpath
+    return None
 
 
 def load_skill(task_description):
@@ -1655,7 +1716,7 @@ def load_skill(task_description):
         "- 可以匹配多个技能（如问题涉及多个领域）\n"
         "- 尽量精准匹配，不要加载无关的技能\n"
         "- 如果没有匹配的技能，matched_skills 列表返回空 []\n"
-        f"- 技能文件路径格式: {SKILLS_DIR.replace(chr(92), '/')}/<技能名>.md\n"
+        "- 技能文件来源：合并启动目录和代码目录两个 skills/ 目录，同名以启动目录版本为准\n"
         "\n"
         "### ⚠️ 重要：输出格式要求\n"
         "\n"
@@ -1819,7 +1880,7 @@ def load_skill(task_description):
     loaded_contents = []
     if matched_skills:
         for skill_name in matched_skills:
-            skill_file = os.path.join(SKILLS_DIR, f"{skill_name}.md")
+            skill_file = _resolve_skill_file(skill_name)
             try:
                 with open(skill_file, "rb") as f:
                     raw_data = f.read()
@@ -1836,11 +1897,11 @@ def load_skill(task_description):
     # ---- 将技能内容追加到全局 messages ----
     if not matched_skills or not loaded_contents:
         # 没有匹配的技能，只把子Agent的分析结论加入上下文做参考
-        if final_reasoning:
-            messages.append({
-                "role": "system",
-                "content": f"===== 技能检索结果 =====\n\n{final_reasoning}\n\n===== 技能检索结束 ====="
-            })
+        # if final_reasoning:
+        #     messages.append({
+        #         "role": "system",
+        #         "content": f"===== 技能检索结果 =====\n\n{final_reasoning}\n\n===== 技能检索结束 ====="
+        #     })
         result_dict = {
             "success": 0,
             "message": "未找到匹配的技能（技能库中没有与需求相关的技能文件）",
@@ -1853,23 +1914,23 @@ def load_skill(task_description):
     # 将读取到的技能内容逐个追加到全局 messages
     skill_summary_parts = []
     for item in loaded_contents:
-        skill_msg = {
-            "role": "system",
-            "content": (
-                f"===== 已加载技能：{item['skill_name']} =====\n\n"
-                f"{item['content']}\n\n"
-                f"===== 技能 {item['skill_name']} 结束 ====="
-            )
-        }
-        messages.append(skill_msg)
+        # skill_msg = {
+        #     "role": "system",
+        #     "content": (
+        #         f"===== 已加载技能：{item['skill_name']} =====\n\n"
+        #         f"{item['content']}\n\n"
+        #         f"===== 技能 {item['skill_name']} 结束 ====="
+        #     )
+        # }
+        # messages.append(skill_msg)
         skill_summary_parts.append(f"{item['skill_name']}({item['size']}字符)")
 
-    # 再加一条总结，说明子 Agent 的选择理由
-    if final_reasoning:
-        messages.append({
-            "role": "system",
-            "content": f"===== 技能加载说明 =====\n\n子Agent根据以下分析选择了上述技能：\n{final_reasoning}\n\n===== 说明结束 ====="
-        })
+    # # 再加一条总结，说明子 Agent 的选择理由
+    # if final_reasoning:
+    #     messages.append({
+    #         "role": "system",
+    #         "content": f"===== 技能加载说明 =====\n\n子Agent根据以下分析选择了上述技能：\n{final_reasoning}\n\n===== 说明结束 ====="
+    #     })
 
     skill_summary = "、".join(skill_summary_parts)
     print(
@@ -1890,28 +1951,38 @@ def load_skill(task_description):
 
 
 def _list_available_skills():
-    """列出 skills/ 目录下所有可用的技能文件"""
-    if not os.path.isdir(SKILLS_DIR):
-        return []
-    try:
-        files = os.listdir(SKILLS_DIR)
-        skills = []
-        for f in sorted(files):
-            if f.endswith(".md"):
-                skills.append(f[:-3])  # 去掉 .md 后缀
-        return skills
-    except Exception:
-        return []
+    """列出所有可用技能（合并两个 skills 目录，启动目录优先）"""
+    merged = _merge_skills()
+    return [s for s, _ in merged]
 
 
 def _list_available_skills_wrapper():
     """给子 Agent 用的 list_skills 工具包装函数，返回格式化的 JSON"""
     skills = _list_available_skills()
+    merged = _merge_skills()
+    
+    # 标记每个技能来自哪个目录
+    cwd_skills = []
+    code_skills = []
+    for s_name, source in merged:
+        if source == "cwd":
+            cwd_skills.append(s_name)
+        else:
+            code_skills.append(s_name)
+    
+    info_parts = []
+    if CWD_SKILLS_DIR:
+        info_parts.append(f"启动目录({CWD_SKILLS_DIR.replace(chr(92), '/')}): {len(cwd_skills)}个技能")
+    if CODE_SKILLS_DIR:
+        info_parts.append(f"代码目录({CODE_SKILLS_DIR.replace(chr(92), '/')}): {len(code_skills)}个技能")
+    info_parts.append(f"合并后共 {len(skills)} 个技能（同名以启动目录版本为准）")
+    
     return json.dumps({
         "success": 1,
         "skills": skills,
-        "skills_dir": SKILLS_DIR.replace("\\", "/"),
-        "message": f"共 {len(skills)} 个可用技能"
+        "cwd_skills": cwd_skills,
+        "code_skills": code_skills,
+        "message": " | ".join(info_parts)
     })
 
 # 工具名称 → 函数的映射表（自动路由用）
@@ -1964,7 +2035,7 @@ def create_prompt_session():
 #  4. 对话循环
 # ============================================================
 def main():
-    global tool_executing, interrupted, messages
+    global tool_executing, interrupted, messages, CWD_SKILLS_DIR, CODE_SKILLS_DIR
 
     # 注册信号处理器 —— 只用于工具执行中的中断
     # 用户输入中的 Ctrl+C 由 prompt_toolkit 处理
@@ -1975,6 +2046,10 @@ def main():
 
     # 初始化日志（以程序启动时间命名）
     init_logger()
+
+    # ----- 初始化 skills 目录（同时检查启动目录和代码目录下的 skills/，同名以启动目录版本为准） -----
+    global CWD_SKILLS_DIR, CODE_SKILLS_DIR
+    _init_skills_dirs()
 
     # ----- 构建 skills 列表提示 -----
     available_skills = _list_available_skills()
@@ -2050,11 +2125,11 @@ def main():
                     break
 
                 try:
-                    # ✨ 修复 tool_calls 和 tool 响应之间被插队的消息顺序
-                    # 这是因为 load_skill 等工具在执行时可能会向 messages 中插入 system 消息，
-                    # 导致 assistant（带 tool_calls）后面不是紧跟着 tool 响应，违反 OpenAI 协议规范
-                    if _fix_messages_tool_order(messages):
-                        print("   🗟 已修复 tool_calls 和 tool 响应之间的消息顺序", flush=True)
+                    # # ✨ 修复 tool_calls 和 tool 响应之间被插队的消息顺序
+                    # # 这是因为 load_skill 等工具在执行时可能会向 messages 中插入 system 消息，
+                    # # 导致 assistant（带 tool_calls）后面不是紧跟着 tool 响应，违反 OpenAI 协议规范
+                    # if _fix_messages_tool_order(messages):
+                    #     print("   🗟 已修复 tool_calls 和 tool 响应之间的消息顺序", flush=True)
 
                     # ✨ 关键改动：使用 get_context_aware_messages 包装
                     # 如果上下文超过阈值，会自动追加一条 system 提醒
@@ -2062,13 +2137,13 @@ def main():
                     msg, reasoning_content = call_api(api_messages, tools=tools)
                 except Exception as e:
                     print(f"\n💥 API调用翻车了: {e}\n", flush=True)
-                    # 🧹 回滚：如果最后一条消息是 assistant（含 tool_use），删掉它
-                    # 避免留下孤立的 tool_use 导致后续 API 调用持续报 400
-                    if len(messages) > 1 and messages[-1].get("role") == "assistant":
-                        last_msg = messages[-1]
-                        if last_msg.get("tool_calls"):
-                            print("   🧹 检测到孤立的 tool_use，自动回滚最后一条消息", flush=True)
-                            messages.pop()
+                    # # 🧹 回滚：如果最后一条消息是 assistant（含 tool_use），删掉它
+                    # # 避免留下孤立的 tool_use 导致后续 API 调用持续报 400
+                    # if len(messages) > 1 and messages[-1].get("role") == "assistant":
+                    #     last_msg = messages[-1]
+                    #     if last_msg.get("tool_calls"):
+                    #         print("   🧹 检测到孤立的 tool_use，自动回滚最后一条消息", flush=True)
+                    #         messages.pop()
                     break
 
                 # 再次检查 —— API 调用过程中可能被中断
