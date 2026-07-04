@@ -1604,16 +1604,17 @@ CODE_SKILLS_DIR = None  # 代码目录下的 skills/
 
 
 def _init_skills_dirs():
-    """初始化两个 skills 目录路径，并返回合并后的技能列表"""
+    """初始化两个 skills 目录路径，并返回合并后的技能列表
+    注意：不再检查目录是否存在（将检查延迟到使用时），
+    这样即使启动后用户才创建 skills 文件夹并添加 .md 文件，也能被动态加载。
+    """
     global CWD_SKILLS_DIR, CODE_SKILLS_DIR
     
-    # 启动目录下的 skills/
-    cwd_dir = os.path.join(os.getcwd(), "skills")
-    CWD_SKILLS_DIR = cwd_dir if os.path.isdir(cwd_dir) else None
+    # 启动目录下的 skills/ —— 无论是否存在都记录路径，使用时再动态检查
+    CWD_SKILLS_DIR = os.path.join(os.getcwd(), "skills")
     
     # 代码目录下的 skills/
-    code_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
-    CODE_SKILLS_DIR = code_dir if os.path.isdir(code_dir) else None
+    CODE_SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
 
 
 def _scan_skills(dir_path):
