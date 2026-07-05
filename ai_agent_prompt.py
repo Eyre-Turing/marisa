@@ -30,6 +30,10 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 
+# MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
+# 通过 mcp_manager.py 统一管理 stdio/HTTP 模式的 MCP 服务器连接
+from mcp_manager import get_mcp_manager, load_mcp_config
+
 
 # ============================================================
 #  配置管理 —— 从同级 JSON 文件读取 API 配置
@@ -827,11 +831,45 @@ tools = [
     },
 ]
 
+# ============================================================
+# MCP 工具动态合并 —— 将外部 MCP 服务器的工具合并到主工具列表
+# ============================================================
+
+def _merge_mcp_tools():
+    """将 MCP 管理器中已连接服务器的工具合并到主工具列表
+    
+    返回合并后的完整工具列表。
+    注意：MCP 工具的调用会通过 tool_func_map 中的 mcp_call_tool 路由。
+    """
+    try:
+        mcp = get_mcp_manager()
+        mcp_tools = mcp.get_all_tools()
+        if mcp_tools:
+            print(f"   📦 合并 {len(mcp_tools)} 个 MCP 工具到工具列表", flush=True)
+            return tools + mcp_tools
+    except Exception as e:
+        print(f"   ⚠️ 合并 MCP 工具时出错: {e}", flush=True)
+    return tools
+
+
+# MCP 工具调用路由 —— 所有 MCP 工具的调用都会走这个函数
+def mcp_call_tool(tool_name, **arguments):
+    """调用 MCP 工具（由 tool_func_map 路由）"""
+    try:
+        mcp = get_mcp_manager()
+        result = mcp.call_tool(tool_name, arguments)
+        return json.dumps({"success": 1, "result": result})
+    except Exception as e:
+        err_msg = f"MCP 工具 {tool_name} 调用失败: {e}"
+        print(f"   ⚠️ {err_msg}", flush=True)
+        return json.dumps({"success": 0, "err": err_msg})
+
 
 # 终止型工具集合：执行这些工具后会直接结束本轮工具调用循环
 # 因为这类工具（如 compress）会修改全局 messages 状态，
-# 后续的 tool response 追加和 API 调用会基于错误的上文继续执行
+# 后续的 tool response 追加和 API 调用会基于错误的上下文继续执行
 TERMINAL_TOOLS = {"compress"}
+
 
 
 def get_code_path():
@@ -2001,6 +2039,44 @@ tool_func_map = {
 
 
 # ============================================================
+# MCP 工具动态注册 —— 启动时获取 MCP 工具并注册到 tool_func_map
+# ============================================================
+
+def _init_mcp_tools():
+    """初始化 MCP 工具连接，注册到 tool_func_map
+    
+    在 main() 启动时调用一次。
+    之后 tools 列表要用 _get_merged_tools() 获取合并后的列表。
+    """
+    global tools
+    
+    mcp = get_mcp_manager()
+    mcp.connect_all()
+    
+    mcp_tools = mcp.get_all_tools()
+    if mcp_tools:
+        print(f"   📦 注册 {len(mcp_tools)} 个 MCP 工具到路由表", flush=True)
+        # 注册到 tool_func_map，让工具执行循环能路由到 mcp_call_tool
+        for t in mcp_tools:
+            tool_name = t["function"]["name"]
+            if tool_name not in tool_func_map:
+                tool_func_map[tool_name] = lambda name=tool_name, **kw: mcp_call_tool(name, **kw)
+        
+        # 更新全局 tools 列表
+        tools = tools + mcp_tools
+        print(f"   ✅ 合并后共 {len(tools)} 个工具可用", flush=True)
+
+
+def _cleanup_mcp_tools():
+    """清理 MCP 工具连接（程序退出时调用）"""
+    try:
+        mcp = get_mcp_manager()
+        mcp.disconnect_all()
+    except Exception as e:
+        print(f"   ⚠️ 清理 MCP 连接时出错: {e}", flush=True)
+
+
+# ============================================================
 #  3. 创建 prompt_toolkit session 及快捷键绑定
 # ============================================================
 def create_prompt_session():
@@ -2050,8 +2126,13 @@ def main():
 
     # ----- 初始化 skills 目录（同时检查启动目录和代码目录下的 skills/，同名以启动目录版本为准） -----
     global CWD_SKILLS_DIR, CODE_SKILLS_DIR
+    # ----- 初始化 skills 目录（同时检查启动目录和代码目录下的 skills/，同名以启动目录版本为准） -----
+    global CWD_SKILLS_DIR, CODE_SKILLS_DIR
     _init_skills_dirs()
-
+    
+    # ----- 初始化 MCP 工具连接（连接所有配置的 MCP 服务器，注册工具到路由表） -----
+    _init_mcp_tools()
+    
     # ----- 构建 skills 列表提示 -----
     available_skills = _list_available_skills()
     skills_hint = ""
@@ -2273,6 +2354,9 @@ def main():
 
         finally:
             tool_executing = False
+    
+    # ----- 程序退出时清理 MCP 连接 -----
+    _cleanup_mcp_tools()
 
 
 if __name__ == "__main__":
