@@ -45,7 +45,8 @@ DEFAULT_MCP_CONFIG = {
         #     "env": {},
         #     "auto_connect": True,
         #     "tool_prefix": "blender_",  # 可选：给工具名加前缀避免冲突
-        #     "timeout": 180
+        #     "timeout": 180,
+        #     "debug": false              # 可选：true 则打印 stderr 日志（调试用），默认 false
         # },
         # {
         #     "name": "playwright",
@@ -56,7 +57,8 @@ DEFAULT_MCP_CONFIG = {
         #     "env": {},
         #     "auto_connect": False,
         #     "tool_prefix": "pw_",
-        #     "timeout": 60
+        #     "timeout": 60,
+        #     "debug": false
         # },
         # {
         #     "name": "github",
@@ -67,7 +69,8 @@ DEFAULT_MCP_CONFIG = {
         #     "env": {"GITHUB_TOKEN": "xxx"},
         #     "auto_connect": False,
         #     "tool_prefix": "gh_",
-        #     "timeout": 60
+        #     "timeout": 60,
+        #     "debug": false
         # }
     ]
 }
@@ -121,13 +124,14 @@ class MCPStdioServer:
     生命周期：initialize → tools/list → tools/call → shutdown
     """
     
-    def __init__(self, name, command, args=None, env=None, tool_prefix="", timeout=60):
+    def __init__(self, name, command, args=None, env=None, tool_prefix="", timeout=60, debug=False):
         self.name = name
         self.command = command
         self.args = args or []
         self.env = env or {}
         self.tool_prefix = tool_prefix
         self.timeout = timeout
+        self.debug = debug
         
         self.proc = None
         self.tools = []          # OpenAI 格式的工具列表
@@ -172,12 +176,13 @@ class MCPStdioServer:
                 bufsize=0  # 无缓冲，确保即时通信
             )
             
-            # 启动 stderr 读取线程（用于日志/调试）
-            self._stderr_thread = threading.Thread(
-                target=self._read_stderr,
-                daemon=True
-            )
-            self._stderr_thread.start()
+            # 根据 debug 选项决定是否启动 stderr 读取线程
+            if self.debug:
+                self._stderr_thread = threading.Thread(
+                    target=self._read_stderr,
+                    daemon=True
+                )
+                self._stderr_thread.start()
             
             # 发送 initialize 请求
             init_result = self._send_request("initialize", {
@@ -483,7 +488,8 @@ class MCPManager:
                     args=cfg.get("args", []),
                     env=cfg.get("env", {}),
                     tool_prefix=cfg.get("tool_prefix", ""),
-                    timeout=cfg.get("timeout", 60)
+                    timeout=cfg.get("timeout", 60),
+                    debug=cfg.get("debug", False)
                 )
                 
                 if cfg.get("auto_connect", True):
