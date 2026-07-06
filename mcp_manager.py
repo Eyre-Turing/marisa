@@ -176,13 +176,13 @@ class MCPStdioServer:
                 bufsize=0  # 无缓冲，确保即时通信
             )
             
-            # 根据 debug 选项决定是否启动 stderr 读取线程
-            if self.debug:
-                self._stderr_thread = threading.Thread(
-                    target=self._read_stderr,
-                    daemon=True
-                )
-                self._stderr_thread.start()
+            # 无论 debug 是否开启，都要启动 stderr 读取线程，否则管道缓冲区满了 uvx 会卡死
+            # debug=True 时打印到终端，debug=False 时只读取不显示
+            self._stderr_thread = threading.Thread(
+                target=self._read_stderr,
+                daemon=True
+            )
+            self._stderr_thread.start()
             
             # 发送 initialize 请求
             init_result = self._send_request("initialize", {
@@ -213,14 +213,17 @@ class MCPStdioServer:
             return False
     
     def _read_stderr(self):
-        """在后台线程中读取 stderr，避免管道阻塞"""
+        """在后台线程中读取 stderr，避免管道阻塞
+        无论 debug 是否开启都会读取，但只在 debug=True 时打印到终端
+        """
         try:
             if self.proc and self.proc.stderr:
                 for line in iter(self.proc.stderr.readline, b''):
                     if line:
-                        line_str = line.decode('utf-8', errors='replace').rstrip()
-                        if line_str:
-                            print(f"   [MCP:{self.name} stderr] {line_str}", flush=True)
+                        if self.debug:
+                            line_str = line.decode('utf-8', errors='replace').rstrip()
+                            if line_str:
+                                print(f"   [MCP:{self.name} stderr] {line_str}", flush=True)
         except Exception:
             pass
     
