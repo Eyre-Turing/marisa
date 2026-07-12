@@ -1064,8 +1064,31 @@ def run_bash(command, timeout=10):
         return json.dumps(result_dict)
 
 
+# ============================================================
+#  路径标准化 —— Windows 下兼容 Linux 风格路径
+# ============================================================
+
+def _normalize_path(filename):
+    """将路径转为当前平台原生格式。
+    在 Windows 下，将 /c/xxx、/abc/xxx 等 Linux 风格路径转换为 c:/xxx、abc:/xxx，
+    其他平台不做转换。
+    """
+    if sys.platform == "win32" and isinstance(filename, str) and len(filename) > 2 and filename[0] == '/':
+        # 匹配 /xxx/... 或 /Xxx/... 模式（第一个分段作为盘符/挂载点名），转为 xxx:\...
+        import re as _re
+        m = _re.match(r'^/([a-zA-Z][a-zA-Z0-9]*)/(.*)', filename)
+        if m:
+            filename = m.group(1) + ':/' + m.group(2)
+    return filename
+
+
+# ============================================================
+#  文件读写工具
+# ============================================================
+
 def write_full_file(filename, data):
     """写入文件，打印人类可读结果，返回 json.dumps 后的字符串"""
+    filename = _normalize_path(filename)
     global interrupted
     # 如果已经被中断，直接跳过
     if interrupted:
@@ -1097,6 +1120,7 @@ def write_full_file(filename, data):
 
 def read_full_file(filename):
     """读取整个文件，静默返回内容（不打印到终端），返回 json.dumps 后的字符串"""
+    filename = _normalize_path(filename)
     global interrupted
     # 如果已经被中断，直接跳过
     if interrupted:
@@ -1136,6 +1160,7 @@ def read_full_file(filename):
 
 def read_file_lines(filename, start_line=1, end_line=None):
     """读取文件指定行范围，返回带行号的内容，返回 json.dumps 后的字符串"""
+    filename = _normalize_path(filename)
     global interrupted
     if interrupted:
         result_dict = {"filename": filename, "content": "", "start_line": 0, "end_line": 0, "total_lines": 0, "success": 0, "err": "用户中断了魔法吟唱"}
@@ -1280,6 +1305,7 @@ def compress(compressed_messages):
 
 def edit_file_lines(filename, start_line, end_line, new_content):
     """编辑文件中指定行范围的内容，并以 git diff 风格展示改动"""
+    filename = _normalize_path(filename)
     global interrupted
     if interrupted:
         result_dict = {"filename": filename, "success": 0, "err": "用户中断了魔法吟唱", "diff": ""}
@@ -1396,6 +1422,7 @@ def edit_file_match(filename, old_content, new_content):
     在文件中搜索 old_content，如果恰好匹配到唯一位置，则替换为 new_content。
     如果匹配不到或匹配到多个位置，报错返回详细信息。
     """
+    filename = _normalize_path(filename)
     global interrupted
     if interrupted:
         result_dict = {"filename": filename, "success": 0, "err": "用户中断了魔法吟唱", "diff": ""}
