@@ -141,6 +141,22 @@ CONTEXT_LIMIT = 1_000_000
 # 设为 700K 字节（约 70%），留出余量避免撞墙
 COMPRESS_THRESHOLD = 700_000
 
+# 长内容自动过期机制（第二层：软过期）
+# tool response 内容超过此大小时在 large_content_counter 中计数，
+# 达到过期轮数后自动替换为过期提示
+LARGE_CONTENT_THRESHOLD = 50 * 1024  # 50KB
+# 大内容在 messages 中存在超过此轮数（外层 while 循环次数）后自动过期
+LARGE_CONTENT_EXPIRE_ROUNDS = 5
+
+# 工具函数硬截断阈值（第一层：保底保护）
+# 当工具返回的内容超过此大小时，直接截断保留前 N 字节，
+# 防止单次工具调用撑爆上下文
+TOOL_HARD_CUTOFF = 200 * 1024  # 200KB
+
+# 大内容计数器：tool_call_id -> 被检测到为大内容的轮次数
+# 在外层 while 循环每次开始时扫描 messages 并更新
+large_content_counter = {}
+
 # messages 提升到全局，方便 compress 工具直接修改
 messages = []
 
@@ -1037,6 +1053,13 @@ def run_bash(command, timeout=10):
         stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
         stderr = smart_decode(result_container["stderr"]) if result_container["stderr"] else ""
         code = proc.returncode
+        # 硬截断保护：防止单次输出过大撑爆上下文
+        stdout_orig_len = len(stdout)
+        stderr_orig_len = len(stderr)
+        if stdout_orig_len > TOOL_HARD_CUTOFF:
+            stdout = stdout[:TOOL_HARD_CUTOFF] + f"\n\n...（输出过大，已截断。原始大小 {stdout_orig_len//1024}KB，仅显示前 {TOOL_HARD_CUTOFF//1024}KB）"
+        if stderr_orig_len > TOOL_HARD_CUTOFF:
+            stderr = stderr[:TOOL_HARD_CUTOFF] + f"\n\n...（错误输出过大，已截断。原始大小 {stderr_orig_len//1024}KB，仅显示前 {TOOL_HARD_CUTOFF//1024}KB）"
         result_dict = {
             "stdout": stdout,
             "stderr": stderr,
@@ -1045,6 +1068,7 @@ def run_bash(command, timeout=10):
         print(
             "魔法结果:\n"
             f"    {stdout.replace(chr(10), chr(10)+'    ')}\n"
+            f"    {'[输出较大，已截断至' + str(TOOL_HARD_CUTOFF//1024) + 'KB]' if stdout_orig_len > TOOL_HARD_CUTOFF else ''}"
             "魔法报错:\n"
             f"    {stderr.replace(chr(10), chr(10)+'    ')}\n"
             f"退出状态: {code}",
@@ -1138,11 +1162,16 @@ def read_full_file(filename):
         with open(filename, "rb") as f:
             raw_data = f.read()
         content = smart_decode(raw_data)
+        file_size = len(raw_data)
+        # 硬截断保护：防止单次读取过大文件撑爆上下文
+        if file_size > TOOL_HARD_CUTOFF:
+            content = content[:TOOL_HARD_CUTOFF] + f"\n\n...（文件过大，已截断。原始大小 {file_size//1024}KB，仅显示前 {TOOL_HARD_CUTOFF//1024}KB）"
         result_dict = {"filename": filename, "content": content, "success": 1, "err": ""}
         # 不打印文件内容到终端，避免刷屏！
         print(
             f"读取整个文件: {filename}\n"
-            f"文件大小: {len(raw_data)} 字节\n"
+            f"文件大小: {file_size} 字节\n"
+            f"{'[文件较大，已截断至' + str(TOOL_HARD_CUTOFF//1024) + 'KB]' if file_size > TOOL_HARD_CUTOFF else ''}"
             f"是否成功: 1",
             flush=True
         )
@@ -1210,6 +1239,14 @@ def read_file_lines(filename, start_line=1, end_line=None):
             # 去掉行尾换行再加，保证格式统一
             numbered_lines.append(f"{i:>{width}} | {line.rstrip(chr(10)).rstrip(chr(13))}")
         numbered_content = '\n'.join(numbered_lines)
+        # 硬截断保护：防止单次读取行数过多撑爆上下文
+        content_orig_len = len(numbered_content)
+        if content_orig_len > TOOL_HARD_CUTOFF:
+            # 保留前半部分和后半部分，中间省略
+            half = TOOL_HARD_CUTOFF // 2
+            numbered_content = (numbered_content[:half] +
+                f"\n...（内容过多，已截断。原始大小 {content_orig_len//1024}KB，共 {total_lines} 行）\n" +
+                numbered_content[-half:])
 
         result_dict = {
             "filename": filename,
@@ -1222,6 +1259,14 @@ def read_file_lines(filename, start_line=1, end_line=None):
         }
         print(
             f"读取文件行: {filename} (第{start_line}~{actual_end}行, 共{total_lines}行)\n"
+            f"{'[返回内容较大，已截断至' + str(TOOL_HARD_CUTOFF//1024) + 'KB]' if content_orig_len > TOOL_HARD_CUTOFF else ''}"
+            f"是否成功: 1",
+            flush=True
+        )
+        return json.dumps(result_dict)
+        print(
+            f"读取文件行: {filename} (第{start_line}~{actual_end}行, 共{total_lines}行)\n"
+            f"{'[返回内容较大，已标记为大内容]' if len(numbered_content) > LARGE_CONTENT_THRESHOLD else ''}"
             f"是否成功: 1",
             flush=True
         )
@@ -1246,7 +1291,7 @@ def compress(compressed_messages):
     注意：压缩完成后，会自动追加一条 system 提示，阻止 AI 在后续对话中
     无限套娃式地重复调用 compress，除非用户再次明确要求压缩。
     """
-    global messages, interrupted
+    global messages, interrupted, large_content_counter
 
     if interrupted:
         result_dict = {"success": 0, "err": "用户中断了魔法吟唱"}
@@ -1273,6 +1318,8 @@ def compress(compressed_messages):
     old_len = len(messages)
     old_size = get_context_size(messages)
     messages = compressed_messages
+    # 压缩后清空大内容计数器，因为 messages 已被完全替换
+    large_content_counter.clear()
 
     # === 修复无限套娃压缩问题 ===
     # 压缩完成后，追加一条 system 提示，明确告诉 AI 不要主动再次调用 compress
@@ -1302,6 +1349,80 @@ def compress(compressed_messages):
         "old_size_bytes": old_size,
         "new_size_bytes": new_size
     })
+
+
+# ============================================================
+#  大内容自动过期机制 —— 在外层 while 循环每次开始时调用
+# ============================================================
+
+def _expire_large_content():
+    """扫描 messages 中所有 role=tool 的消息，对大内容进行计数和过期处理。
+
+    每次外层 while 循环开始时调用。逻辑：
+    1. 遍历 messages 中所有 role=tool 的消息
+    2. 检查 content 的字符串长度，如果超过 LARGE_CONTENT_THRESHOLD 则视为大内容
+    3. 在 large_content_counter 中对该 tool_call_id 计数 +1
+    4. 如果计数达到 LARGE_CONTENT_EXPIRE_ROUNDS，把 content 替换为过期提示
+    5. 已过期的消息不再参与后续计数
+
+    注意：此函数不依赖工具函数内部的任何标记（如 is_large），
+    完全基于 content 的实际大小来判断。
+    """
+    global large_content_counter, messages
+
+    if not messages:
+        return
+
+    expired_count = 0
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+
+        tool_call_id = msg.get("tool_call_id", "")
+        if not tool_call_id:
+            continue
+
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            continue
+
+        # 跳过已经过期了的内容
+        if content.startswith("[数据已过期"):
+            continue
+
+        # 直接根据 content 长度判断是否为大内容（不解析 JSON，不看标记）
+        if len(content) > LARGE_CONTENT_THRESHOLD:
+            # 这是一个大内容，计数 +1
+            count = large_content_counter.get(tool_call_id, 0) + 1
+            large_content_counter[tool_call_id] = count
+
+            if count >= LARGE_CONTENT_EXPIRE_ROUNDS:
+                # 达到过期轮数，替换内容
+                old_size = len(content)
+                # 尝试从 JSON 中提取文件名等信息作为参考
+                original_filename = ""
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        original_filename = parsed.get("filename", "") or parsed.get("command", "")[:100]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                msg["content"] = json.dumps({
+                    "success": 0,
+                    "err": f"[数据已过期：该内容已在对话中存在 {count} 轮（原始大小 {old_size//1024}KB），如需请重新获取]",
+                    "_expired": True,
+                    "_original_tool_call_id": tool_call_id,
+                    "_original_filename": original_filename,
+                    "_original_size": old_size
+                })
+                # 从计数器中移除，避免重复触发
+                large_content_counter.pop(tool_call_id, None)
+                expired_count += 1
+                print(f"   ⏰ 大内容过期: tool_call_id={tool_call_id[:16]}... (原大小 {old_size//1024}KB, 已存在 {count} 轮)", flush=True)
+
+    if expired_count > 0:
+        print(f"   🧹 本次过期了 {expired_count} 条大内容，当前 messages 大小: {get_context_size(messages)//1024}KB", flush=True)
+
 
 def edit_file_lines(filename, start_line, end_line, new_content):
     """编辑文件中指定行范围的内容，并以 git diff 风格展示改动"""
@@ -2196,6 +2317,9 @@ def main():
     session = create_prompt_session()
 
     while True:
+        # 每次外层循环开始时，执行大内容过期检查
+        _expire_large_content()
+
         # 每次回到用户输入时重置中断标志
         interrupted = False
 
