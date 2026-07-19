@@ -167,25 +167,25 @@ def get_context_size(msg_list):
     return len(json_str.encode('utf-8'))
 
 
-def get_context_aware_messages(msg_list):
-    """
-    如果上下文超过阈值，在末尾追加一条 system 提醒（不修改原列表）。
-    这样 AI 能看到当前使用量，主动考虑压缩。
-    """
-    ctx_size = get_context_size(msg_list)
-    if ctx_size > COMPRESS_THRESHOLD:
-        pct = round(ctx_size / CONTEXT_LIMIT * 100, 1)
-        reminder = {
-            "role": "system",
-            "content": (
-                f"[上下文使用率：{pct}%（{ctx_size//1000}K / {CONTEXT_LIMIT//1000}K），"
-                "对话历史较长，建议考虑调用 compress 工具压缩历史对话以节省空间。"
-                "压缩时请保留 system prompt 和最近 2-3 轮完整对话，"
-                "更早的内容用一段摘要替代。]"
-            )
-        }
-        return msg_list + [reminder]
-    return msg_list
+# def get_context_aware_messages(msg_list):
+#     """
+#     如果上下文超过阈值，在末尾追加一条 user 提醒（不修改原列表）。
+#     用 user 角色让 AI 更倾向执行压缩，而非 system 那样容易被忽略。
+#     """
+#     ctx_size = get_context_size(msg_list)
+#     if ctx_size > COMPRESS_THRESHOLD:
+#         pct = round(ctx_size / CONTEXT_LIMIT * 100, 1)
+#         reminder = {
+#             "role": "user",
+#             "content": (
+#                 f"[上下文使用率：{pct}%（{ctx_size//1000}K / {CONTEXT_LIMIT//1000}K），"
+#                 "对话历史较长，建议考虑调用 compress 工具压缩历史对话以节省空间。"
+#                 "压缩时请保留 system prompt 和最近 2-3 轮完整对话，"
+#                 "更早的内容用一段摘要代替。]"
+#             )
+#         }
+#         return msg_list + [reminder]
+#     return msg_list
 
 
 # ============================================================
@@ -1322,14 +1322,13 @@ def compress(compressed_messages):
     large_content_counter.clear()
 
     # === 修复无限套娃压缩问题 ===
-    # 压缩完成后，追加一条 system 提示，明确告诉 AI 不要主动再次调用 compress
-    # 除非用户再次主动要求压缩。这样 AI 在下一轮对话中就能知道该正常回话，
-    # 而不是继续调用 compress 工具。
+    # 压缩完成后，追加一条 assistant 回复作为确认，
+    # 这样 messages 以 assistant 结尾，下次用户输入追加 user 消息时符合交替规则。
+    # 同时也告诉 AI 不要主动再次调用 compress，除非用户再次明确要求压缩。
     messages.append({
-        "role": "system",
+        "role": "assistant",
         "content": (
-            "[提醒：对话历史已压缩完成。在接下来的对话中，请不要主动调用 compress 工具，"
-            "除非用户再次明确要求压缩。请正常回应用户的问题。]"
+            "📦 压缩完成！对话历史已压缩，请继续正常聊天。"
         )
     })
 
@@ -1857,7 +1856,8 @@ def load_skill(task_description):
     参数:
         task_description: 描述你要做什么事、需要哪方面知识的文本
     """
-    global messages, interrupted
+    # global messages
+    global interrupted
 
     if interrupted:
         result_dict = {"success": 0, "err": "用户中断了魔法吟唱"}
@@ -2346,7 +2346,85 @@ def main():
         if not user_input.strip():
             continue
 
-        messages.append({"role": "user", "content": user_input})
+        # ════════════════════════════════════════════════════════════
+        # 智能预压缩：上下文超阈值时，先搁置用户输入，让 AI 压缩完再处理
+        # ════════════════════════════════════════════════════════════
+        # 先检查当前上下文（不含用户新输入）是否超阈值
+        need_pre_compress = get_context_size(messages) > COMPRESS_THRESHOLD
+
+        if need_pre_compress:
+            pct = round(get_context_size(messages) / CONTEXT_LIMIT * 100, 1)
+            print(f"   📊 上下文使用率 {pct}%，先让 AI 压缩再处理你的问题...", flush=True)
+            # 追加压缩请求（不追加用户真实输入）
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[上下文使用率：{pct}%（{get_context_size(messages)//1000}K / {CONTEXT_LIMIT//1000}K），"
+                    "对话历史较长，请先调用 compress 工具压缩历史对话以节省空间。"
+                    "压缩时请保留 system prompt 和最近 2-3 轮完整对话，"
+                    "更早的内容用一段摘要代替。"
+                    "压缩完成后我会告诉你用户真正的问题。]"
+                )
+            })
+            # 单次 API 调用：让 AI 调用 compress
+            tool_executing = True
+            try:
+                msg, reasoning_content = call_api(messages, tools=tools)
+            except Exception as e:
+                print(f"\n💥 API调用翻车了: {e}\n", flush=True)
+                msg = None
+            finally:
+                tool_executing = False
+
+            if msg is None or interrupted:
+                # API 失败或被中断，清理残留
+                if msg is None:
+                    messages.pop()  # 移除压缩请求
+                continue
+
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls")
+
+            if content:
+                print(f"魔理沙:\n    {content.replace(chr(10), chr(10)+'    ')}", flush=True)
+
+            if tool_calls:
+                # 处理工具调用（预期是 compress）
+                for tool in tool_calls:
+                    if tool["type"] != "function":
+                        continue
+                    try:
+                        args = json.loads(tool["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        continue
+                    func = tool_func_map.get(tool["function"]["name"])
+                    if func is None:
+                        continue
+                    tool_name = tool["function"]["name"]
+                    is_terminal = tool_name in TERMINAL_TOOLS
+                    try:
+                        tool_result = func(**args)
+                    except (TypeError, Exception) as e:
+                        tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
+                    # 终端工具（compress）内部已修改全局 messages 并追加了 assistant 确认
+                    if is_terminal:
+                        print("   ↳ 压缩完成，上下文已刷新！", flush=True)
+                    else:
+                        # 非预期工具，追加 tool response
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool["id"],
+                            "name": tool_name,
+                            "content": tool_result
+                        })
+            # 无论 AI 是否调用了 compress，压缩请求 user 消息都保留在 messages 中
+            # 但 compress 函数内部已追加了 assistant 确认，所以 messages 以 assistant 结尾
+            # 现在追加用户真实输入，进入正常处理流程
+            if not interrupted:
+                messages.append({"role": "user", "content": user_input})
+        else:
+            # 上下文没超阈值，正常追加用户输入
+            messages.append({"role": "user", "content": user_input})
 
         # ---------- 多轮工具调用循环 ----------
         tool_executing = True
@@ -2364,10 +2442,11 @@ def main():
                     # if _fix_messages_tool_order(messages):
                     #     print("   🗟 已修复 tool_calls 和 tool 响应之间的消息顺序", flush=True)
 
-                    # ✨ 关键改动：使用 get_context_aware_messages 包装
-                    # 如果上下文超过阈值，会自动追加一条 system 提醒
-                    api_messages = get_context_aware_messages(messages)
-                    msg, reasoning_content = call_api(api_messages, tools=tools)
+                    # # ✨ 关键改动：使用 get_context_aware_messages 包装
+                    # # 如果上下文超过阈值，会自动追加一条 system 提醒
+                    # api_messages = get_context_aware_messages(messages)
+                    # msg, reasoning_content = call_api(api_messages, tools=tools)
+                    msg, reasoning_content = call_api(messages, tools=tools)
                 except Exception as e:
                     print(f"\n💥 API调用翻车了: {e}\n", flush=True)
                     # # 🧹 回滚：如果最后一条消息是 assistant（含 tool_use），删掉它
