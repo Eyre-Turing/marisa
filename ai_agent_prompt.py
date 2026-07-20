@@ -1466,6 +1466,98 @@ def _expire_large_content():
         print(f"   🧹 本次过期了 {expired_count} 条大内容，当前 messages 大小: {get_context_size(messages)//1024}KB", flush=True)
 
 
+# ============================================================
+#  无人值守自动压缩 —— 在内层工具循环中压缩历史工具调用
+# ============================================================
+
+def _squash_tool_calls_automatically(msg_list):
+    """在无人值守时，自动压缩 messages 中中间的工具调用轮次。
+
+    规则：
+    - 保留 system prompt（第0条）
+    - 保留所有 role=user 的消息（用户的指令/提问）
+    - 保留最近 KEEP_RECENT_ROUNDS 轮完整的 assistant(tool_calls) + tool 配对
+    - 删除中间轮次的 assistant(有tool_calls) 及其后面紧跟着的 tool 消息
+    - 其他消息（如无 tool_calls 的 assistant 总结、system 等）不动
+
+    返回值: bool — 是否真的做了压缩
+    """
+    KEEP_RECENT_ROUNDS = 2  # 保留最近几轮完整的工具调用
+
+    if len(msg_list) < 3:
+        return False
+
+    # 找出所有要删除的索引
+    # 收集所有 assistant(有tool_calls) 的索引
+    assistant_tool_idxs = []
+    for i, msg in enumerate(msg_list):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            assistant_tool_idxs.append(i)
+
+    if len(assistant_tool_idxs) <= KEEP_RECENT_ROUNDS:
+        return False  # 不够删的
+
+    # 决定保留最近 KEEP_RECENT_ROUNDS 轮
+    keep_indices = set()
+
+    # 保留 system prompt（第0条）
+    keep_indices.add(0)
+
+    # 保留所有 user 消息
+    for i, msg in enumerate(msg_list):
+        if msg.get("role") == "user":
+            keep_indices.add(i)
+
+    # 保留最近 KEEP_RECENT_ROUNDS 轮的 assistant(tool_calls) + 对应的 tool 消息
+    recent_assistant_idxs = assistant_tool_idxs[-KEEP_RECENT_ROUNDS:]
+    for idx in recent_assistant_idxs:
+        keep_indices.add(idx)
+        # 从 idx 往后找 tool 消息，直到遇到下一条非 tool 消息
+        j = idx + 1
+        while j < len(msg_list):
+            if msg_list[j].get("role") == "tool":
+                keep_indices.add(j)
+                j += 1
+            else:
+                break
+
+    # 所有不在 keep_indices 中的、且满足删除条件的条目：
+    # assistant(有tool_calls) 和其紧跟着的 tool 消息
+    to_delete = set()
+    for idx in assistant_tool_idxs:
+        if idx in keep_indices:
+            continue  # 保留轮次，不删
+        # 要删除这个 assistant
+        to_delete.add(idx)
+        # 以及后面紧跟着的 tool 消息（直到遇到非 tool）
+        j = idx + 1
+        while j < len(msg_list):
+            if msg_list[j].get("role") == "tool":
+                to_delete.add(j)
+                j += 1
+            else:
+                break
+
+    if not to_delete:
+        return False
+
+    # 从后往前删除，避免索引变化
+    old_size = get_context_size(msg_list)
+    old_len = len(msg_list)
+    for idx in sorted(to_delete, reverse=True):
+        del msg_list[idx]
+
+    new_size = get_context_size(msg_list)
+    new_len = len(msg_list)
+    print(
+        f"\n📦 无人值守自动压缩: {old_len}条→{new_len}条, "
+        f"{old_size//1024}KB→{new_size//1024}KB "
+        f"(保留最近 {KEEP_RECENT_ROUNDS} 轮工具调用)\n",
+        flush=True
+    )
+    return True
+
+
 def edit_file_lines(filename, start_line, end_line, new_content):
     """编辑文件中指定行范围的内容，并以 git diff 风格展示改动"""
     filename = _normalize_path(filename)
@@ -2507,6 +2599,13 @@ def main():
                 if interrupted:
                     print("   ↳ 用户中断，跳过剩余工具调用", flush=True)
                     break
+
+                # 📦 无人值守自动压缩：工具循环中上下文超阈值时自动压缩中间的工具调用
+                if not interrupted and get_context_size(messages) > COMPRESS_THRESHOLD:
+                    _squash_tool_calls_automatically(messages)
+                    # 压缩后重新检查上下文，如果还是超阈值就继续压缩（最多再试一次）
+                    if get_context_size(messages) > COMPRESS_THRESHOLD:
+                        _squash_tool_calls_automatically(messages)
 
                 try:
                     # # ✨ 修复 tool_calls 和 tool 响应之间被插队的消息顺序
