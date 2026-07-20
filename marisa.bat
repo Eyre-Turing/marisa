@@ -12,4 +12,4 @@ if %ERRORLEVEL%==0 (
     set PY=python
 )
 
-%PY% "%SCRIPT_DIR%ai_agent_prompt.py"
+%PY% "%SCRIPT_DIR%ai_agent_prompt.py" %*

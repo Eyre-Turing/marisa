@@ -25,6 +25,7 @@ import difflib, re
 import threading
 import datetime
 import pathlib
+import argparse
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -1069,7 +1070,7 @@ def run_bash(command, timeout=10):
             "魔法结果:\n"
             f"    {stdout.replace(chr(10), chr(10)+'    ')}\n"
             f"    {'[输出较大，已截断至' + str(TOOL_HARD_CUTOFF//1024) + 'KB]' if stdout_orig_len > TOOL_HARD_CUTOFF else ''}"
-            "魔法报错:\n"
+            "\n魔法报错:\n"
             f"    {stderr.replace(chr(10), chr(10)+'    ')}\n"
             f"退出状态: {code}",
             flush=True
@@ -1348,6 +1349,48 @@ def compress(compressed_messages):
         "old_size_bytes": old_size,
         "new_size_bytes": new_size
     })
+
+
+# ============================================================
+#  从日志文件恢复会话 —— 支持 -r / --resume 参数
+# ============================================================
+
+def _resume_from_log(log_path):
+    """Restore the last messages snapshot from a log file."""
+    if not os.path.isfile(log_path):
+        return None, "file not found: " + log_path
+
+    try:
+        with open(log_path, "rb") as f:
+            raw_data = f.read()
+        content = smart_decode(raw_data)
+    except Exception as e:
+        return None, "read failed: " + str(e)
+
+    # match the last "--- snapshot ... ---" marker
+    # use \r? to handle both Windows (\r\n) and Unix (\n) line endings
+    matches = list(re.finditer(r'^--- snapshot .* ---\r?$', content, re.MULTILINE))
+    if not matches:
+        return None, "no snapshot marker found in: " + log_path
+
+    last_match = matches[-1]
+    json_text = content[last_match.end():].strip()
+
+    if not json_text:
+        return None, "empty content after last snapshot"
+
+    try:
+        messages = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        return None, "JSON parse failed: " + str(e)
+
+    if not isinstance(messages, list):
+        return None, "messages is not a list: " + str(type(messages))
+
+    if len(messages) == 0 or messages[0].get("role") != "system":
+        return None, "first message is not system prompt, cannot resume"
+
+    return messages, None
 
 
 # ============================================================
@@ -2266,6 +2309,12 @@ def main():
     # 用户输入中的 Ctrl+C 由 prompt_toolkit 处理
     signal.signal(signal.SIGINT, sigint_handler)
 
+    # ---- 命令行参数解析 ----
+    parser = argparse.ArgumentParser(description='魔理沙 AI Agent - 兴趣使然的对话助手')
+    parser.add_argument('-r', '--resume', type=str, default=None,
+                        help='从日志文件恢复会话，用法：-r /path/to/log/file.log')
+    args = parser.parse_args()
+
     # 加载 API 配置（如果配置文件不存在或字段缺失，会提示用户输入）
     load_config()
 
@@ -2303,10 +2352,34 @@ def main():
         f"{skills_hint}"
     )
 
-    # 初始化全局 messages
-    messages = [
-        {"role": "system", "content": system_prompt}
-    ]
+    # ---- 处理 -r / --resume 恢复会话 ----
+    if args.resume:
+        log_path = args.resume
+        print(f"📥 正在从日志恢复会话: {log_path}", flush=True)
+        restored_messages, err = _resume_from_log(log_path)
+        if err:
+            print(f"   ❌ 恢复失败: {err}", flush=True)
+            print("   将启动新的会话。", flush=True)
+            messages = [
+                {"role": "system", "content": system_prompt}
+            ]
+        else:
+            msg_count = len(restored_messages)
+            # 取最后一条用户输入作为提示
+            last_user_msg = ""
+            for m in reversed(restored_messages):
+                if m.get("role") == "user" and isinstance(m.get("content"), str):
+                    last_user_msg = m["content"][:100]
+                    break
+            print(f"   ✅ 恢复成功！共 {msg_count} 条消息", flush=True)
+            if last_user_msg:
+                print(f"   📝 最后一条用户输入: {last_user_msg}{'...' if len(last_user_msg) >= 100 else ''}", flush=True)
+            messages = restored_messages
+    else:
+        # 初始化全局 messages
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
 
     print("🧙 魔理沙 (多行输入模式)", flush=True)
     print("   📝 回车=换行  |  Alt+Enter(或Esc+Enter)=提交", flush=True)

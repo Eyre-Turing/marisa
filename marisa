@@ -24,4 +24,4 @@ if type winpty >/dev/null 2>&1; then
 fi
 
 # 发动魔法！
-$_WINPTY $_PYTHON "$SCRIPT_DIR/ai_agent_prompt.py"
+$_WINPTY $_PYTHON "$SCRIPT_DIR/ai_agent_prompt.py" "$@"
