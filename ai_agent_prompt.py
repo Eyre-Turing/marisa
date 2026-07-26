@@ -281,6 +281,28 @@ def call_api(messages, tools=None, tool_choice="auto"):
         raise
 
 
+def _strip_multimodal(msgs):
+    """
+    直接原地修改 messages 列表，删除多模态结构的数据。
+    
+    将 content 为数组格式（多模态）的消息改为纯文本字符串，
+    只保留 text 类型的内容，image_url 数据直接丢弃不保留。
+    返回是否做了修改（True=有改动）。
+    """
+    modified = False
+    for msg in msgs:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+                # image_url 和其他非 text 类型直接丢弃，不留占位符
+            msg["content"] = "\n".join(text_parts)
+            modified = True
+    return modified
+
+
 def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
     """OpenAI 风格 API 调用（兼容 DeepSeek 等）"""
     api_key = config["api_key"]
@@ -298,6 +320,16 @@ def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
         "Authorization": f"Bearer {api_key}",
     }
 
+    return _do_openai_request(url, headers, model, messages, tools, tool_choice)
+
+
+def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="auto", allow_retry=True):
+    """
+    实际执行 OpenAI 风格 API 请求。
+    
+    如果 HTTP 400 报错且包含 image_url 关键字（模型不支持多模态），
+    自动将全局 messages 中的多模态数据删除，然后重试一次。
+    """
     payload = {
         "model": model,
         "messages": messages,
@@ -314,6 +346,19 @@ def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
             result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
+        
+        # 🗑️ 检测到多模态数据导致 API 报错，直接删除并重试
+        if allow_retry and e.code == 400 and "image_url" in error_body:
+            print(
+                "   🗑️ 模型不支持多模态（image_url），自动清理多模态数据后重试...",
+                flush=True
+            )
+            _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+            return _do_openai_request(
+                url, headers, model, messages, tools, tool_choice,
+                allow_retry=False  # 防止无限递归
+            )
+        
         raise RuntimeError(f"API 请求失败 (HTTP {e.code}): {error_body}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"API 请求失败 (网络错误): {e.reason}")
@@ -3106,7 +3151,21 @@ def main():
                             img_base64 = result_data["base64"]
                             img_mime = result_data["mime"]
                             img_path = result_data["filepath"]
-                            # 注入一条 role:user 的多模态消息，包含图片
+                            # 第一步：先追加 tool 响应，满足 API 协议要求
+                            # assistant(tool_calls) 后面必须紧跟着 tool 消息
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "name": tool_name,
+                                "content": json.dumps({
+                                    "success": 1,
+                                    "filepath": img_path,
+                                    "mime": img_mime,
+                                    "size_kb": result_data.get("size_kb", 0),
+                                    "message": f"图片已读取，大小约 {result_data.get('size_kb', 0)}KB"
+                                })
+                            })
+                            # 第二步：再注入 role:user 的多模态消息，让 AI 看到图片内容
                             messages.append({
                                 "role": "user",
                                 "content": [
