@@ -846,6 +846,69 @@ tools = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_list_servers",
+            "description": "列出所有已配置的 MCP 服务器及其运行状态。返回每个服务器的名称、传输层、是否启用、是否自动连接、当前是否在运行、工具数量等信息。当你需要了解当前有哪些 MCP 服务可用、或者某个 MCP 进程是否存活时使用此工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_connect_server",
+            "description": "连接/启动指定的 MCP 服务器。如果服务器已经在运行，会先断开再重新连接。连接成功后自动注册该服务器的工具到工具列表中。适用于：手动启动 auto_connect=false 的服务器、重新连接已崩溃的 MCP 进程、或者你想临时启用一个未自动连接的 MCP 服务。参数 name 为 mcp_config.json 中配置的服务器名称。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "要连接的 MCP 服务器名称（与 mcp_config.json 中配置的 name 完全一致）"
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_disconnect_server",
+            "description": "断开指定的 MCP 服务器，停止其进程、释放资源，并从工具列表中移除该服务器提供的工具。适用于你想手动停止某个 MCP 服务以释放系统资源。参数 name 为要断开的服务器名称。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "要断开的 MCP 服务器名称"
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_restart_server",
+            "description": "重启指定的 MCP 服务器（先断开再重新连接）。重启成功后自动重新注册该服务器提供的工具。主要适用于 MCP 进程崩溃后重新启动。参数 name 为要重启的服务器名称。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "要重启的 MCP 服务器名称"
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
 ]
 
 # ============================================================
@@ -880,6 +943,145 @@ def mcp_call_tool(tool_name, **arguments):
         err_msg = f"MCP 工具 {tool_name} 调用失败: {e}"
         print(f"   ⚠️ {err_msg}", flush=True)
         return json.dumps({"success": 0, "err": err_msg})
+# ============================================================
+# MCP 进程控制工具 —— 让大模型可以查看和控制 MCP 服务状态
+# ============================================================
+
+def mcp_list_servers():
+    """列出所有已配置的 MCP 服务器及其运行状态
+    
+    返回每个服务器的名称、传输层、是否启用、是否自动连接、
+    当前是否在运行、工具数量等信息。
+    """
+    try:
+        mcp = get_mcp_manager()
+        servers = mcp.list_servers_config()
+        return json.dumps({"success": 1, "servers": servers})
+    except Exception as e:
+        return json.dumps({"success": 0, "err": str(e)})
+
+
+def mcp_connect_server(name):
+    """连接/启动指定的 MCP 服务器
+    
+    如果服务器已经在运行，会先断开再重新连接。
+    连接成功后会自动注册该服务器提供的工具到工具列表中。
+    
+    参数:
+        name: 要连接的 MCP 服务器名称（与 mcp_config.json 中配置的 name 一致）
+    """
+    global tools
+    try:
+        mcp = get_mcp_manager()
+        result = mcp.connect_server(name)
+        
+        if result.get("success"):
+            # 连接成功后，刷新 MCP 工具注册
+            _refresh_mcp_tools()
+        
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"success": 0, "err": str(e)})
+
+
+def mcp_disconnect_server(name):
+    """断开指定的 MCP 服务器
+    
+    停止其进程、释放资源，并从工具列表中移除该服务器提供的工具。
+    
+    参数:
+        name: 要断开的 MCP 服务器名称
+    """
+    global tools
+    try:
+        mcp = get_mcp_manager()
+        result = mcp.disconnect_server(name)
+        
+        if result.get("success"):
+            # 断开后刷新 MCP 工具注册（移除对应的工具）
+            _refresh_mcp_tools()
+        
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"success": 0, "err": str(e)})
+
+
+def mcp_restart_server(name):
+    """重启指定的 MCP 服务器
+    
+    先断开再重新连接。适用于 MCP 进程崩溃后重新启动。
+    重启成功后会自动注册该服务器提供的工具。
+    
+    参数:
+        name: 要重启的 MCP 服务器名称
+    """
+    global tools
+    try:
+        mcp = get_mcp_manager()
+        result = mcp.restart_server(name)
+        
+        if result.get("success"):
+            _refresh_mcp_tools()
+        
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps({"success": 0, "err": str(e)})
+
+
+def _refresh_mcp_tools():
+    """刷新 MCP 工具的路由注册和 tools 列表
+    
+    在 MCP 服务器连接/断开/重启后调用，同步 tool_func_map 和 tools 列表。
+    """
+    global tools, tool_func_map
+    
+    mcp = get_mcp_manager()
+    
+    # 1. 清除旧的 MCP 工具路由（保留非 MCP 工具）
+    # 找出所有当前 MCP 服务器的工具名
+    old_mcp_tool_names = set()
+    for server in mcp.servers.values():
+        if server.connected:
+            for tool in server.tools:
+                old_mcp_tool_names.add(tool["function"]["name"])
+    
+    # 从 tool_func_map 中移除旧的 MCP 工具（注意保留 mcp_ 开头的控制工具本身）
+    keys_to_remove = []
+    for key in tool_func_map:
+        if key in old_mcp_tool_names:
+            keys_to_remove.append(key)
+    for key in keys_to_remove:
+        del tool_func_map[key]
+    
+    # 2. 重新注册当前已连接服务器的工具
+    mcp_tools = mcp.get_all_tools()
+    for t in mcp_tools:
+        tool_name = t["function"]["name"]
+        if tool_name not in tool_func_map:
+            tool_func_map[tool_name] = lambda name=tool_name, **kw: mcp_call_tool(name, **kw)
+    
+    # 3. 同步 tools 列表：重建为 [静态工具] + [当前MCP工具]
+    # 先找出 tools 中哪些是静态工具（非MCP工具）
+    static_tool_names = set()
+    for t in tools:
+        # 静态工具的特征：不是通过 mcp_call_tool 路由的
+        # 用白名单方式：不在 old_mcp_tool_names 和 新 mcp_tools 中的就是静态工具
+        pass
+    
+    # 更简单的方式：保留 tools 中所有非MCP工具，再追加当前MCP工具
+    # 获取当前所有MCP工具名
+    current_mcp_names = set()
+    for t in mcp_tools:
+        current_mcp_names.add(t["function"]["name"])
+    current_mcp_names.update(old_mcp_tool_names)  # 也包含旧的可能还在tools里的
+    
+    # 保留非MCP工具
+    static_tools = [t for t in tools if t["function"]["name"] not in current_mcp_names]
+    
+    # 重建 tools
+    tools = static_tools + mcp_tools
+    
+    print(f"   🔄 MCP 工具列表已刷新: {len(static_tools)} 个静态工具 + {len(mcp_tools)} 个 MCP 工具", flush=True)
 
 
 # 终止型工具集合：执行这些工具后会直接结束本轮工具调用循环
@@ -2318,6 +2520,10 @@ tool_func_map = {
     "edit_file_match": edit_file_match,
     "load_skill": load_skill,
     "get_code_path": get_code_path,
+    "mcp_list_servers": mcp_list_servers,
+    "mcp_connect_server": mcp_connect_server,
+    "mcp_disconnect_server": mcp_disconnect_server,
+    "mcp_restart_server": mcp_restart_server,
 }
 
 

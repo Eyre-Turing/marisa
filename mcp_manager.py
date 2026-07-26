@@ -572,6 +572,127 @@ class MCPManager:
         self.disconnect_all()
         self.connect_all()
     
+    def list_servers_config(self):
+        """返回所有已配置 MCP 服务器的详细状态列表
+        
+        从 mcp_config.json 读取配置，结合当前运行状态返回完整信息。
+        """
+        config = load_mcp_config()
+        server_configs = config.get("mcp_servers", [])
+        result = []
+        for cfg in server_configs:
+            name = cfg.get("name", "unknown")
+            enabled = cfg.get("enabled", True)
+            auto_connect = cfg.get("auto_connect", True)
+            transport = cfg.get("transport", "stdio")
+            
+            # 检查运行状态
+            server = self.servers.get(name)
+            is_running = False
+            tool_count = 0
+            if server is not None:
+                is_running = server.is_alive()
+                tool_count = len(server.tools) if server.connected else 0
+            
+            result.append({
+                "name": name,
+                "transport": transport,
+                "enabled": enabled,
+                "auto_connect": auto_connect,
+                "running": is_running,
+                "tool_count": tool_count,
+                "command": cfg.get("command", ""),
+                "tool_prefix": cfg.get("tool_prefix", ""),
+            })
+        return result
+
+    def connect_server(self, name):
+        """连接指定的 MCP 服务器
+        
+        根据配置创建新的 MCPStdioServer 实例并连接。
+        如果已有同名服务器在运行，会先断开旧连接。
+        
+        参数:
+            name: 服务器名称（与 mcp_config.json 中的 name 一致）
+        
+        返回:
+            dict: {"success": True/False, "name": name, "tool_count": N, "err": "错误信息"}
+        """
+        config = load_mcp_config()
+        server_configs = config.get("mcp_servers", [])
+        
+        # 查找配置
+        cfg = None
+        for c in server_configs:
+            if c.get("name") == name:
+                cfg = c
+                break
+        
+        if not cfg:
+            return {"success": False, "name": name, "err": f"未找到 MCP 服务器配置: {name}"}
+        
+        if not cfg.get("enabled", True):
+            return {"success": False, "name": name, "err": f"MCP 服务器 [{name}] 已禁用（enabled=false），请先修改 mcp_config.json 启用它"}
+        
+        # 如果已有服务器实例且正在运行，先断开
+        existing = self.servers.get(name)
+        if existing:
+            if existing.is_alive():
+                print(f"   \ud83d\udd04 MCP 服务器 [{name}] 已在运行，先断开旧连接...", flush=True)
+                existing.disconnect()
+            # 从路由表中移除旧的工具
+            self._name_to_server = {k: v for k, v in self._name_to_server.items() if v != name}
+        
+        # 创建新实例并连接
+        transport = cfg.get("transport", "stdio")
+        if transport == "stdio":
+            server = MCPStdioServer(
+                name=name,
+                command=cfg["command"],
+                args=cfg.get("args", []),
+                env=cfg.get("env", {}),
+                tool_prefix=cfg.get("tool_prefix", ""),
+                timeout=cfg.get("timeout", 60),
+                debug=cfg.get("debug", False)
+            )
+            
+            if server.connect():
+                self.servers[name] = server
+                for tool in server.tools:
+                    tool_name = tool["function"]["name"]
+                    self._name_to_server[tool_name] = name
+                return {"success": True, "name": name, "tool_count": len(server.tools), "err": ""}
+            else:
+                return {"success": False, "name": name, "tool_count": 0, "err": f"MCP 服务器 [{name}] 连接失败，请检查配置和日志"}
+        else:
+            return {"success": False, "name": name, "err": f"不支持的传输层: {transport}"}
+
+    def disconnect_server(self, name):
+        """断开指定的 MCP 服务器
+        
+        停止进程并清理路由表中的工具注册。
+        
+        参数:
+            name: 服务器名称
+        """
+        server = self.servers.get(name)
+        if not server:
+            return {"success": False, "name": name, "err": f"MCP 服务器 [{name}] 不存在或未连接"}
+        
+        # 从路由表中移除工具
+        self._name_to_server = {k: v for k, v in self._name_to_server.items() if v != name}
+        
+        server.disconnect()
+        del self.servers[name]
+        return {"success": True, "name": name, "err": ""}
+
+    def restart_server(self, name):
+        """重启指定的 MCP 服务器（先断开再重新连接）"""
+        disc_result = self.disconnect_server(name)
+        if not disc_result["success"] and "不存在" not in disc_result.get("err", ""):
+            return disc_result
+        return self.connect_server(name)
+
     def __repr__(self):
         return f"<MCPManager servers={len(self.servers)} tools={len(self._name_to_server)}>"
 
