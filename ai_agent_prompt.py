@@ -527,14 +527,36 @@ def _call_anthropic_api(config, messages, tools=None):
                                 )
                     
                     if not next_has_result:
-                        # ⚡ 孤立 tool_use！跳过这个 assistant 消息
-                        # 同时也跳过它之后可能跟着的 user 文本消息（如果有的话）
-                        print("   ⚠️ 检测到孤立的 tool_use，已自动跳过修复", flush=True)
-                        i += 1
-                        # 跳过后续的 user 消息（直到遇到下一个 assistant 或结尾）
-                        while i < len(anthropic_messages) and anthropic_messages[i]["role"] == "user":
+                        # 🔍 特殊检查：IMAGE_TOOLS（如 read_image）的 tool_use 后面
+                        # 跟着的是包含 image 类型 block 的 user 消息，而不是 tool_result
+                        # 这是正常的流程，不应视为孤立 tool_use
+                        is_image_tool_pair = False
+                        tool_use_names_in_msg = [
+                            b.get("name", "") for b in content_blocks
+                            if isinstance(b, dict) and b.get("type") == "tool_use"
+                        ]
+                        if tool_use_names_in_msg and all(n in IMAGE_TOOLS for n in tool_use_names_in_msg):
+                            if i + 1 < len(anthropic_messages):
+                                next_msg = anthropic_messages[i + 1]
+                                if next_msg["role"] == "user":
+                                    next_content = next_msg.get("content", "")
+                                    if isinstance(next_content, list):
+                                        has_image_block = any(
+                                            isinstance(b, dict) and b.get("type") == "image"
+                                            for b in next_content
+                                        )
+                                        if has_image_block:
+                                            is_image_tool_pair = True
+                        
+                        if not is_image_tool_pair:
+                            # ⚡ 真正的孤立 tool_use！跳过这个 assistant 消息
+                            # 同时也跳过它之后可能跟着的 user 文本消息（如果有的话）
+                            print("   ⚠️ 检测到孤立的 tool_use，已自动跳过修复", flush=True)
                             i += 1
-                        continue
+                            # 跳过后续的 user 消息（直到遇到下一个 assistant 或结尾）
+                            while i < len(anthropic_messages) and anthropic_messages[i]["role"] == "user":
+                                i += 1
+                            continue
         
         fixed_anthropic_messages.append(msg)
         i += 1
@@ -559,26 +581,46 @@ def _call_anthropic_api(config, messages, tools=None):
     # 找出孤立 tool_use（没有对应 tool_result 的）
     orphan_tool_use_ids = all_tool_use_ids - all_tool_result_ids
     if orphan_tool_use_ids:
-        print(f"   ⚠️ 发现 {len(orphan_tool_use_ids)} 个孤立 tool_use，正在修复...", flush=True)
-        # 从 assistant 消息中移除孤立的 tool_use block
-        fixed_msgs = []
+        # 🔍 从孤立集合中排除 IMAGE_TOOLS（如 read_image）
+        # 这些工具的 tool_use 后面跟的是包含 image 的 user 消息，而非 tool_result
+        # 收集所有 IMAGE_TOOLS 的 tool_use id
+        image_tool_ids = set()
         for msg in anthropic_messages:
             if msg["role"] == "assistant":
                 content_blocks = msg.get("content", "")
                 if isinstance(content_blocks, list):
-                    new_blocks = []
                     for block in content_blocks:
                         if isinstance(block, dict) and block.get("type") == "tool_use":
-                            if block.get("id", "") in orphan_tool_use_ids:
-                                print(f"     移除孤立 tool_use: {block.get('id', '')[:20]}... ({block.get('name', '')})", flush=True)
-                                continue  # 跳过这个孤立的 tool_use
-                        new_blocks.append(block)
-                    # 如果所有 block 都被移除了，就完全跳过这个 assistant 消息
-                    if not new_blocks:
-                        continue
-                    msg["content"] = new_blocks
-            fixed_msgs.append(msg)
-        anthropic_messages = fixed_msgs
+                            if block.get("id", "") in orphan_tool_use_ids and block.get("name", "") in IMAGE_TOOLS:
+                                image_tool_ids.add(block.get("id", ""))
+        
+        real_orphan_ids = orphan_tool_use_ids - image_tool_ids
+        if image_tool_ids:
+            print(f"   ℹ️ 排除 {len(image_tool_ids)} 个 IMAGE_TOOLS 的 tool_use（它们后面跟着图片消息）", flush=True)
+        
+        if real_orphan_ids:
+            print(f"   ⚠️ 发现 {len(real_orphan_ids)} 个孤立 tool_use，正在修复...", flush=True)
+            # 从 assistant 消息中移除孤立的 tool_use block
+            fixed_msgs = []
+            for msg in anthropic_messages:
+                if msg["role"] == "assistant":
+                    content_blocks = msg.get("content", "")
+                    if isinstance(content_blocks, list):
+                        new_blocks = []
+                        for block in content_blocks:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                if block.get("id", "") in real_orphan_ids:
+                                    print(f"     移除孤立 tool_use: {block.get('id', '')[:20]}... ({block.get('name', '')})", flush=True)
+                                    continue  # 跳过这个孤立的 tool_use
+                            new_blocks.append(block)
+                        # 如果所有 block 都被移除了，就完全跳过这个 assistant 消息
+                        if not new_blocks:
+                            continue
+                        msg["content"] = new_blocks
+                fixed_msgs.append(msg)
+            anthropic_messages = fixed_msgs
+        else:
+            print(f"   ℹ️ 所有 {len(orphan_tool_use_ids)} 个疑似孤立的 tool_use 均属于 IMAGE_TOOLS，已保留", flush=True)
     
     # 同时也检查是否有多余的 tool_result（没有对应 tool_use 的）
     orphan_tool_result_ids = all_tool_result_ids - all_tool_use_ids
