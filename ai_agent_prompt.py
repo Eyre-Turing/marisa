@@ -360,8 +360,34 @@ def _call_anthropic_api(config, messages, tools=None):
         elif role == "user":
             # 检查是否是 tool_result（Anthropic 的 tool_result 用 role: user + content blocks）
             if isinstance(content, list):
-                # 已经是 Anthropic 格式的 content blocks，直接使用
-                anthropic_messages.append({"role": "user", "content": content})
+                # 将 OpenAI 多模态格式（image_url）转换为 Anthropic 格式（image）
+                converted_blocks = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "image_url":
+                        # 从 data URL 中提取 base64 和 mime 类型
+                        image_url = block.get("image_url", {}).get("url", "")
+                        if image_url.startswith("data:"):
+                            # 格式: data:image/png;base64,xxxx
+                            try:
+                                header, b64_data = image_url.split(",", 1)
+                                media_type = header.split(":")[1].split(";")[0]
+                                converted_blocks.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": b64_data
+                                    }
+                                })
+                            except (ValueError, IndexError):
+                                # 转换失败，保留原样
+                                converted_blocks.append(block)
+                        else:
+                            # 不是 data URL（如 http URL），保留原样
+                            converted_blocks.append(block)
+                    else:
+                        converted_blocks.append(block)
+                anthropic_messages.append({"role": "user", "content": converted_blocks})
             else:
                 anthropic_messages.append({"role": "user", "content": content})
         elif role == "assistant":
@@ -909,6 +935,23 @@ tools = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_image",
+            "description": "读取图片文件并转为 base64 编码。当用户提供了图片文件路径时，调用此工具读取图片。读取成功后图片会自动以多模态格式（role:user）注入对话，你可以直接看到图片内容。支持的格式: png, jpg, jpeg, gif, bmp, webp 等。最大支持 5MB。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "图片文件的完整路径（支持绝对路径和相对路径）"
+                    }
+                },
+                "required": ["filepath"]
+            }
+        }
+    },
 ]
 
 # ============================================================
@@ -1089,6 +1132,70 @@ def _refresh_mcp_tools():
 # 后续的 tool response 追加和 API 调用会基于错误的上下文继续执行
 TERMINAL_TOOLS = {"compress"}
 
+# 图片工具集合：执行这些工具后不会追加 tool response，
+# 而是改为注入一条 role:user 的多模态消息（包含图片 base64）
+IMAGE_TOOLS = {"read_image"}
+
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 图片最大 5MB
+
+
+def read_image(filepath):
+    """读取图片文件，转为 base64 编码返回
+    
+    这个工具由大模型调用，读取用户指定的图片文件并转为 base64 格式。
+    工具本身不修改全局 messages，调用结果由主循环特殊处理：
+    不追加 tool response，而是注入一条 role:user 的多模态消息。
+    """
+    try:
+        import base64
+        import mimetypes
+    except ImportError:
+        return json.dumps({"success": 0, "err": "缺少 base64 或 mimetypes 模块"})
+
+    filepath = _normalize_path(filepath)
+    
+    if not os.path.exists(filepath):
+        return json.dumps({"success": 0, "err": f"文件不存在: {filepath}"})
+    
+    # 检查文件大小
+    file_size = os.path.getsize(filepath)
+    if file_size > MAX_IMAGE_SIZE:
+        return json.dumps({
+            "success": 0, 
+            "err": f"图片过大: {file_size // 1024}KB，最大支持 {MAX_IMAGE_SIZE // 1024 // 1024}MB"
+        })
+    
+    # 猜测 MIME 类型
+    mime_type, _ = mimetypes.guess_type(filepath)
+    if not mime_type or not mime_type.startswith("image/"):
+        return json.dumps({"success": 0, "err": f"不支持的文件类型或不是图片: {filepath} (mime: {mime_type})"})
+    
+    try:
+        with open(filepath, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        return json.dumps({"success": 0, "err": f"读取文件失败: {e}"})
+    
+    b64_size_kb = len(b64) * 3 // 4 // 1024  # base64 解码后的实际大小
+    
+    print(
+        f"\n📷 图片读取成功!\n"
+        f"   文件: {filepath}\n"
+        f"   类型: {mime_type}\n"
+        f"   大小: {b64_size_kb}KB\n"
+        f"   base64: {len(b64)} 字符\n",
+        flush=True
+    )
+    
+    return json.dumps({
+        "success": 1,
+        "filepath": filepath,
+        "mime": mime_type,
+        "base64": b64,
+        "size_kb": b64_size_kb,
+        "message": f"图片已读取，大小约 {b64_size_kb}KB"
+    })
 
 
 def get_code_path():
@@ -2524,6 +2631,7 @@ tool_func_map = {
     "mcp_connect_server": mcp_connect_server,
     "mcp_disconnect_server": mcp_disconnect_server,
     "mcp_restart_server": mcp_restart_server,
+    "read_image": read_image,
 }
 
 
@@ -2895,6 +3003,7 @@ def main():
 
                 # ---------- 逐个执行工具 ----------
                 terminal_tool_called = False  # 标记是否调用了终止型工具
+                image_tool_called = False     # 标记是否调用了图片工具
 
                 for tool in tool_calls_list:
                     # 每次执行工具前检查中断
@@ -2914,9 +3023,11 @@ def main():
                         continue
 
                     tool_name = tool["function"]["name"]
+                    tool_name = tool["function"]["name"]
 
-                    # 判断是否是终止型工具（如 compress）
-                    is_terminal = tool_name in TERMINAL_TOOLS
+                    # 判断工具类型
+                    is_terminal = tool_name in TERMINAL_TOOLS  # 终止型（如 compress）
+                    is_image = tool_name in IMAGE_TOOLS       # 图片型（如 read_image）
 
                     # 🔧 try-except 容错：大模型传错参数名时把报错返回给它自己整改
                     try:
@@ -2941,6 +3052,47 @@ def main():
                         print("   ↳ 压缩完成，上下文已刷新！", flush=True)
                         break
 
+                    # 🖼️ 图片工具的特殊处理：
+                    # 不追加 tool response，而是注入一条 role:user 的多模态消息
+                    if is_image:
+                        try:
+                            result_data = json.loads(tool_result)
+                        except (json.JSONDecodeError, TypeError):
+                            result_data = {"success": 0}
+
+                        if result_data.get("success"):
+                            img_base64 = result_data["base64"]
+                            img_mime = result_data["mime"]
+                            img_path = result_data["filepath"]
+                            # 注入一条 role:user 的多模态消息，包含图片
+                            messages.append({
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": f"[这是你刚才请求读取的图片：{img_path}]"
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{img_mime};base64,{img_base64}"
+                                        }
+                                    }
+                                ]
+                            })
+                            print(f"   🖼️ 图片已注入对话上下文: {img_path}", flush=True)
+                            image_tool_called = True  # 在循环外定义
+                        else:
+                            # 读取失败，用 tool response 告知大模型错误信息
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "name": tool_name,
+                                "content": tool_result
+                            })
+                            print(f"   ⚠️ 图片读取失败: {result_data.get('err', '未知错误')}", flush=True)
+                        continue  # 继续处理其他工具
+
                     # 正常工具：追加 tool response
                     messages.append({
                         "role": "tool",
@@ -2953,6 +3105,11 @@ def main():
                 if terminal_tool_called:
                     save_messages_snapshot(messages)
                     break
+                # 如果调用了图片工具，继续下一轮 API 调用让大模型看到图片
+                if image_tool_called:
+                    save_messages_snapshot(messages)
+                    print("   ↳ 图片已注入，继续识别图片内容...", flush=True)
+                    continue
                 # 如果被中断，跳出工具循环
                 if interrupted:
                     # 从 assistant 消息位置开始全部删除，防止下轮API报400
