@@ -281,6 +281,21 @@ def call_api(messages, tools=None, tool_choice="auto"):
         raise
 
 
+def _has_multimodal_content(msgs):
+    """检查 messages 列表中是否包含多模态内容（content 为 list 且含 image_url 等非 text 类型的 block）。
+    
+    用于判断 API 400 报错是否可能是因为模型不支持多模态导致的。
+    不依赖 API 返回的错误信息格式，直接检查我们发送的数据结构。
+    """
+    for msg in msgs:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") != "text":
+                    return True
+    return False
+
+
 def _strip_multimodal(msgs):
     """
     直接原地修改 messages 列表，删除多模态结构的数据。
@@ -327,7 +342,7 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     """
     实际执行 OpenAI 风格 API 请求。
     
-    如果 HTTP 400 报错且包含 image_url 关键字（模型不支持多模态），
+    如果 HTTP 400 报错且 messages 中包含多模态内容（模型可能不支持多模态），
     自动将全局 messages 中的多模态数据删除，然后重试一次。
     """
     payload = {
@@ -347,10 +362,11 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         
-        # 🗑️ 检测到多模态数据导致 API 报错，直接删除并重试
-        if allow_retry and e.code == 400 and "image_url" in error_body:
+        # 🗑️ 检测到 400 错误且 messages 中包含多模态内容，删除并重试
+        # 不依赖错误信息中的关键字，直接检查我们发送的数据结构
+        if allow_retry and e.code == 400 and _has_multimodal_content(messages):
             print(
-                "   🗑️ 模型不支持多模态（image_url），自动清理多模态数据后重试...",
+                "   🗑️ HTTP 400 且上下文含多模态数据，自动清理后重试...",
                 flush=True
             )
             _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
