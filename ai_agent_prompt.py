@@ -271,7 +271,7 @@ def call_api(messages, tools=None, tool_choice="auto"):
 
     try:
         if protocol == "anthropic":
-            result = _call_anthropic_api(config, messages, tools)
+            result = _call_anthropic_api(config, messages, tools, allow_retry=True)
         else:
             result = _call_openai_api(config, messages, tools, tool_choice)
         return result
@@ -300,21 +300,27 @@ def _strip_multimodal(msgs):
     """
     直接原地修改 messages 列表，删除多模态结构的数据。
     
-    将 content 为数组格式（多模态）的消息改为纯文本字符串，
-    只保留 text 类型的内容，image_url 数据直接丢弃不保留。
+    如果消息的 role 为 "user" 且 content 为数组格式（多模态），
+    则将该消息整条删除。
+    这是因为在不支持多模态的模型场景下，留着这些 user 消息
+    会破坏 assistant(tool_calls) 跟 tool 响应的配对关系，
+    导致报错 "An assistant message with 'tool_calls' must be followed by tool messages..."。
+    
+    其他角色（assistant、tool、system）的消息不动，
+    大模型自己会处理残留的 tool_calls 和 tool response。
+    
     返回是否做了修改（True=有改动）。
     """
     modified = False
-    for msg in msgs:
-        content = msg.get("content")
-        if isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                # image_url 和其他非 text 类型直接丢弃，不留占位符
-            msg["content"] = "\n".join(text_parts)
+    # 从后往前遍历，这样删除不会影响前面的索引
+    i = len(msgs) - 1
+    while i >= 0:
+        msg = msgs[i]
+        # 只删除 role 为 "user" 且 content 为 list（多模态格式）的消息
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            msgs.pop(i)
             modified = True
+        i -= 1
     return modified
 
 
@@ -389,11 +395,14 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     return msg, reasoning_content
 
 
-def _call_anthropic_api(config, messages, tools=None):
+def _call_anthropic_api(config, messages, tools=None, allow_retry=True):
     """
     Anthropic 风格 API 调用。
     将内部 OpenAI 格式的 messages 转换为 Anthropic 格式，
     并处理响应中的 tool_use content blocks。
+
+    如果 HTTP 400 报错且原始 messages 中包含多模态内容，
+    会自动清理全局 messages 中的多模态 user 消息并重试一次。
     """
     api_key = config["api_key"]
     url = config.get("base_url", "https://api.anthropic.com").rstrip("/")
@@ -740,6 +749,19 @@ def _call_anthropic_api(config, messages, tools=None):
             result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
+
+        # 🗑️ 检测到 400 错误且原始 messages 中包含多模态内容，清理并重试
+        if allow_retry and e.code == 400 and _has_multimodal_content(messages):
+            print(
+                "   🗑️ Anthropic HTTP 400 且上下文含多模态数据，自动清理后重试...",
+                flush=True
+            )
+            _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+            return _call_anthropic_api(
+                config, messages, tools,
+                allow_retry=False  # 防止无限递归
+            )
+
         raise RuntimeError(f"Anthropic API 请求失败 (HTTP {e.code}): {error_body}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {e.reason}")
