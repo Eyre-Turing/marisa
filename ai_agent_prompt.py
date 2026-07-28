@@ -1848,14 +1848,12 @@ def _resume_from_log(log_path):
 # ============================================================
 
 def _expire_large_content():
-    """扫描 messages 中所有 role=tool 的消息，对大内容进行计数和过期处理。
+    """扫描 messages 中所有 role=tool 的大内容以及 role=user 的多模态消息，进行计数和过期处理。
 
-    每次外层 while 循环开始时调用。逻辑：
-    1. 遍历 messages 中所有 role=tool 的消息
-    2. 检查 content 的字符串长度，如果超过 LARGE_CONTENT_THRESHOLD 则视为大内容
-    3. 在 large_content_counter 中对该 tool_call_id 计数 +1
-    4. 如果计数达到 LARGE_CONTENT_EXPIRE_ROUNDS，把 content 替换为过期提示
-    5. 已过期的消息不再参与后续计数
+    每次外层 while 循环开始以及内层工具循环每次迭代时调用。逻辑：
+    1. 遍历 messages 中所有 role=tool 的消息，检查 content 长度，超过阈值则计数，达到轮数则过期
+    2. 遍历 messages 中所有 role=user 且 content 为 list（多模态）的消息，同样计数和过期
+    3. 已过期的消息不参与后续计数
 
     注意：此函数不依赖工具函数内部的任何标记（如 is_large），
     完全基于 content 的实际大小来判断。
@@ -1865,33 +1863,52 @@ def _expire_large_content():
     if not messages:
         return
 
+    import hashlib
     expired_count = 0
     for msg in messages:
-        if msg.get("role") != "tool":
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # --- 判断是否为"大内容"，提取 key 和 content_size ---
+        key = None
+        content_size = 0
+        tool_call_id = ""
+
+        if role == "tool":
+            if not isinstance(content, str):
+                continue
+            tool_call_id = msg.get("tool_call_id", "")
+            if not tool_call_id:
+                continue
+            if content.startswith("[数据已过期"):
+                continue
+            if len(content) <= LARGE_CONTENT_THRESHOLD:
+                continue
+            key = f"tool:{tool_call_id}"
+            content_size = len(content)
+
+        elif role == "user" and isinstance(content, list):
+            # 多模态 user 消息：content 是 list 结构
+            content_str = json.dumps(content, ensure_ascii=False, sort_keys=True)
+            if len(content_str) <= LARGE_CONTENT_THRESHOLD:
+                continue
+            content_hash = hashlib.md5(content_str.encode()).hexdigest()[:16]
+            key = f"user_mm:{content_hash}"
+            content_size = len(content_str)
+
+        if key is None:
             continue
 
-        tool_call_id = msg.get("tool_call_id", "")
-        if not tool_call_id:
-            continue
+        # --- 计数 ---
+        count = large_content_counter.get(key, 0) + 1
+        large_content_counter[key] = count
 
-        content = msg.get("content", "")
-        if not isinstance(content, str):
-            continue
+        # --- 达到过期轮数则替换 ---
+        if count >= LARGE_CONTENT_EXPIRE_ROUNDS:
+            old_size = content_size
 
-        # 跳过已经过期了的内容
-        if content.startswith("[数据已过期"):
-            continue
-
-        # 直接根据 content 长度判断是否为大内容（不解析 JSON，不看标记）
-        if len(content) > LARGE_CONTENT_THRESHOLD:
-            # 这是一个大内容，计数 +1
-            count = large_content_counter.get(tool_call_id, 0) + 1
-            large_content_counter[tool_call_id] = count
-
-            if count >= LARGE_CONTENT_EXPIRE_ROUNDS:
-                # 达到过期轮数，替换内容
-                old_size = len(content)
-                # 尝试从 JSON 中提取文件名等信息作为参考
+            if role == "tool":
+                # 工具消息：尝试提取文件名做参考
                 original_filename = ""
                 try:
                     parsed = json.loads(content)
@@ -1907,10 +1924,17 @@ def _expire_large_content():
                     "_original_filename": original_filename,
                     "_original_size": old_size
                 })
-                # 从计数器中移除，避免重复触发
-                large_content_counter.pop(tool_call_id, None)
-                expired_count += 1
-                print(f"   ⏰ 大内容过期: tool_call_id={tool_call_id[:16]}... (原大小 {old_size//1024}KB, 已存在 {count} 轮)", flush=True)
+                display_id = tool_call_id[:20]
+                tag = "tool_call"
+            else:
+                # 多模态 user 消息：替换为简短过期文本
+                msg["content"] = f"[多模态数据已过期：原始大小 {old_size//1024}KB，已在对话中存在 {count} 轮]"
+                display_id = content_hash
+                tag = "多模态"
+
+            large_content_counter.pop(key, None)
+            expired_count += 1
+            print(f"   ⏰ 大内容过期: {tag}_id={display_id}... (原大小 {old_size//1024}KB, 已存在 {count} 轮)", flush=True)
 
     if expired_count > 0:
         print(f"   🧹 本次过期了 {expired_count} 条大内容，当前 messages 大小: {get_context_size(messages)//1024}KB", flush=True)
@@ -1925,7 +1949,7 @@ def _squash_tool_calls_automatically(msg_list):
 
     规则：
     - 保留 system prompt（第0条）
-    - 保留所有 role=user 的消息（用户的指令/提问）
+    - 保留所有非多模态的 user 消息（纯文本 user 保留，多模态 user 也删掉）
     - 保留最近 KEEP_RECENT_ROUNDS 轮完整的 assistant(tool_calls) + tool 配对
     - 删除中间轮次的 assistant(有tool_calls) 及其后面紧跟着的 tool 消息
     - 其他消息（如无 tool_calls 的 assistant 总结、system 等）不动
@@ -1953,10 +1977,13 @@ def _squash_tool_calls_automatically(msg_list):
     # 保留 system prompt（第0条）
     keep_indices.add(0)
 
-    # 保留所有 user 消息
+    # 保留所有非多模态的 user 消息（纯文本 user 消息保留，多模态的也删掉）
     for i, msg in enumerate(msg_list):
         if msg.get("role") == "user":
-            keep_indices.add(i)
+            content = msg.get("content")
+            # 多模态消息的 content 是 list（如图片+文本），纯文本消息的 content 是 str
+            if isinstance(content, str):
+                keep_indices.add(i)
 
     # 保留最近 KEEP_RECENT_ROUNDS 轮的 assistant(tool_calls) + 对应的 tool 消息
     recent_assistant_idxs = assistant_tool_idxs[-KEEP_RECENT_ROUNDS:]
@@ -3054,6 +3081,11 @@ def main():
                 if interrupted:
                     print("   ↳ 用户中断，跳过剩余工具调用", flush=True)
                     break
+
+
+                # ⏰ 大内容过期：工具循环中也定期过期 tool 返回和 user 多模态消息
+                if not interrupted:
+                    _expire_large_content()
 
                 # 📦 无人值守自动压缩：工具循环中上下文超阈值时自动压缩中间的工具调用
                 if not interrupted and get_context_size(messages) > COMPRESS_THRESHOLD:
