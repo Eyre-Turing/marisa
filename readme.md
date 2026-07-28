@@ -115,6 +115,27 @@ Marisa 支持通过 MCP 协议连接外部工具服务。以 **Blender MCP** 为
 }
 ```
 
+考虑到最近 blender-mcp 搞事情，把 api 版本更新了，导致不兼容低版本，可以在 args 里指定使用低版本，如强制使用 1.29.0 版本：
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "blender",
+      "transport": "stdio",
+      "enabled": true,
+      "command": "C:\\Users\\User\\.local\\bin\\uvx.exe",
+      "args": ["--with", "mcp==1.29.0", "blender-mcp"],
+      "env": {},
+      "auto_connect": true,
+      "tool_prefix": "blender_",
+      "timeout": 180,
+      "debug": false
+    }
+  ]
+}
+```
+
 ### 使用
 
 启动 Marisa 后，MCP 服务会自动连接。你只需要告诉 Marisa 要在 Blender 里做什么，它就会自动调用 Blender MCP 的工具帮你建模！
