@@ -362,19 +362,27 @@ class MCPStdioServer:
         content_parts = result.get("content", [])
         
         text_parts = []
+        image_parts = []  # 📸 收集图片数据，不再丢弃！
         for part in content_parts:
             part_type = part.get("type", "")
             if part_type == "text":
                 text_parts.append(part.get("text", ""))
             elif part_type == "image":
-                # 图片数据以 base64 形式返回，这里简单标记
-                text_parts.append(f"[Image: {part.get('mimeType', 'unknown')}]")
+                # 📸 保留完整的 base64 图片数据，供上层注入多模态消息
+                mime = part.get("mimeType", "image/png")
+                data = part.get("data", "")
+                if data:
+                    image_parts.append({"base64": data, "mimeType": mime})
+                    text_parts.append(f"[Image: {mime}, {len(data)//1024}KB base64]")
+                else:
+                    text_parts.append(f"[Image: {mime}, no data]")
             elif part_type == "resource":
                 text_parts.append(f"[Resource: {part.get('uri', 'unknown')}]")
             else:
                 text_parts.append(str(part))
         
-        return "\n".join(text_parts)
+        # 返回结构化 dict：text 给普通工具响应，images 给主循环注入多模态
+        return {"text": "\n".join(text_parts), "images": image_parts}
     
     def disconnect(self):
         """断开 MCP 服务器连接"""

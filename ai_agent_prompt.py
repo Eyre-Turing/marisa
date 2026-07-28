@@ -1080,11 +1080,27 @@ def _merge_mcp_tools():
 
 # MCP 工具调用路由 —— 所有 MCP 工具的调用都会走这个函数
 def mcp_call_tool(tool_name, **arguments):
-    """调用 MCP 工具（由 tool_func_map 路由）"""
+    """调用 MCP 工具（由 tool_func_map 路由）
+    
+    MCP 工具返回的结果现在是结构化 dict: {"text": "...", "images": [...]}
+    如果包含图片数据，会在返回 JSON 中加入 _mcp_images 字段，
+    供主循环检测并注入多模态 user 消息（类似 read_image 的处理方式）。
+    """
     try:
         mcp = get_mcp_manager()
         result = mcp.call_tool(tool_name, arguments)
-        return json.dumps({"success": 1, "result": result})
+        # result 现在是 dict: {"text": "...", "images": [{"base64": "...", "mimeType": "..."}]}
+        if isinstance(result, dict):
+            text = result.get("text", "")
+            images = result.get("images", [])
+            response = {"success": 1, "result": text}
+            if images:
+                response["_mcp_images"] = images
+                print(f"   📸 MCP 工具 {tool_name} 返回了 {len(images)} 张图片", flush=True)
+            return json.dumps(response)
+        else:
+            # 兼容旧格式（纯字符串）
+            return json.dumps({"success": 1, "result": str(result)})
     except Exception as e:
         err_msg = f"MCP 工具 {tool_name} 调用失败: {e}"
         print(f"   ⚠️ {err_msg}", flush=True)
@@ -3209,6 +3225,66 @@ def main():
                             })
                             print(f"   ⚠️ 图片读取失败: {result_data.get('err', '未知错误')}", flush=True)
                         continue  # 继续处理其他工具
+
+                    # 📸 MCP 图片检测：任何工具（包括 MCP 工具）返回的结果中
+                    # 如果包含 _mcp_images 字段，像 IMAGE_TOOLS 一样注入多模态消息
+                    mcp_images = None
+                    try:
+                        _tr_parsed = json.loads(tool_result)
+                        if isinstance(_tr_parsed, dict) and "_mcp_images" in _tr_parsed:
+                            mcp_images = _tr_parsed["_mcp_images"]
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    if mcp_images and isinstance(mcp_images, list) and len(mcp_images) > 0:
+                        # 第一步：追加 tool 响应（纯文本部分，满足 API 协议要求）
+                        # 从 tool_result 中去掉 _mcp_images 字段再存入
+                        try:
+                            _clean_result = json.loads(tool_result)
+                            if isinstance(_clean_result, dict):
+                                _clean_result.pop("_mcp_images", None)
+                                clean_tool_content = json.dumps(_clean_result)
+                            else:
+                                clean_tool_content = tool_result
+                        except (json.JSONDecodeError, TypeError):
+                            clean_tool_content = tool_result
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool["id"],
+                            "name": tool_name,
+                            "content": clean_tool_content
+                        })
+                        # 第二步：为每张图片注入 role:user 的多模态消息
+                        for img_idx, img in enumerate(mcp_images):
+                            if not isinstance(img, dict):
+                                continue
+                            img_b64 = img.get("base64", "")
+                            img_mime = img.get("mimeType", "image/png")
+                            if not img_b64:
+                                continue
+                            img_size_kb = len(img_b64) * 3 // 4 // 1024
+                            img_label = f"[MCP 工具 {tool_name} 返回的图片"
+                            if len(mcp_images) > 1:
+                                img_label += f" {img_idx + 1}/{len(mcp_images)}"
+                            img_label += f" ({img_size_kb}KB)]"
+                            messages.append({
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": img_label
+                                    },
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{img_mime};base64,{img_b64}"
+                                        }
+                                    }
+                                ]
+                            })
+                            print(f"   🖼️ MCP 图片已注入对话上下文：{img_label}", flush=True)
+                        image_tool_called = True
+                        continue  # 跳过正常 tool response 追加
 
                     # 正常工具：追加 tool response
                     messages.append({
