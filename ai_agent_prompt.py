@@ -147,7 +147,7 @@ COMPRESS_THRESHOLD = 700_000
 # 达到过期轮数后自动替换为过期提示
 LARGE_CONTENT_THRESHOLD = 50 * 1024  # 50KB
 # 大内容在 messages 中存在超过此轮数（外层 while 循环次数）后自动过期
-LARGE_CONTENT_EXPIRE_ROUNDS = 5
+LARGE_CONTENT_EXPIRE_ROUNDS = 50
 
 # 工具函数硬截断阈值（第一层：保底保护）
 # 当工具返回的内容超过此大小时，直接截断保留前 N 字节，
@@ -1956,7 +1956,7 @@ def _squash_tool_calls_automatically(msg_list):
 
     返回值: bool — 是否真的做了压缩
     """
-    KEEP_RECENT_ROUNDS = 2  # 保留最近几轮完整的工具调用
+    KEEP_RECENT_ROUNDS = 20  # 保留最近几轮完整的工具调用
 
     if len(msg_list) < 3:
         return False
