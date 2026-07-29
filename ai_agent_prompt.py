@@ -2015,6 +2015,15 @@ def _squash_tool_calls_automatically(msg_list):
             else:
                 break
 
+    # 🐛 修复：删除不在 keep_indices 中的多模态 user 消息（图片 base64 数据）
+    # 多模态 user 消息的 content 为 list（如图片+文本），纯文本 user 的 content 为 str。
+    # 之前只把 str 类型的纯文本 user 加入了 keep_indices，而多模态 user 既不在
+    # keep_indices 中，也不在 assistant/tool 的删除逻辑里，导致它们无限累积占用上下文。
+    for i, msg in enumerate(msg_list):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            if i not in keep_indices:
+                to_delete.add(i)
+
     if not to_delete:
         return False
 
