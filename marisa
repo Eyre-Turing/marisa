@@ -17,9 +17,12 @@ else
     exit 1
 fi
 
-# 检测 winpty（可选，用来绕过 MSYS2 管道缓冲）
+# 检测 winpty（可选，用来在 mintty 中提供伪终端，让原生 Windows 程序能交互）
+# winpty 仅适用于「交互式终端」场景；当 stdin 是管道/重定向（非 TTY）时，
+# 直接用 winpty 会报 "stdin: not a tty" 之类的错误，此时必须绕过 winpty，
+# 让 Python 自己通过非 TTY 逻辑读取管道输入。
 _WINPTY=""
-if type winpty >/dev/null 2>&1; then
+if type winpty >/dev/null 2>&1 && [ -t 0 ]; then
     _WINPTY="winpty"
 fi
 

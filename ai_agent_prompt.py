@@ -27,9 +27,17 @@ import datetime
 import pathlib
 import argparse
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.key_binding import KeyBindings
+# prompt_toolkit 为可选依赖 —— 有则用其增强输入（多行、历史、快捷键），无则退化为 input()
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    HAS_PROMPT_TOOLKIT = True
+except ImportError:
+    PromptSession = None
+    InMemoryHistory = None
+    KeyBindings = None
+    HAS_PROMPT_TOOLKIT = False
 
 # MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
 # 通过 mcp_manager.py 统一管理 stdio/HTTP 模式的 MCP 服务器连接
@@ -120,6 +128,10 @@ def save_config(config):
 tool_executing = False
 interrupted = False
 
+# 是否为 input() 退化模式（prompt_toolkit 不可用或被 --no-prompt-toolkit 强制禁用时置 True）。
+# 用于 sigint_handler 区分 Ctrl+C 的处理方式。
+USE_INPUT_MODE = False
+
 
 def sigint_handler(signum, frame):
     """Ctrl+C 信号处理器"""
@@ -129,8 +141,14 @@ def sigint_handler(signum, frame):
         if not interrupted:
             interrupted = True
             print("\n\n⚠️  中断魔法吟唱！回到对话模式...\n", flush=True)
-    # 用户输入中：交给 prompt_toolkit 处理（默认引发 KeyboardInterrupt）
-
+        return
+    # 非工具执行中：
+    #   - prompt_toolkit 模式：由 prompt_toolkit 接管输入中的 Ctrl+C，这里不需要动作
+    #   - input() 模式：此 handler 是 Python 对 SIGINT 的唯一响应者，若什么都不做，
+    #     input() 就不会收到 KeyboardInterrupt，导致按 Ctrl+C 无法退出。
+    #     因此主动抛 KeyboardInterrupt，让主循环统一捕获并退出。
+    if USE_INPUT_MODE:
+        raise KeyboardInterrupt
 
 # ============================================================
 #  0. 上下文压缩相关常量 & 全局 messages
@@ -2851,35 +2869,107 @@ def _cleanup_mcp_tools():
 
 
 # ============================================================
-#  3. 创建 prompt_toolkit session 及快捷键绑定
+#  3. 输入处理 —— prompt_toolkit 会话 / 退化 input 多行读取
 # ============================================================
 def create_prompt_session():
-    """创建一个支持多行输入的 PromptSession"""
-    
+    """创建一个支持多行输入的 PromptSession（需 prompt_toolkit 可用时调用）"""
+    if not HAS_PROMPT_TOOLKIT:
+        # 组件缺失时不应被调用，返回 None 让调用方走 input 分支
+        return None
+
     # 自定义快捷键绑定
     bindings = KeyBindings()
-    
+
     # 按 Ctrl+D 退出程序
-    from prompt_toolkit.keys import Keys
-    
-    @bindings.add(Keys.ControlD)
-    def exit_(event):
-        """Ctrl+D 退出"""
-        event.app.exit(result=None)  # 返回 None 表示退出
-    
-    # 也可以用 Ctrl+C 退出——不过默认 Ctrl+C 会引发 KeyboardInterrupt
-    
+    try:
+        from prompt_toolkit.keys import Keys
+
+        @bindings.add(Keys.ControlD)
+        def exit_(event):
+            """Ctrl+D 退出"""
+            event.app.exit(result=None)  # 返回 None 表示退出
+
+        # 也可以用 Ctrl+C 退出——不过默认 Ctrl+C 会引发 KeyboardInterrupt
+    except ImportError:
+        pass  # 快捷键增强（Keys）不可用时跳过，不影响基本多行输入
+
     session = PromptSession(
         multiline=True,          # 支持多行输入！
         history=InMemoryHistory(),
         key_bindings=bindings,
-        # 在提示语中说明操作方式
-        prompt_continuation="   ",
+        prompt_continuation="   ",  # 续行提示缩进
     )
 
     session.app.paste_mode = lambda: True
-    
+
     return session
+
+
+def read_multiline_input(prompt):
+    """退化版多行输入：纯 input() 逐行读取。
+
+    多行消息终止规则（参考 SMTP 的 '.'）：
+      - 用户输入的某一行为单个 '.' 时，视为整句话结束标记
+      - 用户如需输入一行以 '.' 开头的内容，须以 '..' 开头（此处还原为单个 '.'）
+      - 其余任意行原样拼入，不做转义
+
+    Ctrl+C 会向上抛出 KeyboardInterrupt（由主循环统一处理），
+    Ctrl+D / EOF 抛出 EOFError（同上）。
+    """
+    lines = []
+    prompt_display = prompt
+    while True:
+        try:
+            line = input(prompt_display)
+        except EOFError:
+            # 无内容时 EOF 视为取消/退出；已有内容时结束本段输入
+            if not lines:
+                raise
+            break
+        # 首行之后续行不再显示 "我: "，改显示空提示或续行符号
+        prompt_display = ""
+        if line == ".":
+            # 单行 '.' = 结束标记
+            break
+        if line.startswith(".."):
+            # '..' 开头还原为 '.'，其余保留
+            line = line[1:]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def split_pipe_messages(text):
+    """将管道/重定向输入的内容按 SMTP '.' 协议切分成多条独立消息。
+
+    规则（与交互式 input 模式一致）：
+      - 某一行内容恰好为 '.'（去掉行尾换行符后）→ 当前消息至此结束，开启下一条
+      - '..' 开头的行 → 还原为 '.' 开头的一个字符（用于在消息中转义单点开头）
+      - 其余行原样加入当前消息
+    输入兼容 '\\r\\n' 和 '\\n' 两种换行。
+
+    例如输入："你好\\n.\\n今天天气怎么样\\n.\\n" → ['你好', '今天天气怎么样']
+    """
+    # 统一换行符为 '\n'
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    lines = text.split('\n')
+    messages = []
+    current = []
+    for raw in lines:
+        line = raw
+        if line == '.':
+            # 当前消息结束；结束标记本身不进入内容
+            messages.append("\n".join(current))
+            current = []
+        elif line.startswith('..'):
+            # 转义：'..' 开头还原为单个 '.'
+            current.append(line[1:])
+        else:
+            current.append(line)
+    # 若内容未以 '.' 结束（EOF 前没有结束标记），把残留也作为一条消息
+    if current:
+        messages.append("\n".join(current))
+    # 去除完全空白的分段（结束标记之间无内容、或首尾多余空行等）
+    return [m for m in messages if m.strip() != ""]
 
 
 # ============================================================
@@ -2896,6 +2986,8 @@ def main():
     parser = argparse.ArgumentParser(description='魔理沙 AI Agent - 兴趣使然的对话助手')
     parser.add_argument('-r', '--resume', type=str, default=None,
                         help='从日志文件恢复会话，用法：-r /path/to/log/file.log')
+    parser.add_argument('--no-prompt-toolkit', action='store_true',
+                        help='强制退化使用 input() 输入（即使环境装有 prompt_toolkit 也不用）')
     args = parser.parse_args()
 
     # 加载 API 配置（如果配置文件不存在或字段缺失，会提示用户输入）
@@ -2964,13 +3056,52 @@ def main():
             {"role": "system", "content": system_prompt}
         ]
 
-    print("🧙 魔理沙 (多行输入模式)", flush=True)
-    print("   📝 回车=换行  |  Alt+Enter(或Esc+Enter)=提交", flush=True)
-    print("   ❌ Ctrl+C=退出  |  Ctrl+D=退出", flush=True)
-    print("   ⚡ 工具执行中按Ctrl+C=中断魔法\n", flush=True)
+    # 判断是否管道/重定向输入（stdin 非 TTY）。此时无法用 prompt_toolkit（其要求 TTY），
+    # 且无需交互循环——读取 stdin 全部内容作为单条输入，处理完即自动退出。
+    pipe_mode = not sys.stdin.isatty()
 
-    # 创建 prompt session
-    session = create_prompt_session()
+    # 决定输入模式：有依赖且未强制禁用，且 stdin 是 TTY → 用 prompt_toolkit；否则退化 input()
+    use_prompt_toolkit = HAS_PROMPT_TOOLKIT and not args.no_prompt_toolkit and not pipe_mode
+    global USE_INPUT_MODE
+    USE_INPUT_MODE = not use_prompt_toolkit
+
+    if use_prompt_toolkit:
+        print("🧙 魔理沙 (多行输入模式 prompt_toolkit)", flush=True)
+        print("   📝 回车=换行  |  Alt+Enter(或Esc+Enter)=提交", flush=True)
+        print("   ❌ Ctrl+C=退出  |  Ctrl+D=退出", flush=True)
+        print("   ⚡ 工具执行中按Ctrl+C=中断魔法\n", flush=True)
+    else:
+        if pipe_mode:
+            reason = "stdin 非 TTY（管道/重定向输入）"
+        elif not HAS_PROMPT_TOOLKIT:
+            reason = "环境未安装 prompt_toolkit"
+        else:
+            reason = "已按 --no-prompt-toolkit 强制退化"
+        print("🧙 魔理沙 (多行输入模式 input)", flush=True)
+        print(f"   ⚠️  检测到：{reason}", flush=True)
+        if pipe_mode:
+            print("   📤 从标准输入读入内容，按 '.' 行分隔成多条消息逐条处理，处理完自动退出\n", flush=True)
+        else:
+            print("   📝 每行输入一段，单行 '.' 结束整句话；以 '..' 开头的行会还原为 '.'", flush=True)
+            print("   ❌ 按 Ctrl+C 退出（Windows 下 Ctrl+D 不标准，请用 Ctrl+C 或输入 exit）  |  ⚡ 工具执行中按Ctrl+C=中断魔法\n", flush=True)
+
+    # 创建输入会话（prompt_toolkit 模式返回 session；input 模式返回 None）
+    session = create_prompt_session() if use_prompt_toolkit else None
+
+    # 管道模式：读取全部 stdin 内容，按 '.' 行分隔成多条消息，逐条处理
+    pipe_messages = []   # 待处理的消息列表（管道模式）
+    if pipe_mode:
+        try:
+            pipe_raw = sys.stdin.read()
+        except Exception as e:
+            print(f"   ⚠️  读取标准输入失败: {e}", flush=True)
+            pipe_raw = ""
+        pipe_messages = split_pipe_messages(pipe_raw)
+        if pipe_messages:
+            print(f"   📨 从标准输入读到 {len(pipe_messages)} 条消息，开始逐条处理...\n", flush=True)
+        else:
+            print("   📭 标准输入为空或没有有效消息，退出。\n", flush=True)
+    pipe_idx = 0   # 当前处理到第几条管道消息
 
     while True:
         # 每次外层循环开始时，执行大内容过期检查
@@ -2980,8 +3111,19 @@ def main():
         interrupted = False
 
         try:
-            # 使用 prompt_toolkit 的多行输入
-            user_input = session.prompt("我: ")
+            if pipe_mode:
+                # 管道模式：逐条取预解析好的消息；取完则退出
+                if pipe_idx < len(pipe_messages):
+                    user_input = pipe_messages[pipe_idx]
+                    pipe_idx += 1
+                else:
+                    break   # 所有管道消息处理完毕
+            elif use_prompt_toolkit:
+                # 使用 prompt_toolkit 的多行输入
+                user_input = session.prompt("我: ")
+            else:
+                # 退化版 input() 多行输入（单行 '.' 结束）
+                user_input = read_multiline_input("我: ")
         except KeyboardInterrupt:
             # Ctrl+C 在输入时引发 KeyboardInterrupt
             print("\n👋 再见！DA⭐ZE！\n", flush=True)
@@ -3000,6 +3142,9 @@ def main():
             break
 
         if not user_input.strip():
+            # 管道模式：若读到的内容为空（没有有效输入），直接退出，避免死循环
+            if pipe_mode:
+                break
             continue
 
         # ════════════════════════════════════════════════════════════
@@ -3375,7 +3520,7 @@ def main():
 
         finally:
             tool_executing = False
-    
+
     # ----- 程序退出时清理 MCP 连接 -----
     _cleanup_mcp_tools()
 
