@@ -3159,7 +3159,7 @@ def main():
         print("🧙 魔理沙 (多行输入模式 input)", flush=True)
         print(f"   ⚠️  检测到：{reason}", flush=True)
         if pipe_mode:
-            print("   📤 从标准输入读入内容，按 '.' 行分隔成多条消息逐条处理，处理完自动退出\n", flush=True)
+            print("   📤 流式读取标准输入：每收到一条以 '.' 行结尾（或管道关闭时）的消息就回答一次，直到 EOF 自动退出\n", flush=True)
         else:
             print("   📝 每行输入一段，单行 '.' 结束整句话；以 '..' 开头的行会还原为 '.'", flush=True)
             print("   ❌ 按 Ctrl+C 退出（Windows 下 Ctrl+D 不标准，请用 Ctrl+C 或输入 exit）  |  ⚡ 工具执行中按Ctrl+C=中断魔法\n", flush=True)
@@ -3167,20 +3167,11 @@ def main():
     # 创建输入会话（prompt_toolkit 模式返回 session；input 模式返回 None）
     session = create_prompt_session() if use_prompt_toolkit else None
 
-    # 管道模式：读取全部 stdin 内容，按 '.' 行分隔成多条消息，逐条处理
-    pipe_messages = []   # 待处理的消息列表（管道模式）
-    if pipe_mode:
-        try:
-            pipe_raw = sys.stdin.read()
-        except Exception as e:
-            print(f"   ⚠️  读取标准输入失败: {e}", flush=True)
-            pipe_raw = ""
-        pipe_messages = split_pipe_messages(pipe_raw)
-        if pipe_messages:
-            print(f"   📨 从标准输入读到 {len(pipe_messages)} 条消息，开始逐条处理...\n", flush=True)
-        else:
-            print("   📭 标准输入为空或没有有效消息，退出。\n", flush=True)
-    pipe_idx = 0   # 当前处理到第几条管道消息
+    # 说明：管道/重定向模式（stdin 非 TTY）不再预读全部 stdin。
+    # 原先用 sys.stdin.read() 一次读满会一直阻塞等 EOF——对 tail -f 这类流式
+    # 输入永远等不到管道关闭，导致用户等不到应答。现改为与退化 input 一致的
+    # 流式逐条读取：每收到一条以 '.' 结尾（或以 EOF 结束）的消息就回答一次。
+    # 由主循环中的 read_multiline_input 统一处理流式读取，读到 EOF 时自动退出。
 
     while True:
         # 每次外层循环开始时，执行大内容过期检查
@@ -3191,12 +3182,10 @@ def main():
 
         try:
             if pipe_mode:
-                # 管道模式：逐条取预解析好的消息；取完则退出
-                if pipe_idx < len(pipe_messages):
-                    user_input = pipe_messages[pipe_idx]
-                    pipe_idx += 1
-                else:
-                    break   # 所有管道消息处理完毕
+                # 管道/重定向模式：与退化 input 一致，流式逐条读取。
+                # 每收到一条以 '.' 结尾（或以 EOF 结束）的消息就返回一段，
+                # 由主循环回答一次后继续读下一条，直到 EOF 自动退出。
+                user_input = read_multiline_input("我: ")
             elif use_prompt_toolkit:
                 # 使用 prompt_toolkit 的多行输入
                 user_input = session.prompt("我: ")
@@ -3221,9 +3210,9 @@ def main():
             break
 
         if not user_input.strip():
-            # 管道模式：若读到的内容为空（没有有效输入），直接退出，避免死循环
-            if pipe_mode:
-                break
+            # 输入为空（只输入了逗结尾或空格）：与退化 input 一致，跳过继续读下一条。
+            # 管道模式也不在此退出——流式输入可能只是中间一条空消息，真正的终止由
+            # EOF（管道关闭）触发，届时 read_multiline_input 会抛 EOFError 由外层捕获退出。
             continue
 
         # ════════════════════════════════════════════════════════════
