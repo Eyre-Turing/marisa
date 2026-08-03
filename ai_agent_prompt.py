@@ -2416,6 +2416,85 @@ def _fix_messages_tool_order(msg_list):
 
 
 # ============================================================
+#  兜底清理：孤立 tool_calls 的 assistant 消息
+# ============================================================
+
+def _prune_incomplete_tool_calls(msg_list):
+    """兜底防御：修复 API 报 400 的根因
+    ("An assistant message with 'tool_calls' must be followed by tool messages
+     responding to each 'tool_call_id'")。
+
+    场景：多轮工具循环中，如果某条 assistant 消息包含 tool_calls，但其部分/全部
+    tool_call_id 在后面没有对应 role=tool 的消息去回应（例如工具名未知导致跳过、
+    执行中断、异常分支遗漏等），那么直接把这条坏消息序列发给 API 就会报 400。
+
+    策略：
+      1. 扫描 msg_list，找到所有带 tool_calls 的 assistant 消息及其 tool_call_ids。
+      2. 收集这些 id 在后面出现过的 role=tool 消息的 tool_call_id 集合。
+      3. 若某 assistant 的 tool_call_id 中有未被回应的，为每个缺失的 id 在其
+         assistant 消息之后补一条 tool 错误响应，保持配对完整（相比删除更保守，
+         保留 AI 的意图）。
+
+    参数:
+        msg_list: 要修复的 messages 列表（原地修改）。
+
+    返回:
+        int: 补了几条 tool 响应。
+    """
+    repaired = 0
+    # 收集所有已出现的 tool_call_id（用于判断某 id 是否已被回应过）
+    # 由于 tool 消息总是紧跟在其 assistant 之后，从前往后扫描时，只要
+    # 尚未遇到某 assistant 的 tool 回应，且之后出现了非 tool 消息，即视为缺失。
+    i = 0
+    n = len(msg_list)
+    while i < n:
+        msg = msg_list[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tcs = msg.get("tool_calls") or []
+            if not isinstance(tcs, list) or not tcs:
+                i += 1
+                continue
+            needed_ids = [tc.get("id") for tc in tcs if tc.get("id")]
+            replied_ids = set()
+            j = i + 1
+            # 向后扫描直到遇到下一条 assistant，收集这期间的所有 tool 消息 id
+            while j < n:
+                nxt = msg_list[j]
+                if nxt.get("role") == "assistant":
+                    break
+                if nxt.get("role") == "tool" and nxt.get("tool_call_id"):
+                    replied_ids.add(nxt.get("tool_call_id"))
+                j += 1
+            # 找出未回应的 id，在 assistant 之后补 tool 错误响应
+            missing = [tid for tid in needed_ids if tid not in replied_ids]
+            if missing:
+                # 从后往前插入，保持顺序（直接顺序插入即可，因为插在 assistant 之后）
+                known = ", ".join(sorted(tool_func_map.keys()))
+                insert_pos = i + 1
+                for tid in missing:
+                    msg_list.insert(insert_pos, {
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "name": "unknown_tool",
+                        "content": json.dumps({
+                            "success": 0,
+                            "err": (f"[兜底修复] 工具调用尚未收到响应即需要继续，"
+                                    f"视为未执行。若需该功能请改用可用工具：{known}。")
+                        }),
+                    })
+                    insert_pos += 1
+                    repaired += 1
+                n += len(missing)  # 列表变长，同步更新长度
+                i += len(missing)
+        i += 1
+    if repaired:
+        print(f"\n🛠 兜底修复：补齐 {repaired} 条缺失的 tool 响应，避免 API 报 400\n", flush=True)
+    return repaired
+
+
+# ============================================================
+
+# ============================================================
 #  Skills 技能加载系统 —— 按需从 skills/ 目录加载 Markdown 技能文件
 #  使用子 Agent 模式：根据任务描述自动分析并加载最匹配的技能
 # ============================================================
@@ -3199,9 +3278,20 @@ def main():
                     except json.JSONDecodeError:
                         continue
                     func = tool_func_map.get(tool["function"]["name"])
-                    if func is None:
-                        continue
                     tool_name = tool["function"]["name"]
+                    if func is None:
+                        # 同主循环：未知工具名追加 tool 错误响应，保持配对完整
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool["id"],
+                            "name": tool_name,
+                            "content": json.dumps({
+                                "success": 0,
+                                "err": (f"未知工具名 '{tool_name}'，该工具不存在。"
+                                        f"请使用可用的工具：{', '.join(sorted(tool_func_map.keys()))}。")
+                            })
+                        })
+                        continue
                     is_terminal = tool_name in TERMINAL_TOOLS
                     try:
                         tool_result = func(**args)
@@ -3247,6 +3337,10 @@ def main():
                     # 压缩后重新检查上下文，如果还是超阈值就继续压缩（最多再试一次）
                     if get_context_size(messages) > COMPRESS_THRESHOLD:
                         _squash_tool_calls_automatically(messages)
+
+                # 🛡 兜底防御：发送 API 前，修复可能残留的"孤立 tool_calls"
+                # （assistant 带 tool_calls 但后面没有对应 tool 响应，会导致 400）
+                _prune_incomplete_tool_calls(messages)
 
                 try:
                     # # ✨ 修复 tool_calls 和 tool 响应之间被插队的消息顺序
@@ -3344,13 +3438,29 @@ def main():
                     except json.JSONDecodeError:
                         continue
 
-                    # 🔥 自动路由：根据工具名查找函数，**kwargs 传参
-                    func = tool_func_map.get(tool["function"]["name"])
-                    if func is None:
-                        continue
+                    tool_name = tool["function"]["name"]
 
-                    tool_name = tool["function"]["name"]
-                    tool_name = tool["function"]["name"]
+                    # 🔥 自动路由：根据工具名查找函数，**kwargs 传参
+                    func = tool_func_map.get(tool_name)
+                    if func is None:
+                        # ⚠️ 修复：未知工具名（如 AI 传了 "bash" 而非 "run_bash"）
+                        # 之前这里直接 continue 跳过了，导致 assistant(tool_calls) 后面
+                        # 没有对应的 tool 消息去回应它的 tool_call_id，违反 OpenAI 协议，
+                        # 下一轮 API 会报 "insufficient tool messages following tool_calls message"(400)。
+                        # 现在改为追加一条 tool 错误响应，保持 assistant↔tool 配对完整，
+                        # 同时把错误信息返回给大模型，让它改用正确的工具名。
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool["id"],
+                            "name": tool_name,
+                            "content": json.dumps({
+                                "success": 0,
+                                "err": (f"未知工具名 '{tool_name}'，该工具不存在。"
+                                        f"请使用可用的工具：{', '.join(sorted(tool_func_map.keys()))}。")
+                            })
+                        })
+                        print(f"\n⚠️ 未知工具名，已把错误返回给大模型: {tool_name}\n", flush=True)
+                        continue
 
                     # 判断工具类型
                     is_terminal = tool_name in TERMINAL_TOOLS  # 终止型（如 compress）
