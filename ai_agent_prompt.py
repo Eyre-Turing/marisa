@@ -215,6 +215,8 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log")
 # 日志文件路径，在 main() 启动时初始化
 _log_file = None
 _err_log_file = None
+# 用户通过 -c/--context-log 指定的上下文日志文件；若设置则优先写入该文件
+_context_log_file = None
 
 
 def _ensure_log_dir():
@@ -245,12 +247,13 @@ def init_logger():
 
 
 def save_messages_snapshot(msg_list):
-    """把当前 messages 追加到日志文件中"""
-    if _log_file is None:
+    """把当前 messages 追加到日志文件中。若设置了 -c/--context-log 则优先写入该文件"""
+    target = _context_log_file if _context_log_file else _log_file
+    if target is None:
         return
     try:
         data = json.dumps(msg_list, ensure_ascii=False, indent=2)
-        with open(_log_file, "a", encoding="utf-8") as f:
+        with open(target, "a", encoding="utf-8") as f:
             f.write(f"\n--- snapshot {_timestamp()} ---\n")
             f.write(data)
             f.write("\n")
@@ -3063,8 +3066,14 @@ def main():
 
     # ---- 命令行参数解析 ----
     parser = argparse.ArgumentParser(description='魔理沙 AI Agent - 兴趣使然的对话助手')
-    parser.add_argument('-r', '--resume', type=str, default=None,
-                        help='从日志文件恢复会话，用法：-r /path/to/log/file.log')
+    # -r 与 -c 互斥：只能选其一
+    ctx_group = parser.add_mutually_exclusive_group()
+    ctx_group.add_argument('-r', '--resume', type=str, default=None,
+                           help='从日志文件恢复会话（只读，不写回该文件），用法：-r /path/to/log/file.log')
+    ctx_group.add_argument('-c', '--context-log', type=str, default=None,
+                           help='指定上下文日志文件并持续写入：若文件不存在则创建并作为会话日志；'
+                                '若文件已存在则先加载其中快照恢复会话，后续快照继续追加写入该文件。'
+                                '用法：-c /path/to/context.log')
     parser.add_argument('--no-prompt-toolkit', action='store_true',
                         help='强制退化使用 input() 输入（即使环境装有 prompt_toolkit 也不用）')
     args = parser.parse_args()
@@ -3106,6 +3115,61 @@ def main():
         f"{skills_hint}"
     )
 
+    # ---- 处理 -c / --context-log：指定上下文日志文件并持续写入 ----
+    if args.context_log:
+        ctx_log_path = args.context_log
+        global _context_log_file
+        # 记录文件原本是否存在：存在则先加载，不存在则直接创建并作为新会话语料
+        ctx_existed = False
+        try:
+            # 确保文件可写（不存在则创建，含父目录）
+            ctx_dir = os.path.dirname(os.path.abspath(ctx_log_path))
+            if ctx_dir:
+                os.makedirs(ctx_dir, exist_ok=True)
+            ctx_existed = os.path.isfile(ctx_log_path)
+            if not ctx_existed:
+                with open(ctx_log_path, "w", encoding="utf-8") as _f:
+                    _f.write(f"===== Session started at {_timestamp()} =====\n")
+        except Exception as e:
+            print(f"   ❌ 无法创建/访问上下文日志文件: {e}", flush=True)
+            print(f"   将回退到普通会话（不写入该文件）。", flush=True)
+            ctx_log_path = None
+
+        if ctx_log_path is not None:
+            _context_log_file = ctx_log_path
+            if ctx_existed:
+                print(f"📝 上下文日志文件(已存在): {ctx_log_path}", flush=True)
+            else:
+                print(f"📝 已创建上下文日志文件: {ctx_log_path}", flush=True)
+
+        if ctx_log_path is not None and ctx_existed:
+            # 文件已存在：先尝试加载其中的快照恢复会话
+            print(f"📥 正在从上下文日志加载会话: {ctx_log_path}", flush=True)
+            restored_messages, err = _resume_from_log(ctx_log_path)
+            if not err:
+                msg_count = len(restored_messages)
+                last_user_msg = ""
+                for m in reversed(restored_messages):
+                    if m.get("role") == "user" and isinstance(m.get("content"), str):
+                        last_user_msg = m["content"][:100]
+                        break
+                print(f"   ✅ 加载成功！共 {msg_count} 条消息", flush=True)
+                if last_user_msg:
+                    print(f"   📝 最后一条用户输入: {last_user_msg}{'...' if len(last_user_msg) >= 100 else ''}", flush=True)
+                messages = restored_messages
+            else:
+                print(f"   ⚠️ 未从文件恢复（{err}），以新会话启动，后续快照仍写入该文件。", flush=True)
+                messages = [
+                    {"role": "system", "content": system_prompt}
+                ]
+        else:
+            # 文件原本不存在（刚创建）或创建失败：以新会话启动
+            messages = [
+                {"role": "system", "content": system_prompt}
+            ]
+        # 注：若 ctx_log_path 为 None（创建失败）则 _context_log_file 未设置，
+        #     快照仍写入默认 log 目录。
+
     # ---- 处理 -r / --resume 恢复会话 ----
     if args.resume:
         log_path = args.resume
@@ -3129,8 +3193,8 @@ def main():
             if last_user_msg:
                 print(f"   📝 最后一条用户输入: {last_user_msg}{'...' if len(last_user_msg) >= 100 else ''}", flush=True)
             messages = restored_messages
-    else:
-        # 初始化全局 messages
+    elif not args.context_log:
+        # 初始化全局 messages（未指定 -r 或 -c 时的新会话）
         messages = [
             {"role": "system", "content": system_prompt}
         ]
