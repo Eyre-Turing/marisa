@@ -837,17 +837,21 @@ tools = [
         "type": "function",
         "function": {
             "name": "run_bash",
-            "description": "在本地执行一条bash命令并返回结果。正常情况结果为一个json，有stdout、stderr、code三个字段，stdout为标准输出（字符串），stderr为标准错误（字符串），code为返回值（数字）。如果异常，结果为空字符串",
+            "description": "在本地执行一条命令并返回结果。正常情况结果为一个json，有stdout、stderr、code、shell四个字段，stdout为标准输出（字符串），stderr为标准错误（字符串），code为返回值（数字），shell为实际使用的执行外壳（'bash'/'sh'/'cmd'）。如果异常，结果为空字符串。注意 shell 字段：bash/sh 支持单引号；cmd（仅当 Windows 且无 bash 时）不支持单引号——在 cmd 下 python -c 'print(1)' 会静默无输出且 code=0，这是引号问题不是命令错误，请改用双引号 python -c \"print(1)\"",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "要执行的bash命令行"
+                        "description": "要执行的命令行"
                     },
                     "timeout": {
                         "type": "integer",
                         "description": "超时时间，单位为秒，如果不传默认为10"
+                    },
+                    "force_use_bash": {
+                        "type": "boolean",
+                        "description": "选填，默认为false。为true时强制以 bash 执行（等价于 bash -c '命令'，不经过 cmd 解析，单引号可用）；若系统没有 bash 可执行文件，会返回找不到 bash 的报错信息，届时请自行改用 cmd 语法、去掉 force_use_bash，或将命令写入脚本文件再执行"
                     }
                 },
                 "required": ["command"]
@@ -1390,26 +1394,101 @@ def smart_decode(data):
     return data.decode("utf-8", errors="replace")
 
 
-def run_bash(command, timeout=10):
-    """执行一条 bash 命令，打印人类可读结果，返回 json.dumps 后的字符串
-    
+def _detect_bash_path():
+    """探测可用的 bash 解释器路径（Windows 专用）。找到返回路径字符串，找不到返回 None。
+
+    排除 WSL 的 System32\\bash.exe —— 那是 Linux 子系统启动器，-c 会进 Linux 环境，
+    用它执行 Windows 命令会得到完全不同的语义。
+    结果做模块级缓存，只探测一次。
+    """
+    global _bash_path_probed, _bash_path_cache
+    if _bash_path_probed:
+        return _bash_path_cache or None
+    _bash_path_probed = True
+
+    if sys.platform != "win32":
+        # 非 Windows：系统自带 /bin/sh，无需探测，run_bash 直接 shell=True 即可
+        _bash_path_cache = ""
+        return None
+
+    # 1) 先查已知的 Git/MSYS2/Cygwin 安装路径（绕开 PATH 顺序坑）
+    candidates = [
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        r"C:\msys64\usr\bin\bash.exe",
+        r"C:\cygwin64\bin\bash.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            _bash_path_cache = c
+            return c
+
+    # 2) 兜底：PATH 里找 bash / sh，但排除 System32 下的（那是 WSL/系统内置启动器，语义不同）
+    import shutil
+    for name in ("bash", "sh"):
+        found = shutil.which(name)
+        if not found:
+            continue
+        low = found.lower().replace("\\", "/")
+        if "/system32/" in low:
+            continue
+        _bash_path_cache = found
+        return found
+
+    _bash_path_cache = ""
+    return None
+
+
+_bash_path_probed = False
+_bash_path_cache = None
+
+
+def run_bash(command, timeout=10, force_use_bash=False):
+    """执行一条命令，打印人类可读结果，返回 json.dumps 后的字符串
+
+    参数:
+        command: 要执行的命令字符串
+        timeout: 超时秒数
+        force_use_bash: 选填，默认为 False。为 True 时强制以 bash 执行
+            （等价于 ["bash", "-c", command]，不经过 cmd 解析，单引号可用）；
+            若系统没有 bash 可执行文件，会把找不到 bash 的报错原样返回，
+            由调用方（大模型）自行决定改用 cmd 语法或写脚本文件执行。
+            为 False 时自动模式：Windows 下若探测到 bash 则用 bash，否则降级 cmd；
+            非 Windows 使用系统默认 shell（/bin/sh）。
+
     使用 Popen + 进程组 + watchdog 线程实现真正的超时机制，
     即使用户跑了交互命令（top、python、read 等）也能强制结束。
     """
     global interrupted
     # 🛡️ 类型护盾！防止 DeepSeek 模型乱传参数
     if not isinstance(command, str) or not command.strip():
-        result_dict = {"stdout": "", "stderr": f"无效的command参数: {repr(command)}", "code": -2}
+        result_dict = {"stdout": "", "stderr": f"无效的command参数: {repr(command)}", "code": -2, "shell": ""}
         print(f"\n{result_dict['stderr']}\n", flush=True)
         return json.dumps(result_dict)
     try:
         timeout = int(timeout)
     except (TypeError, ValueError):
         timeout = 10
+    # force_use_bash 规范化：防止模型传 "true"/"false"/1/0 等
+    if isinstance(force_use_bash, str):
+        force_use_bash = force_use_bash.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        force_use_bash = bool(force_use_bash)
+
+    # 确定实际使用的 shell（用于返回给大模型 + 防"闹鬼"提示）
+    used_shell = "sh"      # 非 Windows 默认
+    bash_path = None       # 自动模式下探测到的 bash 路径
+    if force_use_bash:
+        used_shell = "bash"
+    elif sys.platform == "win32":
+        bash_path = _detect_bash_path()
+        used_shell = "bash" if bash_path else "cmd"
 
     # 如果已经被中断，直接跳过
     if interrupted:
-        result_dict = {"stdout": "", "stderr": "用户中断了魔法吟唱", "code": -1}
+        result_dict = {"stdout": "", "stderr": "用户中断了魔法吟唱", "code": -1, "shell": used_shell}
         print(f"\n{result_dict['stderr']}\n", flush=True)
         return json.dumps(result_dict)
 
@@ -1425,13 +1504,27 @@ def run_bash(command, timeout=10):
             extra_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             extra_kwargs["preexec_fn"] = os.setsid
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **extra_kwargs
-        )
+        if force_use_bash or (sys.platform == "win32" and bash_path):
+            # 用 bash 执行：不经过 cmd 解析，单引号/管道/重定向都由 bash 处理
+            # force_use_bash=True 时用 "bash" 名字走 PATH 解析；找不到会抛 FileNotFoundError，
+            # 由下方的 except 分支把报错原样返回给大模型。
+            bash_cmd = ["bash", "-c", command] if force_use_bash else [bash_path, "-c", command]
+            proc = subprocess.Popen(
+                bash_cmd,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **extra_kwargs
+            )
+        else:
+            # 非 Windows（/bin/sh）或 Windows 无 bash（降级 cmd）：走系统 shell
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **extra_kwargs
+            )
 
         result_container = {
             "stdout": b"",
@@ -1512,7 +1605,7 @@ def run_bash(command, timeout=10):
         if result_container["timed_out"]:
             stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
             stderr = smart_decode(result_container["stderr"]) if result_container["stderr"] else ""
-            result_dict = {"stdout": stdout, "stderr": f"命令执行超时（{timeout}秒），已强制终止\n{stderr}".strip(), "code": -1}
+            result_dict = {"stdout": stdout, "stderr": f"命令执行超时（{timeout}秒），已强制终止\n{stderr}".strip(), "code": -1, "shell": used_shell}
             print(
                 f"魔法结果:\n    \n"
                 f"魔法报错:\n    命令执行超时（{timeout}秒），已强制终止\n"
@@ -1525,6 +1618,14 @@ def run_bash(command, timeout=10):
         stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
         stderr = smart_decode(result_container["stderr"]) if result_container["stderr"] else ""
         code = proc.returncode
+        # 防"闹鬼"：cmd 模式下命令含单引号 + 空输出 + code0 → 主动提示引号问题，
+        # 避免大模型以为是 -c 内容写错而反复试错
+        if used_shell == "cmd" and code == 0 and not stdout.strip() and "'" in command:
+            stderr = (
+                (stderr + "\n" if stderr else "")
+                + "[提示] 当前执行 shell 是 cmd，命令中含单引号 ' 但 cmd 不把单引号当引号；本命令无任何输出(code=0)，多半是引号未生效。"
+                + " 例如 python -c 'print(1)' 应写成 python -c \"print(1)\"；若必须用 bash 语法，可调用 run_bash 时加 force_use_bash=true（需系统装有 bash）。"
+            )
         # 硬截断保护：防止单次输出过大撑爆上下文
         stdout_orig_len = len(stdout)
         stderr_orig_len = len(stderr)
@@ -1535,7 +1636,8 @@ def run_bash(command, timeout=10):
         result_dict = {
             "stdout": stdout,
             "stderr": stderr,
-            "code": code
+            "code": code,
+            "shell": used_shell
         }
         print(
             "魔法结果:\n"
@@ -1548,8 +1650,29 @@ def run_bash(command, timeout=10):
         )
         return json.dumps(result_dict)
 
+    except FileNotFoundError as e:
+        # 典型场景：force_use_bash=true 但系统没有 bash 可执行文件 → 把报错原样返回，
+        # 让大模型自己决定改用 cmd 语法或写脚本文件执行
+        detail = str(e)
+        msg = f"命令执行异常（找不到可执行文件）: {detail}"
+        if force_use_bash:
+            msg += (
+                "\n[提示] 你设置了 force_use_bash=true，但系统中没有可用的 bash 可执行文件，命令无法启动。可选做法："
+                "① 去掉 force_use_bash（自动模式会降级到 cmd，注意 cmd 不支持单引号，请改用双引号）；"
+                "② 把命令改写为 cmd 语法；③ 用 write_full_file 把脚本写成 .bat/.py 文件再执行。"
+            )
+            used_shell = "bash(缺失)"
+        result_dict = {"stdout": "", "stderr": msg, "code": -2, "shell": used_shell}
+        print(
+            "魔法结果:\n    \n"
+            "魔法报错:\n"
+            f"    {msg}\n"
+            "退出状态: -2",
+            flush=True
+        )
+        return json.dumps(result_dict)
     except Exception as e:
-        result_dict = {"stdout": "", "stderr": f"命令执行异常: {str(e)}", "code": -2}
+        result_dict = {"stdout": "", "stderr": f"命令执行异常: {str(e)}", "code": -2, "shell": used_shell}
         print(
             "魔法结果:\n    \n"
             "魔法报错:\n"
