@@ -54,7 +54,14 @@ DEFAULT_CONFIG = {
     "api_key": "",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-chat",
-    "protocol": "openai"
+    "protocol": "openai",
+    # 多模态辅助模型配置（可选）——字段与主配置一一对应，加 mul_ 前缀：
+    # mul_api_key / mul_base_url / mul_model / mul_protocol
+    # 配置后 read_image 可传 description 参数，由辅助多模态模型识别图片并返回文本描述
+    "mul_api_key": "",
+    "mul_base_url": "",
+    "mul_model": "",
+    "mul_protocol": "openai"
 }
 
 _config_cache = None
@@ -278,12 +285,20 @@ def save_error_snapshot(msg_list, error_msg):
 # ============================================================
 #  1. 调用 DeepSeek Chat API（纯标准库，不依赖 openai）
 # ============================================================
-def call_api(messages, tools=None, tool_choice="auto"):
+def call_api(messages, tools=None, tool_choice="auto", config_override=None):
     """
     根据配置中的 protocol 字段，调用 OpenAI 风格或 Anthropic 风格的 API。
     直接构造 HTTP 请求（从 ai_agent_config.json 读取参数）。
+
+    config_override: 可选。传入一个标准结构的配置 dict
+        （含 api_key / base_url / model / protocol 键），
+        用于调用独立配置的辅助模型（如多模态读图子 Agent）。
+        为 None 时使用主配置（ai_agent_config.json）。
     """
-    config = load_config()
+    if config_override is not None:
+        config = config_override
+    else:
+        config = load_config()
     api_key = config.get("api_key")
     if not api_key:
         raise ValueError("API 密钥未配置！请检查 ai_agent_config.json 文件。")
@@ -1089,13 +1104,17 @@ tools = [
         "type": "function",
         "function": {
             "name": "read_image",
-            "description": "读取图片文件并转为 base64 编码。当用户提供了图片文件路径时，调用此工具读取图片。读取成功后图片会自动以多模态格式（role:user）注入对话，你可以直接看到图片内容。支持的格式: png, jpg, jpeg, gif, bmp, webp 等。最大支持 5MB。",
+            "description": "读取图片文件并转为 base64 编码。当用户提供了图片文件路径时，调用此工具读取图片。读取成功后图片会自动以多模态格式（role:user）注入对话，你可以直接看到图片内容。如果配置了多模态辅助模型（mul_api_key 等），可以同时传入 description 参数描述你想从这个图片读到什么，工具会调用辅助多模态模型识别图片并直接返回文本描述，无需主模型支持多模态。支持的格式: png, jpg, jpeg, gif, bmp, webp 等。最大支持 5MB。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filepath": {
                         "type": "string",
                         "description": "图片文件的完整路径（支持绝对路径和相对路径）"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "（可选）描述你想从这个图片读到什么。如果配置了多模态辅助模型（mul_api_key/mul_base_url/mul_model/mul_protocol），将调用辅助多模态模型识别图片并返回文本描述；不传则按原方式注入多模态图片消息"
                     }
                 },
                 "required": ["filepath"]
@@ -1306,12 +1325,17 @@ IMAGE_TOOLS = {"read_image"}
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 图片最大 5MB
 
 
-def read_image(filepath):
+def read_image(filepath, description=""):
     """读取图片文件，转为 base64 编码返回
     
     这个工具由大模型调用，读取用户指定的图片文件并转为 base64 格式。
     工具本身不修改全局 messages，调用结果由主循环特殊处理：
     不追加 tool response，而是注入一条 role:user 的多模态消息。
+
+    如果配置了多模态辅助模型（mul_api_key / mul_base_url / mul_model / mul_protocol），
+    且传入了 description 参数（描述你想从这个图片读到什么），
+    则会启动"读图子 Agent"：调用辅助多模态模型识别图片，直接返回文本描述，
+    无需主模型支持多模态也能"看懂"图片。
     """
     try:
         import base64
@@ -1345,6 +1369,15 @@ def read_image(filepath):
     
     b64_size_kb = len(b64) * 3 // 4 // 1024  # base64 解码后的实际大小
     
+    # ---- 🔮 多模态辅助模型（子 Agent 读图）模式 ----
+    # 若配置了 mul_* 字段且传入了 description，则调用辅助多模态模型识别图片，
+    # 直接返回文本描述（不再注入多模态消息，兼容不支持多模态的主模型）
+    mul_config = _build_mul_config()
+    if mul_config is not None and isinstance(description, str) and description.strip():
+        return _read_image_via_subagent(
+            filepath, mime_type, b64, b64_size_kb, description, mul_config
+        )
+    
     print(
         f"\n📷 图片读取成功!\n"
         f"   文件: {filepath}\n"
@@ -1361,6 +1394,106 @@ def read_image(filepath):
         "base64": b64,
         "size_kb": b64_size_kb,
         "message": f"图片已读取，大小约 {b64_size_kb}KB"
+    })
+
+
+def _build_mul_config():
+    """从主配置中提取 mul_ 前缀字段，组装成标准结构的辅助模型配置 dict。
+
+    返回标准结构：{"api_key", "base_url", "model", "protocol"}，
+    可直接传给 call_api 的 config_override。
+    若未配置多模态辅助模型（mul_api_key 或 mul_model 缺失/为空），返回 None。
+    """
+    config = load_config()
+    mul_api_key = (config.get("mul_api_key") or "").strip()
+    mul_model = (config.get("mul_model") or "").strip()
+    if not mul_api_key or not mul_model:
+        return None
+
+    mul_base_url = (config.get("mul_base_url") or "").strip()
+    if not mul_base_url:
+        mul_base_url = (config.get("base_url") or "").strip() or DEFAULT_CONFIG["base_url"]
+
+    mul_protocol = (config.get("mul_protocol") or "").strip().lower()
+    if not mul_protocol:
+        mul_protocol = (config.get("protocol") or "openai").strip().lower() or "openai"
+
+    return {
+        "api_key": mul_api_key,
+        "base_url": mul_base_url,
+        "model": mul_model,
+        "protocol": mul_protocol,
+    }
+
+
+def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description, mul_config):
+    """通过多模态辅助模型（子 Agent）识别图片内容，返回文本描述。
+
+    类似 load_skill 的子 Agent 模式，但更简单：
+    不带工具、单轮 API 调用即可拿到结果。
+    返回的 JSON 含 mode="subagent"，主循环据此按普通工具结果处理（不注入多模态消息）。
+    """
+    if interrupted:
+        return json.dumps({"success": 0, "err": "用户中断了魔法吟唱"})
+
+    mul_model = mul_config.get("model", "?")
+    print(
+        f"\n🔮 多模态辅助模型读图子Agent启动...\n"
+        f"   模型: {mul_model}\n"
+        f"   图片: {filepath} ({b64_size_kb}KB)\n"
+        f"   问题: {description[:200]}{'...' if len(description) > 200 else ''}\n",
+        flush=True
+    )
+
+    sub_system_prompt = (
+        "你是一个图片识别助手。用户会给你一张图片和一个具体的问题描述。\n"
+        "请仔细观察图片内容，并根据问题描述给出准确、详细的回答。\n"
+        "要求：\n"
+        "1. 仔细观察图片中的每一个细节，不要凭空猜测或编造\n"
+        "2. 如果图片中有文字，请准确读出\n"
+        "3. 回答要直接、简洁但完整，不要客套\n"
+        "4. 如果图片内容无法回答该问题，请如实说明"
+    )
+
+    sub_messages = [
+        {"role": "system", "content": sub_system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"问题：{description}\n\n请根据图片内容回答。"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{b64}"}
+                }
+            ]
+        }
+    ]
+
+    try:
+        sub_msg, _ = call_api(sub_messages, tools=None, config_override=mul_config)
+    except Exception as e:
+        err_msg = f"多模态辅助模型调用失败: {e}"
+        print(f"   ⚠️ {err_msg}\n", flush=True)
+        return json.dumps({"success": 0, "err": err_msg})
+
+    result_text = (sub_msg.get("content") or "").strip()
+    if not result_text:
+        return json.dumps({"success": 0, "err": "多模态辅助模型返回了空结果"})
+
+    print(
+        f"   ✅ 子Agent读图完成: {result_text[:100]}{'...' if len(result_text) > 100 else ''}\n",
+        flush=True
+    )
+
+    return json.dumps({
+        "success": 1,
+        "mode": "subagent",
+        "result": result_text,
+        "source_model": mul_model,
+        "filepath": filepath,
+        "mime": mime_type,
+        "size_kb": b64_size_kb,
+        "message": f"多模态辅助模型 ({mul_model}) 已识别图片，结果见 result 字段"
     })
 
 
@@ -3673,7 +3806,8 @@ def main():
                         except (json.JSONDecodeError, TypeError):
                             result_data = {"success": 0}
 
-                        if result_data.get("success"):
+                        if result_data.get("success") and "base64" in result_data:
+                            # 原多模态注入逻辑（未配置多模态辅助模型，或未传 description）
                             img_base64 = result_data["base64"]
                             img_mime = result_data["mime"]
                             img_path = result_data["filepath"]
@@ -3710,14 +3844,19 @@ def main():
                             print(f"   🖼️ 图片已注入对话上下文: {img_path}", flush=True)
                             image_tool_called = True  # 在循环外定义
                         else:
-                            # 读取失败，用 tool response 告知大模型错误信息
+                            # 多模态辅助模型读图模式（mode=subagent，结果已是文本描述）
+                            # 或读取失败：统一按普通工具追加 tool response，
+                            # 不再注入多模态消息（主模型可能不支持多模态）
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool["id"],
                                 "name": tool_name,
                                 "content": tool_result
                             })
-                            print(f"   ⚠️ 图片读取失败: {result_data.get('err', '未知错误')}", flush=True)
+                            if result_data.get("success"):
+                                print(f"   🔮 多模态辅助模型读图完成，结果已返回: {result_data.get('filepath', '')}", flush=True)
+                            else:
+                                print(f"   ⚠️ 图片读取失败: {result_data.get('err', '未知错误')}", flush=True)
                         continue  # 继续处理其他工具
 
                     # 📸 MCP 图片检测：任何工具（包括 MCP 工具）返回的结果中
