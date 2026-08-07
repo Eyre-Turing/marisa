@@ -62,6 +62,19 @@ pip3 install prompt_toolkit
 }
 ```
 
+另外，你可以使用支持多模态的大模型来辅助你的大模型读图，比如 deepseek 本身不支持读图，但是可以使用 qwen3.8-max 来辅助读图，那就可以这样写：
+
+```json
+  "api_key": "sk-xxxx",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-v4-flash",
+  "protocol": "openai",
+  "mul_api_key": "sk-ws-xxxx",
+  "mul_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "mul_model": "qwen3.8-max",
+  "mul_protocol": "openai",
+```
+
 ### 启动
 
 **Linux：**
