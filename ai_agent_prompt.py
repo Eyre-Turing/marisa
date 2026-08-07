@@ -3870,8 +3870,7 @@ def main():
                         pass
 
                     if mcp_images and isinstance(mcp_images, list) and len(mcp_images) > 0:
-                        # 第一步：追加 tool 响应（纯文本部分，满足 API 协议要求）
-                        # 从 tool_result 中去掉 _mcp_images 字段再存入
+                        # 从 tool_result 中去掉 _mcp_images 字段，得到纯文本 tool 响应
                         try:
                             _clean_result = json.loads(tool_result)
                             if isinstance(_clean_result, dict):
@@ -3881,13 +3880,79 @@ def main():
                                 clean_tool_content = tool_result
                         except (json.JSONDecodeError, TypeError):
                             clean_tool_content = tool_result
+
+                        mul_config = _build_mul_config()
+                        if mul_config:
+                            # 🔮 多模态辅助模型读图模式：MCP 图片交给辅助模型识别成文本描述，
+                            # 并入 tool response 文本返回（主模型可能不支持多模态，不再注入图片消息）
+                            # 🔮 读图 prompt 携带主模型调用 MCP 工具的原始 arguments（原文），
+                            # 直接把调用 MCP 函数时的完整参数原文交给辅助模型，
+                            # 让辅助模型自行判断重点观察哪里；无参数时回退通用描述
+                            if isinstance(args, dict) and args:
+                                read_prompt = (
+                                    "这张图片是调用 MCP 工具 " + tool_name + " 后返回的结果。\n"
+                                    f"调用该工具时的参数：{json.dumps(args, ensure_ascii=False)}\n"
+                                    "请重点观察与上述调用信息相关的细节并准确回答，同时简要说明图片的整体内容。"
+                                )
+                            else:
+                                read_prompt = "请详细描述这张图片的内容，包括所有可见的文字、物体、布局、颜色等细节。"
+
+                            img_descriptions = []
+                            for img_idx, img in enumerate(mcp_images):
+                                if not isinstance(img, dict):
+                                    continue
+                                img_b64 = img.get("base64", "")
+                                img_mime = img.get("mimeType", "image/png")
+                                if not img_b64:
+                                    continue
+                                img_size_kb = len(img_b64) * 3 // 4 // 1024
+                                img_label = f"[MCP 工具 {tool_name} 返回的图片"
+                                if len(mcp_images) > 1:
+                                    img_label += f" {img_idx + 1}/{len(mcp_images)}"
+                                img_label += f" ({img_size_kb}KB)]"
+                                sub_result = _read_image_via_subagent(
+                                    img_label, img_mime, img_b64, img_size_kb,
+                                    read_prompt,
+                                    mul_config
+                                )
+                                try:
+                                    sub_data = json.loads(sub_result)
+                                except (json.JSONDecodeError, TypeError):
+                                    sub_data = {"success": 0, "err": f"读图结果解析失败: {str(sub_result)[:100]}"}
+                                if sub_data.get("success"):
+                                    desc_text = sub_data.get("result", "")
+                                else:
+                                    desc_text = f"读取失败: {sub_data.get('err', '未知错误')}"
+                                img_descriptions.append(f"图片 {img_idx + 1}/{len(mcp_images)} 内容：{desc_text}")
+                            # 将描述并入 tool response 文本
+                            _full_content = clean_tool_content
+                            if img_descriptions:
+                                try:
+                                    _full_obj = json.loads(clean_tool_content)
+                                    if isinstance(_full_obj, dict):
+                                        _full_obj["image_descriptions"] = img_descriptions
+                                        _full_content = json.dumps(_full_obj, ensure_ascii=False)
+                                    else:
+                                        _full_content = clean_tool_content + "\n" + "\n".join(img_descriptions)
+                                except (json.JSONDecodeError, TypeError):
+                                    _full_content = clean_tool_content + "\n" + "\n".join(img_descriptions)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "name": tool_name,
+                                "content": _full_content
+                            })
+                            print(f"   🔮 MCP 图片已由多模态辅助模型识别为文本描述（{len(img_descriptions)} 张），已并入 tool response", flush=True)
+                            continue  # 跳过正常 tool response 追加（已追加）
+
+                        # 原逻辑：注入 role:user 多模态消息（主模型支持多模态时使用）
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool["id"],
                             "name": tool_name,
                             "content": clean_tool_content
                         })
-                        # 第二步：为每张图片注入 role:user 的多模态消息
+                        # 为每张图片注入 role:user 的多模态消息
                         for img_idx, img in enumerate(mcp_images):
                             if not isinstance(img, dict):
                                 continue
