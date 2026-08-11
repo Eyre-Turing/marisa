@@ -183,6 +183,11 @@ TOOL_HARD_CUTOFF = 200 * 1024  # 200KB
 # 在外层 while 循环每次开始时扫描 messages 并更新
 large_content_counter = {}
 
+# 主模型是否已确认不支持多模态（读图）：
+# 一旦检测到模型对多模态内容报 HTTP 400 或返回空 content，置为 True；
+# 之后注入图片前先检查此标记，避免反复触发"空返回"毒化对话。
+_main_model_no_multimodal = False
+
 # messages 提升到全局，方便 compress 工具直接修改
 messages = []
 
@@ -285,7 +290,7 @@ def save_error_snapshot(msg_list, error_msg):
 # ============================================================
 #  1. 调用 DeepSeek Chat API（纯标准库，不依赖 openai）
 # ============================================================
-def call_api(messages, tools=None, tool_choice="auto", config_override=None):
+def call_api(messages, tools=None, tool_choice="auto", config_override=None, guard_multimodal=True):
     """
     根据配置中的 protocol 字段，调用 OpenAI 风格或 Anthropic 风格的 API。
     直接构造 HTTP 请求（从 ai_agent_config.json 读取参数）。
@@ -294,6 +299,12 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None):
         （含 api_key / base_url / model / protocol 键），
         用于调用独立配置的辅助模型（如多模态读图子 Agent）。
         为 None 时使用主配置（ai_agent_config.json）。
+
+    guard_multimodal: 可选，默认 True。是否启用"多模态防护"：
+        True  → 主模型调用：HTTP 400 且上下文含多模态时自动剥离并重试，并记录
+                _main_model_no_multimodal 标记；
+        False → 子 Agent（辅助模型）调用：HTTP 400 直接抛异常交给上层处理，
+                不做剥离、不触碰全局标记，避免辅助模型的失败污染主模型判定。
     """
     if config_override is not None:
         config = config_override
@@ -307,9 +318,10 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None):
 
     try:
         if protocol == "anthropic":
-            result = _call_anthropic_api(config, messages, tools, allow_retry=True)
+            result = _call_anthropic_api(config, messages, tools, allow_retry=True, guard_multimodal=guard_multimodal)
         else:
-            result = _call_openai_api(config, messages, tools, tool_choice)
+            result = _call_openai_api(config, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
+        return result
         return result
     except Exception as e:
         # 出错时保存 err 日志
@@ -360,7 +372,7 @@ def _strip_multimodal(msgs):
     return modified
 
 
-def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
+def _call_openai_api(config, messages, tools=None, tool_choice="auto", guard_multimodal=True):
     """OpenAI 风格 API 调用（兼容 DeepSeek 等）"""
     api_key = config["api_key"]
     url = config.get("base_url", DEFAULT_CONFIG["base_url"]).rstrip("/")
@@ -377,16 +389,22 @@ def _call_openai_api(config, messages, tools=None, tool_choice="auto"):
         "Authorization": f"Bearer {api_key}",
     }
 
-    return _do_openai_request(url, headers, model, messages, tools, tool_choice)
+    return _do_openai_request(url, headers, model, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
 
 
-def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="auto", allow_retry=True):
+def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="auto", allow_retry=True, guard_multimodal=True):
     """
     实际执行 OpenAI 风格 API 请求。
     
     如果 HTTP 400 报错且 messages 中包含多模态内容（模型可能不支持多模态），
-    自动将全局 messages 中的多模态数据删除，然后重试一次。
+    自动将全局 messages 中的多模态数据删除，然后重试一次，并记录
+    _main_model_no_multimodal 标记（仅 guard_multimodal=True 时，即主模型调用）。
+
+    guard_multimodal=False 时（子 Agent / 辅助模型调用）：HTTP 400 不做剥离重试，
+    直接抛异常交给上层处理，避免辅助模型的失败污染主模型的多模态判定标记。
+    空返回的检测与处理由主循环负责，不在本函数内。
     """
+    global _main_model_no_multimodal
     payload = {
         "model": model,
         "messages": messages,
@@ -406,16 +424,23 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
         
         # 🗑️ 检测到 400 错误且 messages 中包含多模态内容，删除并重试
         # 不依赖错误信息中的关键字，直接检查我们发送的数据结构
-        if allow_retry and e.code == 400 and _has_multimodal_content(messages):
+        # 仅主模型调用（guard_multimodal=True）执行此防护，子 Agent 直接抛异常
+        if allow_retry and guard_multimodal and e.code == 400 and _has_multimodal_content(messages):
             print(
                 "   🗑️ HTTP 400 且上下文含多模态数据，自动清理后重试...",
                 flush=True
             )
             _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+            _main_model_no_multimodal = True  # 记住：主模型不支持多模态
             return _do_openai_request(
                 url, headers, model, messages, tools, tool_choice,
-                allow_retry=False  # 防止无限递归
+                allow_retry=False,  # 防止无限递归
+                guard_multimodal=guard_multimodal
             )
+        
+        raise RuntimeError(f"API 请求失败 (HTTP {e.code}): {error_body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"API 请求失败 (网络错误): {e.reason}")
         
         raise RuntimeError(f"API 请求失败 (HTTP {e.code}): {error_body}")
     except urllib.error.URLError as e:
@@ -431,15 +456,21 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     return msg, reasoning_content
 
 
-def _call_anthropic_api(config, messages, tools=None, allow_retry=True):
+def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_multimodal=True):
     """
     Anthropic 风格 API 调用。
     将内部 OpenAI 格式的 messages 转换为 Anthropic 格式，
     并处理响应中的 tool_use content blocks。
 
     如果 HTTP 400 报错且原始 messages 中包含多模态内容，
-    会自动清理全局 messages 中的多模态 user 消息并重试一次。
+    会自动清理全局 messages 中的多模态 user 消息并重试一次，并记录
+    _main_model_no_multimodal 标记（仅 guard_multimodal=True 时，即主模型调用）。
+
+    guard_multimodal=False 时（子 Agent / 辅助模型调用）：HTTP 400 不做剥离重试，
+    直接抛异常交给上层处理，避免辅助模型的失败污染主模型的多模态判定标记。
+    空返回的检测与处理由主循环负责，不在本函数内。
     """
+    global _main_model_no_multimodal
     api_key = config["api_key"]
     url = config.get("base_url", "https://api.anthropic.com").rstrip("/")
     if not url.endswith("/messages"):
@@ -787,17 +818,18 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True):
         error_body = e.read().decode("utf-8", errors="replace")
 
         # 🗑️ 检测到 400 错误且原始 messages 中包含多模态内容，清理并重试
-        if allow_retry and e.code == 400 and _has_multimodal_content(messages):
+        if allow_retry and guard_multimodal and e.code == 400 and _has_multimodal_content(messages):
             print(
                 "   🗑️ Anthropic HTTP 400 且上下文含多模态数据，自动清理后重试...",
                 flush=True
             )
             _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+            _main_model_no_multimodal = True  # 记住：主模型不支持多模态
             return _call_anthropic_api(
                 config, messages, tools,
-                allow_retry=False  # 防止无限递归
+                allow_retry=False,  # 防止无限递归
+                guard_multimodal=guard_multimodal
             )
-
         raise RuntimeError(f"Anthropic API 请求失败 (HTTP {e.code}): {error_body}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {e.reason}")
@@ -1470,7 +1502,7 @@ def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description,
     ]
 
     try:
-        sub_msg, _ = call_api(sub_messages, tools=None, config_override=mul_config)
+        sub_msg, _ = call_api(sub_messages, tools=None, config_override=mul_config, guard_multimodal=False)
     except Exception as e:
         err_msg = f"多模态辅助模型调用失败: {e}"
         print(f"   ⚠️ {err_msg}\n", flush=True)
@@ -2952,7 +2984,7 @@ def load_skill(task_description):
 
             # 调用 API
             try:
-                sub_msg, sub_reasoning = call_api(sub_messages, tools=sub_tools, tool_choice="auto")
+                sub_msg, sub_reasoning = call_api(sub_messages, tools=sub_tools, tool_choice="auto", guard_multimodal=False)
             except Exception as e:
                 err_msg = f"技能检索子Agent API 调用失败: {e}"
                 print(f"   ⚠️ {err_msg}\n", flush=True)
@@ -3315,6 +3347,7 @@ def split_pipe_messages(text):
 # ============================================================
 def main():
     global tool_executing, interrupted, messages, CWD_SKILLS_DIR, CODE_SKILLS_DIR
+    global _main_model_no_multimodal
 
     # 注册信号处理器 —— 只用于工具执行中的中断
     # 用户输入中的 Ctrl+C 由 prompt_toolkit 处理
@@ -3687,6 +3720,24 @@ def main():
 
                 # 没有工具调用 → AI总结完毕，跳出内层循环
                 if not tool_calls:
+                    # 🛡️ 空返回防御：模型啥也没说。
+                    # 若上下文含多模态 → 判定主模型不支持多模态：置标记、剥离毒消息、重试；
+                    # 否则 → 不写入空消息污染历史，提示用户后结束本轮。
+                    if not content:
+                        if not reasoning_content and _has_multimodal_content(messages):
+                            _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+                            print(
+                                "   🗑️ 模型返回空内容且上下文含多模态数据，疑似不支持多模态，自动清理后重试...",
+                                flush=True
+                            )
+                            _strip_multimodal(messages)
+                            continue  # 重试（毒消息已清除，不会再触发本分支）
+                        print(
+                            "\n⚠️ 模型返回了空内容（可能是模型不支持读图或临时抽风）。"
+                            "本轮未写入对话历史，请重试或换个问法。\n",
+                            flush=True
+                        )
+                        break
                     assistant_msg = {"role": "assistant", "content": content}
                     if reasoning_content:
                         assistant_msg["reasoning_content"] = reasoning_content
@@ -3811,6 +3862,42 @@ def main():
                             img_base64 = result_data["base64"]
                             img_mime = result_data["mime"]
                             img_path = result_data["filepath"]
+
+                            # 🛡️ 已知主模型不支持多模态：不再注入图片消息，避免毒化对话
+                            if _main_model_no_multimodal:
+                                mul_config = _build_mul_config()
+                                if mul_config is not None:
+                                    # 改用辅助多模态模型读图，把文本描述作为 tool 响应
+                                    read_prompt = (
+                                        "这张图片是主模型调用 read_image 工具后返回的结果。"
+                                        "请详细描述图片内容，包括所有可见的文字、物体、布局、颜色等细节。"
+                                    )
+                                    tool_content = _read_image_via_subagent(
+                                        img_path, img_mime, img_base64,
+                                        result_data.get("size_kb", 0),
+                                        read_prompt,
+                                        mul_config
+                                    )
+                                    print(f"   🔮 主模型不支持多模态，已改用辅助多模态模型读图: {img_path}", flush=True)
+                                else:
+                                    # 没有辅助模型：只给文本元信息 + 明确提示
+                                    tool_content = json.dumps({
+                                        "success": 1,
+                                        "filepath": img_path,
+                                        "mime": img_mime,
+                                        "size_kb": result_data.get("size_kb", 0),
+                                        "message": ("图片已读取，但当前主模型不支持多模态读图，无法查看图片内容。"
+                                                    "如需识别图片，请配置 mul_* 多模态辅助模型后使用带 description 的读图方式。")
+                                    })
+                                    print(f"   ⚠️ 主模型不支持多模态，未注入图片内容: {img_path}", flush=True)
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool["id"],
+                                    "name": tool_name,
+                                    "content": tool_content
+                                })
+                                continue  # 不注入多模态消息，进入下一轮工具循环
+
                             # 第一步：先追加 tool 响应，满足 API 协议要求
                             # assistant(tool_calls) 后面必须紧跟着 tool 消息
                             messages.append({
@@ -3946,6 +4033,30 @@ def main():
                             continue  # 跳过正常 tool response 追加（已追加）
 
                         # 原逻辑：注入 role:user 多模态消息（主模型支持多模态时使用）
+                        if _main_model_no_multimodal:
+                            # 🛡️ 主模型不支持多模态：只给文本提示，不注入图片
+                            _note = (
+                                "（当前主模型不支持多模态读图，图片内容已跳过。"
+                                "如需识别图片，请配置 mul_* 多模态辅助模型。）"
+                            )
+                            try:
+                                _full_obj = json.loads(clean_tool_content)
+                                if isinstance(_full_obj, dict):
+                                    _full_obj["image_note"] = _note
+                                    _full_content = json.dumps(_full_obj, ensure_ascii=False)
+                                else:
+                                    _full_content = clean_tool_content + "\n" + _note
+                            except (json.JSONDecodeError, TypeError):
+                                _full_content = clean_tool_content + "\n" + _note
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "name": tool_name,
+                                "content": _full_content
+                            })
+                            print(f"   ⚠️ 主模型不支持多模态，跳过 {len(mcp_images)} 张 MCP 图片注入", flush=True)
+                            continue  # 跳过正常 tool response 追加（已追加）
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool["id"],
