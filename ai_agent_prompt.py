@@ -322,7 +322,6 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None, gua
         else:
             result = _call_openai_api(config, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
         return result
-        return result
     except Exception as e:
         # 出错时保存 err 日志
         save_error_snapshot(messages, str(e))
@@ -626,8 +625,8 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
                             j += 1
                             continue
                     break
-                if j > i + 1:
-                    print(f"   🔗 合并 {j - i} 条连续的 tool_result user 消息", flush=True)
+                # if j > i + 1:
+                #     print(f"   🔗 合并 {j - i} 条连续的 tool_result user 消息", flush=True)
                 merged_anthropic_messages.append({"role": "user", "content": merged_blocks})
                 i = j
                 continue
@@ -688,7 +687,7 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
                         if not is_image_tool_pair:
                             # ⚡ 真正的孤立 tool_use！跳过这个 assistant 消息
                             # 同时也跳过它之后可能跟着的 user 文本消息（如果有的话）
-                            print("   ⚠️ 检测到孤立的 tool_use，已自动跳过修复", flush=True)
+                            # print("   ⚠️ 检测到孤立的 tool_use，已自动跳过修复", flush=True)
                             i += 1
                             # 跳过后续的 user 消息（直到遇到下一个 assistant 或结尾）
                             while i < len(anthropic_messages) and anthropic_messages[i]["role"] == "user":
