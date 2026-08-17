@@ -26,6 +26,10 @@ import threading
 import datetime
 import pathlib
 import argparse
+import queue
+import time
+import atexit
+import tempfile
 
 # prompt_toolkit 为可选依赖 —— 有则用其增强输入（多行、历史、快捷键），无则退化为 input()
 try:
@@ -1152,6 +1156,61 @@ tools = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_bg_task",
+            "description": "在后台启动一条长耗时命令并立即返回（不阻塞当前会话，适合安装工具、编译大型项目、长时间下载/测试等）。返回 JSON：success、task_id、pid、status(running)、shell、stdout_path、stderr_path。拿到 task_id 后可用 bg_task_status 实时查询状态/输出、bg_task_kill 终止；任务结束后 agent 会自动收到通知并汇报。输出实时写入临时文件（避免管道缓冲导致延迟），bg_task_status 可随时看到最新输出；但注意部分程序（如 python 不带 -u）自身会缓冲输出，如需实时请给命令加 -u 或重定向到文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要在后台执行的完整命令行"
+                    },
+                    "force_use_bash": {
+                        "type": "boolean",
+                        "description": "选填，默认 false。为 true 时强制以 bash 执行（等价于 bash -c '命令'，不经 cmd 解析，单引号可用）；若系统没有 bash 会返回报错，请改回 false 或把命令写入脚本文件再执行"
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bg_task_status",
+            "description": "查询后台任务状态和已收集的输出（非阻塞）。返回 JSON：task_id、status(running/done/failed/killed/error)、returncode、running_seconds、stdout、stderr、command。任务未完成时输出为已收集的部分；任务完成后输出完整（超 200KB 自动截断）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "后台任务 id（由 start_bg_task 返回）"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bg_task_kill",
+            "description": "终止一个正在运行的后台任务（杀死整个进程树）。任务已结束或不存在会返回错误。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "后台任务 id"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
 ]
 
 # ============================================================
@@ -1847,6 +1906,360 @@ def run_bash(command, timeout=10, force_use_bash=False):
         return json.dumps(result_dict)
 
 
+# ============================================================
+#  后台任务管理器 —— 长耗时命令异步执行
+#  用法：
+#    start_bg_task(command)      → 立即返回 task_id，不阻塞当前会话
+#    bg_task_status(task_id)     → 查询状态/已收集输出（非阻塞）
+#    bg_task_kill(task_id)       → 终止任务（杀整个进程树）
+#  任务结束后自动进入完成队列，主循环在空闲点注入通知消息并驱动模型汇报，
+#  用户无需等待、agent 也能"主动开口"汇报结果。
+# ============================================================
+
+_bg_tasks = {}                 # task_id -> task_info dict
+_bg_task_seq = 0               # 递增任务 id
+_bg_completed = queue.Queue()  # 已完成/失败/被杀 的 task_id 通知队列
+_bg_lock = threading.Lock()
+# 本 agent 专属的日志目录（懒创建）。用 tempfile.TemporaryDirectory（mkdtemp）：
+# ① 目录名带随机后缀，OS 原子创建 → 多 agent 各自独立目录，task_id 从 1 计数也不会撞文件；
+# ② agent 退出时 cleanup() 自动删除整个目录 → 不留垃圾日志。
+_bg_tmpdir = None
+# 完成通知注入对话时最多携带的输出尾部字节数
+_BG_NOTIFY_TAIL = 4 * 1024              # 4KB
+
+
+def _bg_ensure_tmpdir():
+    """懒创建本 agent 专属日志目录（线程安全）。返回 TemporaryDirectory 对象。"""
+    global _bg_tmpdir
+    if _bg_tmpdir is None:
+        with _bg_lock:
+            if _bg_tmpdir is None:
+                _bg_tmpdir = tempfile.TemporaryDirectory(prefix="marisa_bg_")
+    return _bg_tmpdir
+
+
+def _bg_next_task_id():
+    """分配递增的任务 id（线程安全）"""
+    global _bg_task_seq
+    with _bg_lock:
+        _bg_task_seq += 1
+        return _bg_task_seq
+
+
+def _bg_notify(task_id):
+    """把 task_id 放入完成通知队列（去重：wait 线程和 kill 可能同时触发）"""
+    with _bg_lock:
+        info = _bg_tasks.get(task_id)
+        if info is None or info.get("notified"):
+            return
+        info["notified"] = True
+        _bg_completed.put(task_id)
+
+
+def _bg_log_path(task_id, kind):
+    """后台任务输出文件路径（本 agent 专属临时目录内，文件名带 task_id）。
+
+    关键设计：子进程 stdout/stderr 不走管道而是直接写文件——
+    管道会让子进程 stdio 走全缓冲（输出攒到缓冲区满或进程退出才可见），
+    而写文件是即时系统调用，bash 的 echo / 脚本逐行输出实时落盘，
+    bg_task_status 随时可读到最新输出。
+
+    多 agent 隔离：目录由 mkdtemp 唯一创建（marisa_bg_xxxxxx），
+    每个 agent 进程写自己的目录，task_id 重复也不会冲突。
+    """
+    d = _bg_ensure_tmpdir().name
+    return os.path.join(d, f"task_{task_id}_{kind}.log")
+
+
+def _bg_read_file(path, max_bytes):
+    """读取后台任务输出文件。文件超限时只取末尾 max_bytes（最新输出）。"""
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size <= max_bytes:
+                f.seek(0)
+                data = f.read()
+                return smart_decode(data)
+            f.seek(size - max_bytes)
+            data = f.read()
+            text = smart_decode(data)
+            return f"…（输出过大，已截断，仅显示尾部 {max_bytes//1024}KB）\n{text}"
+    except Exception:
+        return ""
+
+
+def _bg_wait_process(task_id, proc):
+    """后台 wait 线程：等待进程结束 → 更新状态 → 入完成队列"""
+    info = _bg_tasks.get(task_id)
+    if info is None:
+        return
+    try:
+        proc.wait()
+        info["returncode"] = proc.returncode
+        info["finish_time"] = time.time()
+        # 若已被 bg_task_kill 标记为 killed，保持 killed，避免被进程返回码覆盖
+        if info.get("status") != "killed":
+            info["status"] = "done" if proc.returncode == 0 else "failed"
+    except Exception:
+        if info.get("status") != "killed":
+            info["status"] = "error"
+        info["finish_time"] = time.time()
+    _bg_notify(task_id)
+    print(f"\n🔔 后台任务 #{task_id} 已结束（exit={info['returncode']}）\n", flush=True)
+
+
+def _bg_kill_process_tree(pid):
+    """杀死整个进程树（Windows: taskkill /F /T；Unix: killpg）"""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+        )
+    else:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+
+
+def start_bg_task(command, force_use_bash=False):
+    """在后台启动一条命令，立即返回 task_id，不阻塞当前会话。
+
+    返回 json：success、task_id、pid、status("running")、shell。
+    后续用 bg_task_status(task_id) 查询，任务完成时 agent 会自动收到通知。
+    """
+    if not isinstance(command, str) or not command.strip():
+        return json.dumps({"success": 0, "task_id": None, "err": f"无效的command参数: {repr(command)}"})
+    # force_use_bash 规范化（防止模型传 "true"/"false"/1/0 等）
+    if isinstance(force_use_bash, str):
+        force_use_bash = force_use_bash.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        force_use_bash = bool(force_use_bash)
+
+    # 确定实际使用的 shell（与 run_bash 同一套逻辑）
+    used_shell = "sh"
+    bash_path = None
+    if force_use_bash:
+        used_shell = "bash"
+    elif sys.platform == "win32":
+        bash_path = _detect_bash_path()
+        used_shell = "bash" if bash_path else "cmd"
+
+    # 分配 task_id 并创建输出文件：
+    # stdout/stderr 直接写文件（不走管道）——避免管道全缓冲导致输出延迟到任务结束，
+    # 文件写入是即时系统调用，bash echo / 脚本输出实时落盘，随时可查。
+    task_id = _bg_next_task_id()
+    out_path = _bg_log_path(task_id, "out")
+    err_path = _bg_log_path(task_id, "err")
+
+    extra_kwargs = {}
+    if sys.platform == "win32":
+        extra_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        extra_kwargs["preexec_fn"] = os.setsid
+
+    try:
+        out_f = open(out_path, "wb")
+        err_f = open(err_path, "wb")
+        if force_use_bash or (sys.platform == "win32" and bash_path):
+            bash_cmd = ["bash", "-c", command] if force_use_bash else [bash_path, "-c", command]
+            proc = subprocess.Popen(
+                bash_cmd, shell=False,
+                stdout=out_f, stderr=err_f,
+                **extra_kwargs
+            )
+        else:
+            proc = subprocess.Popen(
+                command, shell=True,
+                stdout=out_f, stderr=err_f,
+                **extra_kwargs
+            )
+        # 父进程关闭文件对象（子进程持有 fd 继续写入，不受影响）
+        out_f.close()
+        err_f.close()
+    except Exception as e:
+        return json.dumps({"success": 0, "task_id": task_id, "err": f"启动后台任务失败: {e}"})
+
+    info = {
+        "task_id": task_id,
+        "command": command,
+        "pid": proc.pid,
+        "proc": proc,            # 退出清理时需等待进程真正结束（Windows 句柄释放）
+        "shell": used_shell,
+        "status": "running",
+        "returncode": None,
+        "stdout_path": out_path,
+        "stderr_path": err_path,
+        "start_time": time.time(),
+        "finish_time": None,
+        "notified": False,
+    }
+    _bg_tasks[task_id] = info
+
+    # wait 线程：等待进程结束 → 更新状态 → 入完成队列
+    threading.Thread(target=_bg_wait_process, args=(task_id, proc), daemon=True).start()
+
+    return json.dumps({
+        "success": 1,
+        "task_id": task_id,
+        "pid": proc.pid,
+        "status": "running",
+        "shell": used_shell,
+        "stdout_path": out_path,
+        "stderr_path": err_path,
+        "message": (
+            f"后台任务 #{task_id} 已启动，输出实时写入文件（{out_path}）。"
+            f"可用 bg_task_status(task_id={task_id}) 随时查看最新输出；任务完成后我会收到通知。"
+        )
+    })
+
+
+def bg_task_status(task_id):
+    """查询后台任务状态和已收集的输出（非阻塞）"""
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        return json.dumps({"success": 0, "err": f"无效的task_id: {repr(task_id)}"})
+    info = _bg_tasks.get(task_id)
+    if info is None:
+        active = [t for t, i in _bg_tasks.items() if i.get("status") == "running"]
+        return json.dumps({
+            "success": 0,
+            "err": f"找不到后台任务 #{task_id}。当前活跃任务: {active if active else '无'}"
+        })
+
+    # 从输出文件读取（输出实时落盘；文件超限时只取尾部最新内容）
+    stdout = _bg_read_file(info.get("stdout_path"), TOOL_HARD_CUTOFF)
+    stderr = _bg_read_file(info.get("stderr_path"), TOOL_HARD_CUTOFF)
+
+    dur = None
+    if info["finish_time"] is not None:
+        dur = round(info["finish_time"] - info["start_time"], 1)
+    elif info["start_time"]:
+        dur = round(time.time() - info["start_time"], 1)
+
+    # 运行中但无任何输出时，提示可能是程序自身缓冲或刚开始执行
+    hint = ""
+    if info["status"] == "running" and not stdout and not stderr:
+        hint = "（任务运行中暂无输出，可能是程序自身缓冲或刚开始执行）"
+
+    return json.dumps({
+        "success": 1,
+        "task_id": task_id,
+        "status": info["status"],
+        "pid": info["pid"],
+        "command": info["command"],
+        "shell": info["shell"],
+        "returncode": info["returncode"],
+        "running_seconds": dur,
+        "stdout": stdout,
+        "stderr": stderr,
+        "message": f"后台任务 #{task_id} 状态: {info['status']}{hint}"
+    })
+
+
+def bg_task_kill(task_id):
+    """终止一个正在运行的后台任务（杀死整个进程树）"""
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        return json.dumps({"success": 0, "err": f"无效的task_id: {repr(task_id)}"})
+    info = _bg_tasks.get(task_id)
+    if info is None:
+        return json.dumps({"success": 0, "err": f"找不到后台任务 #{task_id}"})
+    if info["status"] != "running":
+        return json.dumps({"success": 0, "err": f"任务 #{task_id} 已不在运行（状态: {info['status']}）"})
+    try:
+        _bg_kill_process_tree(info["pid"])
+        info["status"] = "killed"
+        info["finish_time"] = time.time()
+        _bg_notify(task_id)
+        print(f"\n✂️  后台任务 #{task_id}（PID {info['pid']}）已终止\n", flush=True)
+        return json.dumps({"success": 1, "task_id": task_id, "status": "killed",
+                           "message": f"后台任务 #{task_id} 已被终止"})
+    except Exception as e:
+        return json.dumps({"success": 0, "err": f"终止任务 #{task_id} 失败: {e}"})
+
+
+def _bg_build_event_message():
+    """从完成队列取一个 task_id，构造 user 通知消息文本；队列空返回 None"""
+    try:
+        task_id = _bg_completed.get_nowait()
+    except queue.Empty:
+        return None
+    info = _bg_tasks.get(task_id)
+    if info is None:
+        return None
+
+    status = info["status"]
+    code = info["returncode"]
+    dur = None
+    if info["finish_time"] is not None:
+        dur = round(info["finish_time"] - info["start_time"], 1)
+    elif info["start_time"]:
+        dur = round(time.time() - info["start_time"], 1)
+
+    stdout = _bg_read_file(info.get("stdout_path"), _BG_NOTIFY_TAIL)
+    stderr = _bg_read_file(info.get("stderr_path"), _BG_NOTIFY_TAIL)
+    stdout_tail = stdout[-_BG_NOTIFY_TAIL:] if stdout else ""
+    stderr_tail = stderr[-_BG_NOTIFY_TAIL:] if stderr else ""
+    tail_note = ""
+    if len(stdout) > _BG_NOTIFY_TAIL or len(stderr) > _BG_NOTIFY_TAIL:
+        tail_note = "（输出较长，仅展示尾部，可用 bg_task_status 查询完整输出）"
+
+    text = (
+        f"[后台任务通知] 后台任务 #{task_id} 已结束：\n"
+        f"  命令: {info['command']}\n"
+        f"  状态: {status}（exit code: {code if code is not None else 'N/A'}）\n"
+        f"  运行时长: {dur} 秒\n"
+        f"{tail_note}\n"
+    )
+    if stdout_tail:
+        text += f"  --- 标准输出尾部 ---\n{stdout_tail}\n"
+    if stderr_tail:
+        text += f"  --- 标准错误尾部 ---\n{stderr_tail}\n"
+    text += "请查看结果并继续后续工作（如需可调用 bg_task_status 获取完整输出，或发起新的后台任务）。"
+    return text
+
+def _bg_shutdown():
+    """程序退出时终止仍在运行的后台任务，并清理本 agent 的日志目录（防止孤儿进程/垃圾日志）"""
+    running = [tid for tid, i in _bg_tasks.items() if i.get("status") == "running"]
+    if running:
+        print(f"\n🔮 程序退出，正在终止 {len(running)} 个后台任务...", flush=True)
+        for tid in running:
+            try:
+                info = _bg_tasks[tid]
+                _bg_kill_process_tree(info["pid"])
+                info["status"] = "killed"
+                print(f"   ✂️  后台任务 #{tid}（PID {info['pid']}）已终止", flush=True)
+            except Exception:
+                pass
+        # 等待子进程真正退出：Windows 上进程终止后句柄才释放，
+        # 否则紧接着删除日志文件会因占用而失败（WinError 32）。
+        for tid in running:
+            proc = (_bg_tasks.get(tid) or {}).get("proc")
+            if proc is not None:
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+    # 清理本 agent 的专属日志目录（TemporaryDirectory.cleanup → 删除整个目录）。
+    # 句柄释放可能有延迟，重试几次兜底；仍失败则交给系统临时目录清理。
+    global _bg_tmpdir
+    if _bg_tmpdir is not None:
+        for _ in range(3):
+            try:
+                _bg_tmpdir.cleanup()
+                break
+            except Exception:
+                time.sleep(0.3)
+        _bg_tmpdir = None
+
+
+# 模块级注册退出清理：import 即生效。即使不调用 main()（测试/嵌入式场景），
+# 后台任务与日志目录也能在进程退出时被正确清理（否则只剩 tempfile 的 finalizer，
+# 它不会 kill 任务/等待句柄释放，日志目录会因文件占用删不掉）。
+atexit.register(_bg_shutdown)
 # ============================================================
 #  路径标准化 —— Windows 下兼容 Linux 风格路径
 # ============================================================
@@ -3196,6 +3609,9 @@ tool_func_map = {
     "mcp_disconnect_server": mcp_disconnect_server,
     "mcp_restart_server": mcp_restart_server,
     "read_image": read_image,
+    "start_bg_task": start_bg_task,
+    "bg_task_status": bg_task_status,
+    "bg_task_kill": bg_task_kill,
 }
 
 
@@ -3348,9 +3764,10 @@ def main():
     global tool_executing, interrupted, messages, CWD_SKILLS_DIR, CODE_SKILLS_DIR
     global _main_model_no_multimodal
 
-    # 注册信号处理器 —— 只用于工具执行中的中断
+    # 注册信号处理器——只用于工具执行中的中断
     # 用户输入中的 Ctrl+C 由 prompt_toolkit 处理
     signal.signal(signal.SIGINT, sigint_handler)
+    # 后台任务清理已在模块级注册 atexit，无需在此重复注册
 
     # ---- 命令行参数解析 ----
     parser = argparse.ArgumentParser(description='魔理沙 AI Agent - 兴趣使然的对话助手')
@@ -3532,26 +3949,35 @@ def main():
         # 每次回到用户输入时重置中断标志
         interrupted = False
 
-        try:
-            if pipe_mode:
-                # 管道/重定向模式：与退化 input 一致，流式逐条读取。
-                # 每收到一条以 '.' 结尾（或以 EOF 结束）的消息就返回一段，
-                # 由主循环回答一次后继续读下一条，直到 EOF 自动退出。
-                user_input = read_multiline_input("我: ")
-            elif use_prompt_toolkit:
-                # 使用 prompt_toolkit 的多行输入
-                user_input = session.prompt("我: ")
-            else:
-                # 退化版 input() 多行输入（单行 '.' 结束）
-                user_input = read_multiline_input("我: ")
-        except KeyboardInterrupt:
-            # Ctrl+C 在输入时引发 KeyboardInterrupt
-            print("\n👋 再见！DA⭐ZE！\n", flush=True)
-            break
-        except EOFError:
-            # Ctrl+D 也可能引发 EOFError（取决于配置）
-            print("\n👋 再见！DA⭐ZE！\n", flush=True)
-            break
+        # 🔔 后台任务完成事件泵：有完成事件时优先自动处理（不等待用户输入）
+        # 后台任务结束 → 注入一条 user 通知消息 → 走正常处理流程让模型汇报/继续
+        bg_ev_text = None
+        if not interrupted:
+            bg_ev_text = _bg_build_event_message()
+        if bg_ev_text is not None:
+            print("   🔔 后台任务已结束，自动汇报...\n", flush=True)
+            user_input = bg_ev_text
+        else:
+            try:
+                if pipe_mode:
+                    # 管道/重定向模式：与退化 input 一致，流式逐条读取。
+                    # 每收到一条以 '.' 结尾（或以 EOF 结束）的消息就返回一段，
+                    # 由主循环回答一次后继续读下一条，直到 EOF 自动退出。
+                    user_input = read_multiline_input("我: ")
+                elif use_prompt_toolkit:
+                    # 使用 prompt_toolkit 的多行输入
+                    user_input = session.prompt("我: ")
+                else:
+                    # 退化版 input() 多行输入（单行 '.' 结束）
+                    user_input = read_multiline_input("我: ")
+            except KeyboardInterrupt:
+                # Ctrl+C 在输入时引发 KeyboardInterrupt
+                print("\n👋 再见！DA⭐ZE！\n", flush=True)
+                break
+            except EOFError:
+                # Ctrl+D 也可能引发 EOFError（取决于配置）
+                print("\n👋 再见！DA⭐ZE！\n", flush=True)
+                break
 
         # 如果 Ctrl+D 导致返回 None，也退出
         if user_input is None:
