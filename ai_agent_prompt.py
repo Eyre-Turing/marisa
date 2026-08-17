@@ -1753,6 +1753,7 @@ def run_bash(command, timeout=10, force_use_bash=False):
             "stdout": b"",
             "stderr": b"",
             "timed_out": False,
+            "user_interrupted": False,
             "exception": None
         }
 
@@ -1800,6 +1801,35 @@ def run_bash(command, timeout=10, force_use_bash=False):
             stdout_data, stderr_data = proc.communicate(timeout=timeout + 5)
             result_container["stdout"] = stdout_data
             result_container["stderr"] = stderr_data
+        except KeyboardInterrupt:
+            # 🛡️ 用户按了 Ctrl+C 中断魔法吟唱！绝不能让它把整个 agent 干崩。
+            # Ctrl+C 时 signal handler 已把 interrupted 置 True，这里捕获后做善后：
+            # 杀掉子进程、读取残留输出，然后返回"用户中断"结果，程序继续存活。
+            result_container["timed_out"] = False
+            # 杀掉整个进程组（跟 watchdog 一样的杀法）
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=5
+                    )
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            # 读取残留输出（短暂等待，失败就算了）
+            try:
+                stdout_data, stderr_data = proc.communicate(timeout=3)
+                result_container["stdout"] = stdout_data
+                result_container["stderr"] = stderr_data
+            except Exception:
+                pass
+            # 中断结果留给下方统一处理（stderr 里说明是用户中断）
+            result_container["user_interrupted"] = True
         except subprocess.TimeoutExpired:
             # communicate 超时，但 watchdog 已经或即将杀掉进程
             # 等待进程结束
@@ -1833,6 +1863,21 @@ def run_bash(command, timeout=10, force_use_bash=False):
                 f"魔法结果:\n    \n"
                 f"魔法报错:\n    命令执行超时（{timeout}秒），已强制终止\n"
                 f"退出状态: -1",
+                flush=True
+            )
+            return json.dumps(result_dict)
+
+        # 🛡️ 用户中断处理：Ctrl+C 中断了魔法吟唱，优雅返回而不是崩掉整个程序
+        if result_container["user_interrupted"]:
+            stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
+            stderr = smart_decode(result_container["stderr"]) if result_container["stderr"] else ""
+            # stderr 里带上用户中断的说明，方便后续对话上下文理解
+            interrupt_msg = "用户按 Ctrl+C 中断了命令执行"
+            stderr = (interrupt_msg + ("\n" + stderr if stderr else "")) if stderr else interrupt_msg
+            result_dict = {"stdout": stdout, "stderr": stderr, "code": -1, "shell": used_shell}
+            print(
+                "魔法结果:\n    \n"
+                f"魔法报错:\n    {interrupt_msg}",
                 flush=True
             )
             return json.dumps(result_dict)
