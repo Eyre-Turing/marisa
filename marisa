@@ -1,7 +1,11 @@
 #!/bin/bash
 
 # 脚本所在目录（不 cd，让用户可以在任意目录下使用）
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF_FILENAME=$0
+if type readlink >/dev/null 2>&1; then
+    SELF_FILENAME=$(readlink -f "$0")
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SELF_FILENAME")" && pwd)"
 
 export PYTHONUTF8=1
 export PYTHONUNBUFFERED=1
