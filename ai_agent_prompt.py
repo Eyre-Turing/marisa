@@ -3269,44 +3269,108 @@ def _init_skills_dirs():
 
 
 def _scan_skills(dir_path):
-    """扫描指定目录下的 .md 文件，返回技能名列表"""
+    """扫描指定技能根目录，返回技能清单，兼容两种主流形态：
+
+    1. 扁平型（向后兼容）：<dir>/<技能名>.md           -> 技能名=文件名
+    2. 目录型（主流 Claude Code / OpenHands / ppt-master）：
+       <dir>/<技能名>/SKILL.md                          -> 技能名=目录名
+
+    返回列表，每个元素为 dict: {name, kind, root}
+      - kind: "file"  扁平型，root 为该 .md 文件所在目录
+      - kind: "dir"   目录型，root 为该技能目录
+    """
     if not dir_path or not os.path.isdir(dir_path):
         return []
+    result = []
     try:
-        result = []
         for f in sorted(os.listdir(dir_path)):
-            if f.endswith(".md"):
-                result.append(f[:-3])
+            full = os.path.join(dir_path, f)
+            # 扁平型：直接 .md 文件
+            if os.path.isfile(full) and f.endswith(".md"):
+                result.append({"name": f[:-3], "kind": "file", "root": dir_path})
+            # 目录型：子目录且含 SKILL.md（大小写不敏感，兼容 Windows/macOS）
+            elif os.path.isdir(full):
+                skill_md = _find_skill_md(full)
+                if skill_md:
+                    result.append({"name": f, "kind": "dir", "root": full})
         return result
     except Exception:
         return []
 
 
+def _find_skill_md(skill_root):
+    """在技能目录中查找 SKILL.md，大小写不敏感地匹配主流的 SKILL.md 命名。"""
+    if not os.path.isdir(skill_root):
+        return None
+    try:
+        for entry in os.listdir(skill_root):
+            if entry.lower() == "skill.md":
+                p = os.path.join(skill_root, entry)
+                if os.path.isfile(p):
+                    return p
+    except Exception:
+        pass
+    return None
+
+
 def _merge_skills():
-    """合并两个 skills 目录的技能列表，启动目录优先（同名覆盖）"""
+    """合并两个技能根目录的技能清单，启动目录优先（同名覆盖）。
+
+    返回列表，每个元素为 dict: {name, kind, root}
+    - kind: "file"  扁平型 .md 技能
+    - kind: "dir"   目录型 SKILL.md 技能
+    """
     cwd_skills = _scan_skills(CWD_SKILLS_DIR)
     code_skills = _scan_skills(CODE_SKILLS_DIR)
-    
-    # 启动目录优先：如果启动目录有同名技能，代码目录的被覆盖
-    # 用 dict 去重，启动目录的先插入，代码目录的后插入会覆盖
+
+    # 启动目录优先：同名技能，启动目录版本覆盖代码目录版本
+    # 用 dict 按技能名去重，code 先插入，cwd 后插入覆盖
     merged = {}
     for s in code_skills:
-        merged[s] = "code"
+        merged[s["name"]] = s
     for s in cwd_skills:
-        merged[s] = "cwd"
-    
-    # 保持排序稳定：按名字排序
-    return [(s, merged[s]) for s in sorted(merged.keys())]
+        merged[s["name"]] = s
+
+    # 按名字排序，保持稳定
+    return [merged[k] for k in sorted(merged.keys())]
 
 
-def _resolve_skill_file(skill_name):
-    """根据技能名返回实际文件路径（启动目录优先）"""
-    if CWD_SKILLS_DIR:
-        fpath = os.path.join(CWD_SKILLS_DIR, f"{skill_name}.md")
-        if os.path.isfile(fpath):
-            return fpath
-    if CODE_SKILLS_DIR:
-        fpath = os.path.join(CODE_SKILLS_DIR, f"{skill_name}.md")
+def _resolve_skill_file(skill_info):
+    """根据技能信息返回实际技能入口文件路径（支持 dict 或字符串两种入参）。
+
+    - skill_info 为 dict（来自 _merge_skills）：按 kind 解析
+      * kind="file" -> <root>/<name>.md
+      * kind="dir"  -> <root>/SKILL.md（大小写不敏感）
+    - skill_info 为字符串（老代码传技能名）：向后兼容，自动探测两种形态
+    """
+    if isinstance(skill_info, dict):
+        name = skill_info.get("name")
+        kind = skill_info.get("kind")
+        root = skill_info.get("root")
+        if not name or not root:
+            return None
+        if kind == "dir":
+            return _find_skill_md(root) or None
+        # file 形态
+        if CWD_SKILLS_DIR and os.path.normpath(root) == os.path.normpath(CWD_SKILLS_DIR):
+            fpath = os.path.join(root, f"{name}.md")
+            if os.path.isfile(fpath):
+                return fpath
+        fpath = os.path.join(root, f"{name}.md")
+        return fpath if os.path.isfile(fpath) else None
+
+    # 字符串兼容分支：直接在两个 skills 根目录下探测两种形态
+    skill_name = skill_info
+    for base in (CWD_SKILLS_DIR, CODE_SKILLS_DIR):
+        if not base:
+            continue
+        # 目录型
+        sub = os.path.join(base, skill_name)
+        skill_md = _find_skill_md(sub)
+        if skill_md:
+            return skill_md
+        # 扁平型
+        fpath = os.path.join(base, f"{skill_name}.md")
         if os.path.isfile(fpath):
             return fpath
     return None
@@ -3349,23 +3413,24 @@ def load_skill(task_description):
         return json.dumps(result_dict)
 
     # ---- 构造子 Agent 的 System Prompt ----
-    skills_list_str = "\n".join(f"  - {s}" for s in available_skills)
-    # ---- 构造子 Agent 的 System Prompt ----
-    skills_list_str = "\n".join(f"  - {s}" for s in available_skills)
+    merged_info = _merge_skills()
+    available_with_desc = [_skill_desc(s) for s in merged_info]
+    skills_list_str = "\n".join(f"  - {s}" for s in available_with_desc)
     sub_system_prompt = (
         "你是一个技能检索助手。你的任务是根据用户描述的需求，从技能库中找出最匹配的技能。\n"
         "\n"
-        f"可用技能文件（位于 skills/ 目录下，均为 .md 格式）：\n"
+        "可用技能（位于 skills/ 目录下，兼容两种形态：扁平 .md 文件，或含 SKILL.md 的目录型技能）"
+        "，括号中为可用的技能描述/用途：\n"
         f"{skills_list_str}\n"
         "\n"
         "请按以下步骤操作：\n"
         "1. 分析用户的需求描述，判断需要哪些技能\n"
         "2. 使用 list_skills 工具查看可用技能列表（确认最新情况）\n"
-        "3. 如果不确定某个技能的内容是否匹配，可以使用 read_full_file 工具读取来确认\n"
+        "3. 如果不确定某个技能的内容是否匹配，可以使用 read_full_file 工具读取其入口文件（扁平 .md 或 SKILL.md）来确认\n"
         "4. 确定最终匹配的技能列表\n"
         "\n"
         "注意：\n"
-        "- 技能文件名（不含 .md）大致反映了其内容领域\n"
+        "- 技能名（不含 .md / SKILL.md）大致反映了其内容领域\n"
         "- 可以匹配多个技能（如问题涉及多个领域）\n"
         "- 尽量精准匹配，不要加载无关的技能\n"
         "- 如果没有匹配的技能，matched_skills 列表返回空 []\n"
@@ -3530,18 +3595,26 @@ def load_skill(task_description):
                 matched_skills = []
 
     # ---- 主Agent根据子Agent的匹配结果，自己读取技能文件并加载 ----
+    # 事先构建「技能名 -> 技能信息(dict)」映射，便于按形态精确解析入口与技能根目录
+    merged_index = {s["name"]: s for s in _merge_skills()}
     loaded_contents = []
     if matched_skills:
         for skill_name in matched_skills:
-            skill_file = _resolve_skill_file(skill_name)
+            skill_info = merged_index.get(skill_name)
+            skill_file = _resolve_skill_file(skill_info) if skill_info else _resolve_skill_file(skill_name)
             try:
                 with open(skill_file, "rb") as f:
                     raw_data = f.read()
                 content = smart_decode(raw_data)
+                # 目录型技能附带技能根目录，便于后续读取 references/ 等辅助资源
+                skill_root = ""
+                if skill_info and skill_info.get("kind") == "dir":
+                    skill_root = skill_info.get("root", "")
                 loaded_contents.append({
                     "skill_name": skill_name,
                     "content": content,
-                    "size": len(content)
+                    "size": len(content),
+                    "skill_root": skill_root,
                 })
                 print(f"读取技能文件: {skill_file}\n文件大小: {len(raw_data)} 字节\n是否成功: 1", flush=True)
             except Exception as e:
@@ -3596,45 +3669,140 @@ def load_skill(task_description):
     return json.dumps({
         "success": 1,
         "skills_loaded": [item["skill_name"] for item in loaded_contents],
-        "skills_detail": [{"name": item["skill_name"], "size_chars": item["size"]} for item in loaded_contents],
+        "skills_detail": [{
+            "name": item["skill_name"],
+            "size_chars": item["size"],
+            "skill_root": item.get("skill_root", ""),
+        } for item in loaded_contents],
         "contents": {item["skill_name"]: item["content"] for item in loaded_contents},
         "reasoning_preview": final_reasoning[:300] if final_reasoning else "",
         "message": f"技能 '{'、'.join(item['skill_name'] for item in loaded_contents)}' 已加载成功，AI 将参考这些技能知识"
     })
 
 
+def _parse_frontmatter(text):
+    """极简解析 Markdown 顶部的 YAML frontmatter（--- 到 --- 之间的键值对）。
+
+    不依赖第三方 yaml 库，只处理扁平键值（兼容主流 SKILL.md 的 name/description）。
+    返回 dict。解析失败或没有 frontmatter 时返回空 dict。
+    """
+    result = {}
+    if not text:
+        return result
+    lines = text.split("\n")
+    start = -1
+    for i, ln in enumerate(lines[:60]):
+        if ln.strip() == "---":
+            start = i
+            break
+    if start < 0:
+        return result
+    end = -1
+    for i in range(start + 1, min(len(lines), start + 60)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end < 0:
+        return result
+    pending_key = None
+    pending_val = []
+    # YAML 块标量指示符：> | >- |- 等，后续缩进行都属于该 key 的值
+    BLOCK_SCALAR = (">", "|", ">-", ">>-", "|-", "||-", ">&", ">>&")
+    for ln in lines[start + 1:end]:
+        if not ln.strip():
+            continue
+        if not ln[0].isspace() and ":" in ln:
+            key, _, val = ln.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if pending_key and pending_val:
+                result[pending_key] = "\n".join(pending_val).strip()
+            if val and val in BLOCK_SCALAR:
+                # 块标量：后续缩进行收集到该 key
+                pending_key, pending_val = key, []
+            elif val:
+                pending_key, pending_val = None, []
+                result[key] = val.strip().strip('"').strip("'")
+            else:
+                pending_key, pending_val = key, []
+        elif pending_key is not None:
+            pending_val.append(ln.strip())
+    if pending_key and pending_val:
+        result[pending_key] = "\n".join(pending_val).strip()
+    return result
+
+
+def _skill_desc(skill_info, text=None):
+    """为技能生成一个给子 Agent 看的描述字符串。
+
+    目录型技能优先用 frontmatter 里的 name/description；扁平型用其技能名。
+    """
+    name = skill_info.get("name", "")
+    kind = skill_info.get("kind", "file")
+    if kind == "dir":
+        if text is None:
+            skill_md = _find_skill_md(skill_info.get("root", ""))
+            if skill_md:
+                try:
+                    with open(skill_md, "rb") as f:
+                        text = smart_decode(f.read())
+                except Exception:
+                    text = None
+        if text:
+            fm = _parse_frontmatter(text)
+            desc = fm.get("description") or fm.get("desc") or ""
+            fm_name = fm.get("name") or ""
+            parts = [f"[目录型技能] {name}"]
+            if fm_name and fm_name != name:
+                parts[0] += f" (frontmatter name={fm_name})"
+            if desc:
+                parts.append(desc[:200])
+            return " | ".join(parts)
+    return f"[扁平技能] {name}"
+
+
 def _list_available_skills():
-    """列出所有可用技能（合并两个 skills 目录，启动目录优先）"""
+    """列出所有可用技能（合并两个 skills 目录，启动目录优先）。
+
+    返回技能名列表（与老接口一致，供主 Agent 简单引用）。
+    """
     merged = _merge_skills()
-    return [s for s, _ in merged]
+    return [s["name"] for s in merged]
 
 
 def _list_available_skills_wrapper():
-    """给子 Agent 用的 list_skills 工具包装函数，返回格式化的 JSON"""
-    skills = _list_available_skills()
+    """给子 Agent 用的 list_skills 工具包装函数，返回格式化的 JSON。
+
+    相比老版本，额外附带每个技能的形态与描述，帮助子 Agent 更精准匹配。
+    """
     merged = _merge_skills()
-    
-    # 标记每个技能来自哪个目录
+
     cwd_skills = []
     code_skills = []
-    for s_name, source in merged:
-        if source == "cwd":
-            cwd_skills.append(s_name)
+    for s in merged:
+        if CWD_SKILLS_DIR and os.path.normpath(s.get("root", "")) == os.path.normpath(CWD_SKILLS_DIR):
+            s["_source"] = "cwd"
+            cwd_skills.append(s["name"])
         else:
-            code_skills.append(s_name)
-    
+            s["_source"] = "code"
+            code_skills.append(s["name"])
+
+    skills_names = [s["name"] for s in merged]
+    skills_with_info = [_skill_desc(s) for s in merged]
+
     info_parts = []
     if CWD_SKILLS_DIR:
         info_parts.append(f"启动目录({CWD_SKILLS_DIR.replace(chr(92), '/')}): {len(cwd_skills)}个技能")
     if CODE_SKILLS_DIR:
         info_parts.append(f"代码目录({CODE_SKILLS_DIR.replace(chr(92), '/')}): {len(code_skills)}个技能")
-    info_parts.append(f"合并后共 {len(skills)} 个技能（同名以启动目录版本为准）")
-    
+    info_parts.append(f"合并后共 {len(skills_names)} 个技能（同名以启动目录版本为准）")
+
     return json.dumps({
         "success": 1,
-        "skills": skills,
+        "skills": skills_names,
         "cwd_skills": cwd_skills,
         "code_skills": code_skills,
+        "skills_with_info": skills_with_info,
         "message": " | ".join(info_parts)
     })
 
