@@ -2871,15 +2871,23 @@ def edit_file_lines(filename, start_line, end_line, new_content):
             lineterm='\n'
         ))
         # 🔧 修正 hunk header 的行号偏移！
-        # unified_diff 只看到了从 start_line 截取的片段，所以行号从1开始
-        # 我们要把它修正为实际的文件行号
+        # unified_diff 只看到了从 start_line 截取的片段，所以 hunk 头里的
+        # 相对行号是从 1 开始的。真实文件行号 = start_line - 1 + 相对行号。
+        # 关键：多个 hunk 时每个 hunk 的相对行号不同（如 @@ -1,5 @@ 和 @@ -300,5 @@），
+        # 必须分别加上 start_line-1 偏移，而不是全部硬编码成 start_line！
         fixed_diff_lines = []
         for line in diff_lines:
             match = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
             if match:
+                old_rel = int(match.group(1))      # 片段内旧文件相对起始行号（从1开始）
                 old_count = match.group(2) or '1'
+                new_rel = int(match.group(3))      # 片段内新文件相对起始行号（从1开始）
                 new_count = match.group(4) or '1'
-                line = f'@@ -{start_line},{old_count} +{start_line},{new_count} @@\n'
+                # 整个 old_text 片段被 new_content 替换，start_line 是片段起始处，
+                # 所以每个 hunk 的真实行号 = start_line - 1 + 相对行号
+                old_abs = start_line - 1 + old_rel
+                new_abs = start_line - 1 + new_rel
+                line = f'@@ -{old_abs},{old_count} +{new_abs},{new_count} @@\n'
             fixed_diff_lines.append(line)
         diff_text = ''.join(fixed_diff_lines)
 
@@ -3054,15 +3062,23 @@ def edit_file_match(filename, old_content, new_content):
             tofile=f'b/{filename}',
             lineterm='\n'
         ))
-        # 修正行号：计算 old_content 在文件中的起始行号
+        # 🔧 修正行号：计算 old_content 在文件中的起始行号
         start_line = original_text[:pos].count('\n') + 1
+        # 多个 hunk 时每个 hunk 的相对行号不同，必须分别加上 start_line-1 偏移，
+        # 而不是全部硬编码成 start_line ！否则第二个 @@ 的行号会错。
         fixed_diff_lines = []
         for line in diff_lines:
             match = re.match(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@', line)
             if match:
+                old_rel = int(match.group(1))      # 片段内旧文件相对起始行号（从1开始）
                 old_count = match.group(2) or '1'
+                new_rel = int(match.group(3))      # 片段内新文件相对起始行号（从1开始）
                 new_count = match.group(4) or '1'
-                line = f'@@ -{start_line},{old_count} +{start_line},{new_count} @@\n'
+                # old_content 被 new_content 替换，start_line 是替换起始处，
+                # 每个 hunk 的真实行号 = start_line - 1 + 相对行号
+                old_abs = start_line - 1 + old_rel
+                new_abs = start_line - 1 + new_rel
+                line = f'@@ -{old_abs},{old_count} +{new_abs},{new_count} @@\n'
             fixed_diff_lines.append(line)
         diff_text = ''.join(fixed_diff_lines)
 
