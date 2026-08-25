@@ -36,11 +36,15 @@ try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Dimension
+    from prompt_toolkit.application import get_app
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
     PromptSession = None
     InMemoryHistory = None
     KeyBindings = None
+    Dimension = None
+    get_app = None
     HAS_PROMPT_TOOLKIT = False
 
 # MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
@@ -3885,6 +3889,32 @@ def _cleanup_mcp_tools():
 # ============================================================
 #  3. 输入处理 —— prompt_toolkit 会话 / 退化 input 多行读取
 # ============================================================
+if HAS_PROMPT_TOOLKIT:
+
+    class _BoundedInputSession(PromptSession):
+        """限制多行输入可视化高度的 PromptSession 子类。
+
+        默认 prompt_toolkit 的多行输入高度会随内容无限增长：当用户在终端里
+        粘贴一大段文本时，输入区会向上扩展，把上方已有的历史输出（如 AI 回复
+        的最后几行）覆盖掉。此子类把输入区高度限制在终端高度的一定比例内，
+        超出内容在输入区内部滚动显示，从而不侵占上方屏幕。
+        """
+
+        def _get_default_buffer_control_height(self) -> "Dimension":
+            # 先取父类高度（含补全菜单所需的预留空间）。
+            base = super()._get_default_buffer_control_height()
+            # 计算合理上限：终端行数的一部分，且保持在 [6, 16] 之间。
+            try:
+                rows = get_app().output.get_size().rows
+                max_h = max(6, min(16, int(rows * 0.4)))
+            except Exception:
+                max_h = 10
+            # 在父类基础上施加高度上限。
+            if base.max is None or base.max > max_h:
+                base = Dimension(min=base.min or 0, max=max_h)
+            return base
+
+
 def create_prompt_session():
     """创建一个支持多行输入的 PromptSession（需 prompt_toolkit 可用时调用）"""
     if not HAS_PROMPT_TOOLKIT:
@@ -3907,7 +3937,7 @@ def create_prompt_session():
     except ImportError:
         pass  # 快捷键增强（Keys）不可用时跳过，不影响基本多行输入
 
-    session = PromptSession(
+    session = _BoundedInputSession(
         multiline=True,          # 支持多行输入！
         history=InMemoryHistory(),
         key_bindings=bindings,
