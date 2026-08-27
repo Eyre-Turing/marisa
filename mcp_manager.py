@@ -26,6 +26,7 @@ import threading
 import signal
 import sys
 import uuid
+import shutil
 import time
 
 # ============================================================
@@ -157,6 +158,22 @@ class MCPStdioServer:
         print(f"   🔌 连接 MCP 服务器 [{self.name}]...", flush=True)
         
         try:
+            # Windows 下 .cmd/.bat 不能被 subprocess 直接启动，需补全扩展名（如 npx -> npx.cmd）
+            command = self.command
+            if sys.platform == "win32" and os.path.splitext(command)[1].lower() not in (".cmd", ".bat", ".exe", ".com"):
+                resolved = shutil.which(command)
+                # shutil.which 在 Windows 上会优先解析到扩展名，但 Popen 列表模式仍可能报 WinError 2，
+                # 这里附带查找 .cmd/.bat 版本并转换为绝对路径
+                if resolved and os.path.splitext(resolved)[1].lower() in (".cmd", ".bat"):
+                    command = resolved
+                else:
+                    cmd_candidate = shutil.which(command + ".cmd")
+                    bat_candidate = shutil.which(command + ".bat")
+                    if cmd_candidate:
+                        command = cmd_candidate
+                    elif bat_candidate:
+                        command = bat_candidate
+
             # 启动子进程
             startupinfo = None
             if sys.platform == "win32":
@@ -167,7 +184,7 @@ class MCPStdioServer:
             proc_env.update(self.env)
             
             self.proc = subprocess.Popen(
-                [self.command] + self.args,
+                [command] + self.args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
