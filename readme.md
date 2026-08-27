@@ -174,6 +174,48 @@ Marisa 支持通过 MCP 协议连接外部工具服务。以 **Blender MCP** 为
 
 启动 Marisa 后，MCP 服务会自动连接。你只需要告诉 Marisa 要在 Blender 里做什么，它就会自动调用 Blender MCP 的工具帮你建模！
 
+### 使用 HTTP 传输协议
+
+除了通过 `stdio` 启动本地进程外，MCP 服务也可以通过 **Streamable HTTP** 传输协议连接。此时服务端是一个暴露在 `http://` 或 `https://` 上的 HTTP 端点，Marisa 通过 `JSON-RPC 2.0 over HTTP POST` 与其通信（响应支持纯 JSON 与 `text/event-stream`（SSE）两种格式）。
+
+配置方式与 `stdio` 类似，只需把 `transport` 设为 `"http"` 并指定 `url` 即可。以连接某个远程 MCP 服务为例：
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "remote_mcp",
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "enabled": true,
+      "auto_connect": true,
+      "tool_prefix": "remote_",
+      "timeout": 60,
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN"
+      },
+      "debug": false
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | :-: | --- |
+| `name` | 是 | 服务名称（唯一标识） |
+| `transport` | 是 | 固定为 `"http"` |
+| `url` | 是 | MCP 服务的 HTTP 端点地址 |
+| `enabled` | 否 | 是否启用，默认 `true` |
+| `auto_connect` | 否 | 启动 Marisa 时是否自动连接，默认 `true` |
+| `tool_prefix` | 否 | 给工具名加前缀，避免与其他 MCP 服务冲突 |
+| `timeout` | 否 | 请求超时时间（秒），默认 `60` |
+| `headers` | 否 | 附加的 HTTP 请求头，常用于鉴权（如 `Authorization`） |
+| `debug` | 否 | 是否打印 HTTP 请求/响应日志，默认 `false` |
+
+> 💡 需要鉴权的服务，把令牌放到 `headers` 里即可，例如：`"headers": {"Authorization": "Bearer sk-xxxx"}`。
+
 ---
 
 ## 🧩 自定义技能
