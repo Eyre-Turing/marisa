@@ -454,9 +454,298 @@ class MCPStdioServer:
 
 
 # ============================================================
-# MCP 管理器（主入口）
+# MCP Streamable HTTP 服务器客户端
 # ============================================================
 
+class MCPHttpServer:
+    """
+    通过 Streamable HTTP 连接的 MCP 服务器。
+
+    通信协议：JSON-RPC 2.0 over HTTP POST (Streamable HTTP transport)
+    生命周期：initialize → tools/list → tools/call
+    """
+
+    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False):
+        self.name = name
+        self.url = url
+        self.tool_prefix = tool_prefix
+        self.timeout = timeout
+        self.headers = headers or {}
+        self.debug = debug
+
+        self.tools = []          # OpenAI 格式的工具列表
+        self.mcp_tools = []      # 原始 MCP 格式的工具列表
+        self.connected = False
+        self.server_info = {}
+        self._next_id = 1
+        # 会话 ID（服务器在 initialize 响应中可能通过 Mcp-Session-Id 头返回）
+        self._session_id = None
+
+    def _get_id(self):
+        rid = self._next_id
+        self._next_id += 1
+        return rid
+
+    def _send_request(self, method, params=None):
+        """
+        发送 JSON-RPC 请求并等待响应（同步 HTTP POST）。
+        """
+        import urllib.request
+        import urllib.error
+
+        req_id = self._get_id()
+        request = {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": req_id,
+            "method": method,
+            "params": params or {}
+        }
+
+        data = json.dumps(request).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        req_headers.update(self.headers)
+        if self._session_id:
+            req_headers["Mcp-Session-Id"] = self._session_id
+
+        if self.debug:
+            print(f"   [MCP:{self.name} http] -> {method} (id={req_id})", flush=True)
+
+        try:
+            req = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                # 捕获会话 ID
+                sid = resp.headers.get("Mcp-Session-Id")
+                if sid:
+                    self._session_id = sid
+
+                body = resp.read().decode("utf-8")
+                content_type = resp.headers.get("Content-Type", "")
+
+                if self.debug:
+                    print(f"   [MCP:{self.name} http] <- {content_type}: {body[:500]}", flush=True)
+
+                result = self._parse_http_response(body, content_type, req_id)
+                return result
+
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise ConnectionError(
+                f"MCP HTTP 服务器 [{self.name}] 返回 HTTP {e.code}: {body[:500]}"
+            )
+        except urllib.error.URLError as e:
+            raise ConnectionError(
+                f"MCP HTTP 服务器 [{self.name}] 连接失败: {e.reason}"
+            )
+
+    def _parse_http_response(self, body, content_type, expected_id):
+        """
+        解析 HTTP 响应体，支持纯 JSON 和 SSE (text/event-stream) 两种格式。
+        """
+        # 处理 SSE 格式：逐行解析 data: {...}
+        if "text/event-stream" in content_type:
+            for line in body.splitlines():
+                line = line.strip()
+                if line.startswith("data:"):
+                    json_str = line[5:].strip()
+                    if not json_str:
+                        continue
+                    try:
+                        resp = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if resp.get("id") == expected_id:
+                        if "error" in resp:
+                            raise RuntimeError(
+                                f"MCP 请求失败: {resp['error'].get('message', 'unknown error')}"
+                            )
+                        return resp.get("result", {})
+            raise RuntimeError(
+                f"MCP HTTP 服务器 [{self.name}] 在 SSE 响应中未找到 id={expected_id} 的结果"
+            )
+
+        # 纯 JSON 格式
+        resp = json.loads(body)
+        if "error" in resp:
+            raise RuntimeError(
+                f"MCP 请求失败: {resp['error'].get('message', 'unknown error')}"
+            )
+        if resp.get("id") != expected_id:
+            raise RuntimeError(
+                f"MCP HTTP 响应 id 不匹配: 期望 {expected_id}, 得到 {resp.get('id')}"
+            )
+        return resp.get("result", {})
+
+    def connect(self):
+        """
+        连接到 HTTP MCP 服务器并完成初始化握手。
+        """
+        if self.connected:
+            return True
+
+        print(f"   📬 连接 MCP HTTP 服务器 [{self.name}] -> {self.url}...", flush=True)
+
+        try:
+            init_result = self._send_request("initialize", {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "marisa-ai-agent",
+                    "version": "1.0.0"
+                }
+            })
+
+            self.server_info = init_result
+            self.connected = True
+
+            # 发送 initialized 通知（部分服务器需要）
+            try:
+                self._send_notification("notifications/initialized", {})
+            except Exception:
+                pass  # 通知失败不影响连接
+
+            # 获取工具列表
+            self._fetch_tools()
+
+            print(f"   ✅ MCP HTTP 服务器 [{self.name}] 连接成功！"
+                  f" 工具数: {len(self.tools)}"
+                  f" 服务器: {self.server_info.get('serverInfo', {}).get('name', 'unknown')}",
+                  flush=True)
+
+            return True
+
+        except Exception as e:
+            print(f"   ❌ MCP HTTP 服务器 [{self.name}] 连接失败: {e}", flush=True)
+            self.connected = False
+            return False
+
+    def _send_notification(self, method, params=None):
+        """
+        发送 JSON-RPC 通知（无 id，不等待响应）。
+        """
+        import urllib.request
+
+        notification = {
+            "jsonrpc": JSONRPC_VERSION,
+            "method": method,
+            "params": params or {}
+        }
+
+        data = json.dumps(notification).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        req_headers.update(self.headers)
+        if self._session_id:
+            req_headers["Mcp-Session-Id"] = self._session_id
+
+        try:
+            req = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
+            urllib.request.urlopen(req, timeout=self.timeout).read()
+        except Exception:
+            pass  # 通知不需要处理响应
+
+    def _fetch_tools(self):
+        """
+        获取 MCP 服务器的工具列表并转换为 OpenAI 格式。
+        """
+        result = self._send_request("tools/list", {})
+
+        raw_tools = result.get("tools", [])
+        self.mcp_tools = raw_tools
+
+        converted = []
+        for tool in raw_tools:
+            mcp_name = tool.get("name", "")
+            name = f"{self.tool_prefix}{mcp_name}" if self.tool_prefix else mcp_name
+
+            converted.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {
+                        "type": "object",
+                        "properties": {}
+                    })
+                },
+                "_mcp_server": self.name,
+                "_mcp_original_name": mcp_name
+            })
+
+        self.tools = converted
+
+    def call_tool(self, name, arguments):
+        """
+        调用 MCP 工具。
+        """
+        if not self.connected:
+            raise ConnectionError(f"MCP HTTP 服务器 [{self.name}] 未连接")
+
+        original_name = name
+        if self.tool_prefix and name.startswith(self.tool_prefix):
+            original_name = name[len(self.tool_prefix):]
+
+        result = self._send_request("tools/call", {
+            "name": original_name,
+            "arguments": arguments
+        })
+
+        # 处理 MCP 返回结果格式（与 stdio 版本逻辑一致）
+        content_parts = result.get("content", [])
+
+        text_parts = []
+        image_parts = []
+        for part in content_parts:
+            part_type = part.get("type", "")
+            if part_type == "text":
+                text_parts.append(part.get("text", ""))
+            elif part_type == "image":
+                mime = part.get("mimeType", "image/png")
+                data = part.get("data", "")
+                if data:
+                    image_parts.append({"base64": data, "mimeType": mime})
+                    text_parts.append(f"[Image: {mime}, {len(data)//1024}KB base64]")
+                else:
+                    text_parts.append(f"[Image: {mime}, no data]")
+            elif part_type == "resource":
+                text_parts.append(f"[Resource: {part.get('uri', 'unknown')}]")
+            else:
+                text_parts.append(str(part))
+
+        return {"text": "\n".join(text_parts), "images": image_parts}
+
+    def disconnect(self):
+        """
+        断开 HTTP MCP 服务器连接。
+        """
+        print(f"   📬 断开 MCP HTTP 服务器 [{self.name}]...", flush=True)
+        self.connected = False
+        self.tools = []
+        self.mcp_tools = []
+        self._session_id = None
+        print(f"   ✅ MCP HTTP 服务器 [{self.name}] 已断开", flush=True)
+
+    def is_alive(self):
+        """
+        检查服务器是否还活着（HTTP 模式下只要 connected 就算活着）。
+        """
+        return self.connected
+
+    def __repr__(self):
+        return f"<MCPHttpServer {self.name} url={self.url} tools={len(self.tools)} connected={self.connected}>"
+
+
+# ============================================================
+# MCP 管理器（主入口）
+# ============================================================
 class MCPManager:
     """
     统一的 MCP 服务器管理器。
@@ -507,6 +796,25 @@ class MCPManager:
                     if server.connect():
                         self.servers[name] = server
                         # 注册工具路由
+                        for tool in server.tools:
+                            tool_name = tool["function"]["name"]
+                            self._name_to_server[tool_name] = name
+                        connected_count += 1
+                else:
+                    self.servers[name] = server
+            elif transport == "http":
+                server = MCPHttpServer(
+                    name=name,
+                    url=cfg["url"],
+                    tool_prefix=cfg.get("tool_prefix", ""),
+                    timeout=cfg.get("timeout", 60),
+                    headers=cfg.get("headers", {}),
+                    debug=cfg.get("debug", False)
+                )
+                
+                if cfg.get("auto_connect", True):
+                    if server.connect():
+                        self.servers[name] = server
                         for tool in server.tools:
                             tool_name = tool["function"]["name"]
                             self._name_to_server[tool_name] = name
@@ -646,7 +954,7 @@ class MCPManager:
         existing = self.servers.get(name)
         if existing:
             if existing.is_alive():
-                print(f"   \ud83d\udd04 MCP 服务器 [{name}] 已在运行，先断开旧连接...", flush=True)
+                print(f"   🔄 MCP 服务器 [{name}] 已在运行，先断开旧连接...", flush=True)
                 existing.disconnect()
             # 从路由表中移除旧的工具
             self._name_to_server = {k: v for k, v in self._name_to_server.items() if v != name}
@@ -672,6 +980,24 @@ class MCPManager:
                 return {"success": True, "name": name, "tool_count": len(server.tools), "err": ""}
             else:
                 return {"success": False, "name": name, "tool_count": 0, "err": f"MCP 服务器 [{name}] 连接失败，请检查配置和日志"}
+        elif transport == "http":
+            server = MCPHttpServer(
+                name=name,
+                url=cfg["url"],
+                tool_prefix=cfg.get("tool_prefix", ""),
+                timeout=cfg.get("timeout", 60),
+                headers=cfg.get("headers", {}),
+                debug=cfg.get("debug", False)
+            )
+            
+            if server.connect():
+                self.servers[name] = server
+                for tool in server.tools:
+                    tool_name = tool["function"]["name"]
+                    self._name_to_server[tool_name] = name
+                return {"success": True, "name": name, "tool_count": len(server.tools), "err": ""}
+            else:
+                return {"success": False, "name": name, "tool_count": 0, "err": f"MCP HTTP 服务器 [{name}] 连接失败，请检查 URL 和网络"}
         else:
             return {"success": False, "name": name, "err": f"不支持的传输层: {transport}"}
 
