@@ -1163,6 +1163,23 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "set_main_model_multimodal",
+            "description": "强制设置当前主模型是否支持读图（多模态）的状态。这是一个手动开关：当主模型被误判为不支持读图、但其实能看图时，传 supported=True 强制复位为支持读图，之后图片会直接注入给主模型看；若用户明确知道当前大模型不支持读图，可传 supported=False 主动标记为不支持，之后图片会交给辅助模型识别或跳过。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "supported": {
+                        "type": "boolean",
+                        "description": "true=主模型支持读图（强制复位为支持读图）；false=主模型不支持读图（标记为不支持读图）"
+                    }
+                },
+                "required": ["supported"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "start_bg_task",
             "description": "在后台启动一条长耗时命令并立即返回（不阻塞当前会话，适合安装工具、编译大型项目、长时间下载/测试等）。返回 JSON：success、task_id、pid、status(running)、shell、stdout_path、stderr_path。拿到 task_id 后可用 bg_task_status 实时查询状态/输出、bg_task_kill 终止；任务结束后 agent 会自动收到通知并汇报。输出实时写入临时文件（避免管道缓冲导致延迟），bg_task_status 可随时看到最新输出；但注意部分程序（如 python 不带 -u）自身会缓冲输出，如需实时请给命令加 -u 或重定向到文件。",
             "parameters": {
@@ -1417,6 +1434,42 @@ IMAGE_TOOLS = {"read_image"}
 
 
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 图片最大 5MB
+
+
+def set_main_model_multimodal(supported):
+    """强制设置当前主模型是否支持读图（多模态）的状态。
+
+    这是一个"手动开关"，供主模型或用户在读图相关逻辑误判/需要时，主动强制覆盖
+    _main_model_no_multimodal 标志，而不必等代码自动判断。
+
+    参数 supported：
+      - True  → 主模型【支持】读图（_main_model_no_multimodal=False）：后续图片直接注入给主模型看；
+      - False → 主模型【不支持】读图（_main_model_no_multimodal=True）：后续图片交给辅助模型/跳过。
+
+    典型用途：
+      - 主模型被误判为"不支持读图"后，若它其实能看图，可调用本工具传 supported=True 强制复位；
+      - 若用户明确知道当前大模型不支持读图，可让本模型调用本工具传 supported=False 主动标记。
+    """
+    global _main_model_no_multimodal
+
+    # 兼容可能以字符串传入的布尔值
+    if isinstance(supported, str):
+        supported = supported.strip().lower() in ("true", "1", "yes", "y", "是", "支持")
+    supported = bool(supported)
+
+    _main_model_no_multimodal = not supported
+    status = "支持读图" if supported else "不支持读图"
+    print(
+        f"   🔧 [set_main_model_multimodal] 主模型读图状态已强制设为：{status} "
+        f"(_main_model_no_multimodal={_main_model_no_multimodal})",
+        flush=True
+    )
+    return json.dumps({
+        "success": 1,
+        "supported": supported,
+        "multimodal_supported": supported,
+        "message": f"主模型读图状态已强制设置为：{status}。后续对图片的处理将按此状态执行。",
+    }, ensure_ascii=False)
 
 
 def read_image(filepath, description=""):
@@ -3842,6 +3895,7 @@ tool_func_map = {
     "mcp_disconnect_server": mcp_disconnect_server,
     "mcp_restart_server": mcp_restart_server,
     "read_image": read_image,
+    "set_main_model_multimodal": set_main_model_multimodal,
     "start_bg_task": start_bg_task,
     "bg_task_status": bg_task_status,
     "bg_task_kill": bg_task_kill,
