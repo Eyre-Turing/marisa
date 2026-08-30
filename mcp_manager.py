@@ -770,6 +770,347 @@ class MCPHttpServer:
 
 
 # ============================================================
+# MCP 老式 SSE transport 服务器客户端
+# ============================================================
+
+class MCPHttpSseServer:
+    """
+    通过老式 SSE (Server-Sent Events) transport 连接的 MCP 服务器。
+
+    通信协议：JSON-RPC 2.0 over HTTP + SSE
+    生命周期：
+      1. GET <sse_url> 建立 SSE 长连接，收到 `event: endpoint` 事件得到消息端点
+      2. POST JSON-RPC 请求到该消息端点（返回 HTTP 202 + 空 body）
+      3. 响应通过 SSE 长连接异步推回（同一 SSE 流）
+    """
+
+    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False):
+        self.name = name
+        self.sse_url = url          # SSE 入口 URL，如 http://host/sse
+        self.url = url              # 连接后会被 SSE 流更新为 messages 端点
+        self.tool_prefix = tool_prefix
+        self.timeout = timeout
+        self.headers = headers or {}
+        self.debug = debug
+
+        self.tools = []          # OpenAI 格式工具列表
+        self.mcp_tools = []      # 原始 MCP 格式工具列表
+        self.connected = False
+        self.server_info = {}
+        self._next_id = 1
+        self._session_id = None
+
+        # SSE 状态
+        self._endpoint_ready = threading.Event()
+        self._endpoint_url = None
+        self._pending = {}       # req_id -> {"event": Event, "result": None, "error": None}
+        self._pending_lock = threading.Lock()
+        self._sse_thread = None
+        self._sse_response = None
+        self._stopped = threading.Event()
+
+    def _get_id(self):
+        rid = self._next_id
+        self._next_id += 1
+        return rid
+    def _sse_listener(self):
+        """后台线程：持续读取原始 SSE 字节流，解析 endpoint 事件和 JSON-RPC 异步响应。
+
+        使用 select 轮询底层 socket。若沿用 setttimeout(1.0) 做空闲轮询，socket 一旦
+        读超时一次就会进入 Python 的 timeout_occurred 坏状态，此后每次 read 都抛
+        OSError('cannot read from timed out object')，导致监听线程崩溃、后续响应无人接收。
+        改为非阻塞 + select 后，空闲时不会破坏 socket，且能感知 _stopped 优雅退出，
+        在 socket 关闭时也正常中止，不会在 Windows 上与其他线程 close 死锁。
+        """
+        import select
+        import urllib.request
+        import socket as _socket_mod
+        req = urllib.request.Request(self.sse_url, headers={"Accept": "text/event-stream"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=None)
+        except Exception as e:
+            if self.debug:
+                print(f"   [MCP:{self.name} sse] 连接 SSE 失败: {e}", flush=True)
+            self._fail_all_pending(f"SSE 连接失败: {e}")
+            return
+        self._sse_response = resp
+        # 底层 socket 设为非阻塞，配合 select 轮询，避免超时后进入破状态
+        sock = resp.fp.raw._sock
+        try:
+            sock.setblocking(False)
+        except Exception:
+            pass
+        current_event = None
+        data_buf = []
+        buf = b""
+        try:
+            while not self._stopped.is_set():
+                try:
+                    readable, _, _ = select.select([sock], [], [], 0.5)
+                except (OSError, ValueError):
+                    break
+                if not readable:
+                    continue
+                try:
+                    chunk = sock.recv(65536)
+                except BlockingIOError as e:
+                    # 非阻塞下偶发无数据，继续等待
+                    continue
+                except (OSError, ValueError) as e:
+                    if self.debug:
+                        print(f"   [MCP:{self.name} sse] 读取异常: {e}", flush=True)
+                    break
+                if not chunk:
+                    break  # 对端关闭连接
+                buf += chunk
+                while b"\n" in buf:
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
+                    if line.startswith("event:"):
+                        if data_buf:
+                            payload = "\n".join(data_buf)
+                            data_buf = []
+                            self._process_sse_data(current_event, payload)
+                        current_event = line[len("event:"):].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_buf.append(line[len("data:"):].strip())
+                        continue
+                    if line == "":
+                        if data_buf:
+                            payload = "\n".join(data_buf)
+                            data_buf = []
+                            self._process_sse_data(current_event, payload)
+                        current_event = None
+                        continue
+        except Exception:
+            pass
+        finally:
+            # SSE 断开时，通知仍在等待的请求
+            self._fail_all_pending("SSE 连接已断开")
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _process_sse_data(self, event, payload):
+        """处理一个完整 SSE 事件的 data payload（可能由多行 data: 拼接而成）。"""
+        if event == "endpoint":
+            self._endpoint_url = payload
+            self.url = payload
+            self._endpoint_ready.set()
+            if self.debug:
+                print(f"   [MCP:{self.name} sse] endpoint -> {payload}", flush=True)
+            return
+        self._dispatch_response(payload)
+
+    def _dispatch_response(self, data):
+        """尝试将 SSE 数据解析为 JSON-RPC 响应，并唤醒对应的等待请求。"""
+        try:
+            msg = json.loads(data)
+        except (json.JSONDecodeError, ValueError):
+            if self.debug:
+                print(f"   [MCP:{self.name} sse] 非 JSON 数据: {data[:200]}", flush=True)
+            return
+        rid = msg.get("id")
+        if rid is None:
+            return
+        with self._pending_lock:
+            entry = self._pending.get(rid)
+        if entry:
+            if "error" in msg:
+                entry["error"] = msg["error"]
+            else:
+                entry["result"] = msg.get("result", {})
+            entry["event"].set()
+
+    def _fail_all_pending(self, reason):
+        with self._pending_lock:
+            for entry in self._pending.values():
+                entry["error"] = {"message": reason}
+                entry["event"].set()
+            self._pending.clear()
+
+    def _wait_for_response(self, rid):
+        with self._pending_lock:
+            entry = self._pending.get(rid)
+        if not entry:
+            raise RuntimeError(f"MCP SSE 服务器 [{self.name}] 无挂起的请求 id={rid}")
+        if not entry["event"].wait(self.timeout):
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise TimeoutError(f"MCP SSE 服务器 [{self.name}] 请求 id={rid} 等待响应超时")
+        with self._pending_lock:
+            self._pending.pop(rid, None)
+        if entry["error"]:
+            raise RuntimeError(f"MCP 请求失败: {entry['error'].get('message', entry['error'])}")
+        return entry["result"]
+
+    def _send_request(self, method, params=None):
+        """发送 JSON-RPC 请求并等待 SSE 流异步返回响应。"""
+        import urllib.request
+        if not self._endpoint_ready.is_set():
+            raise ConnectionError(f"MCP SSE 服务器 [{self.name}] 尚未建立 SSE endpoint")
+        req_id = self._get_id()
+        request = {"jsonrpc": JSONRPC_VERSION, "id": req_id, "method": method, "params": params or {}}
+        data = json.dumps(request).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        req_headers.update(self.headers)
+        if self._session_id:
+            req_headers["Mcp-Session-Id"] = self._session_id
+
+        if self.debug:
+            print(f"   [MCP:{self.name} sse] -> {method} (id={req_id})", flush=True)
+
+        entry = {"event": threading.Event(), "result": None, "error": None}
+        with self._pending_lock:
+            self._pending[req_id] = entry
+
+        try:
+            rq = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
+            with urllib.request.urlopen(rq, timeout=self.timeout) as resp:
+                sid = resp.headers.get("Mcp-Session-Id")
+                if sid:
+                    self._session_id = sid
+            # 老式 SSE：POST 返回 202 + 空 body，结果经 SSE 流推送
+            return self._wait_for_response(req_id)
+        except Exception as e:
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            raise ConnectionError(f"MCP SSE 服务器 [{self.name}] 请求 {method} 失败: {e}")
+
+    def _send_notification(self, method, params=None):
+        import urllib.request
+        notification = {"jsonrpc": JSONRPC_VERSION, "method": method, "params": params or {}}
+        data = json.dumps(notification).encode("utf-8")
+        req_headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+        req_headers.update(self.headers)
+        if self._session_id:
+            req_headers["Mcp-Session-Id"] = self._session_id
+        try:
+            rq = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
+            urllib.request.urlopen(rq, timeout=self.timeout).read()
+        except Exception:
+            pass
+
+    def connect(self):
+        """建立 SSE 连接，拿到消息端点，完成 initialize 握手。"""
+        if self.connected:
+            return True
+        self.url = self.sse_url
+        print(f"   📬 连接 MCP SSE 服务器 [{self.name}] -> {self.sse_url}...", flush=True)
+        try:
+            # 若已有旧 SSE 线程在运行，先停止并等它退出，避免与新连接混淆
+            if self._sse_thread and self._sse_thread.is_alive():
+                self._stopped.set()
+                self._sse_thread.join(timeout=2.0)
+                self._sse_thread = None
+            # 启动 SSE 监听线程，等待 endpoint 事件
+            self._stopped.clear()
+            self._sse_thread = threading.Thread(target=self._sse_listener, daemon=True)
+            self._sse_thread.start()
+            if not self._endpoint_ready.wait(self.timeout):
+                raise TimeoutError("等待 SSE endpoint 事件超时")
+
+            init_result = self._send_request("initialize", {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "marisa-ai-agent", "version": "1.0.0"}
+            })
+
+            self.server_info = init_result
+            self.connected = True
+
+            try:
+                self._send_notification("notifications/initialized", {})
+            except Exception:
+                pass
+
+            self._fetch_tools()
+
+            print(f"   ✅ MCP SSE 服务器 [{self.name}] 连接成功！"
+                  f" 工具数: {len(self.tools)}"
+                  f" 服务器: {self.server_info.get('serverInfo', {}).get('name', 'unknown')}", flush=True)
+            return True
+
+        except Exception as e:
+            print(f"   ❌ MCP SSE 服务器 [{self.name}] 连接失败: {e}", flush=True)
+            self.connected = False
+            return False
+
+    def _fetch_tools(self):
+        result = self._send_request("tools/list", {})
+        raw_tools = result.get("tools", [])
+        self.mcp_tools = raw_tools
+        converted = []
+        for tool in raw_tools:
+            mcp_name = tool.get("name", "")
+            name = f"{self.tool_prefix}{mcp_name}" if self.tool_prefix else mcp_name
+            converted.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}})
+                },
+                "_mcp_server": self.name,
+                "_mcp_original_name": mcp_name
+            })
+        self.tools = converted
+
+    def call_tool(self, name, arguments):
+        if not self.connected:
+            raise ConnectionError(f"MCP SSE 服务器 [{self.name}] 未连接")
+        original_name = name
+        if self.tool_prefix and name.startswith(self.tool_prefix):
+            original_name = name[len(self.tool_prefix):]
+        result = self._send_request("tools/call", {"name": original_name, "arguments": arguments})
+        content_parts = result.get("content", [])
+        text_parts = []
+        image_parts = []
+        for part in content_parts:
+            part_type = part.get("type", "")
+            if part_type == "text":
+                text_parts.append(part.get("text", ""))
+            elif part_type == "image":
+                mime = part.get("mimeType", "image/png")
+                data = part.get("data", "")
+                if data:
+                    image_parts.append({"base64": data, "mimeType": mime})
+                    text_parts.append(f"[Image: {mime}, {len(data)//1024}KB base64]")
+                else:
+                    text_parts.append(f"[Image: {mime}, no data]")
+            elif part_type == "resource":
+                text_parts.append(f"[Resource: {part.get('uri', 'unknown')}]")
+            else:
+                text_parts.append(str(part))
+        return {"text": "\n".join(text_parts), "images": image_parts}
+
+    def disconnect(self):
+        print(f"   📬 断开 MCP SSE 服务器 [{self.name}]...", flush=True)
+        self.connected = False
+        self.tools = []
+        self.mcp_tools = []
+        self._session_id = None
+        # 通知 SSE 线程停止。不在此处调用 _sse_response.close()/sock.close()：
+        # 阻塞读取的 socket 在另一个线程 close() 会与读线程死锁（Windows 上尤为明显）。
+        # SSE 线程会在读超时轮询中感知 _stopped 并自行优雅退出。
+        self._stopped.set()
+        self._fail_all_pending("连接已断开")
+        self._endpoint_ready.clear()
+        print(f"   ✅ MCP SSE 服务器 [{self.name}] 已断开", flush=True)
+
+    def is_alive(self):
+        return self.connected
+
+    def __repr__(self):
+        return f"<MCPHttpSseServer {self.name} url={self.url} tools={len(self.tools)} connected={self.connected}>"
+
+
+# ============================================================
 # MCP 管理器（主入口）
 # ============================================================
 class MCPManager:
@@ -830,6 +1171,25 @@ class MCPManager:
                     self.servers[name] = server
             elif transport == "http":
                 server = MCPHttpServer(
+                    name=name,
+                    url=cfg["url"],
+                    tool_prefix=cfg.get("tool_prefix", ""),
+                    timeout=cfg.get("timeout", 60),
+                    headers=cfg.get("headers", {}),
+                    debug=cfg.get("debug", False)
+                )
+                
+                if cfg.get("auto_connect", True):
+                    if server.connect():
+                        self.servers[name] = server
+                        for tool in server.tools:
+                            tool_name = tool["function"]["name"]
+                            self._name_to_server[tool_name] = name
+                        connected_count += 1
+                else:
+                    self.servers[name] = server
+            elif transport == "sse":
+                server = MCPHttpSseServer(
                     name=name,
                     url=cfg["url"],
                     tool_prefix=cfg.get("tool_prefix", ""),
@@ -1024,6 +1384,24 @@ class MCPManager:
                 return {"success": True, "name": name, "tool_count": len(server.tools), "err": ""}
             else:
                 return {"success": False, "name": name, "tool_count": 0, "err": f"MCP HTTP 服务器 [{name}] 连接失败，请检查 URL 和网络"}
+        elif transport == "sse":
+            server = MCPHttpSseServer(
+                name=name,
+                url=cfg["url"],
+                tool_prefix=cfg.get("tool_prefix", ""),
+                timeout=cfg.get("timeout", 60),
+                headers=cfg.get("headers", {}),
+                debug=cfg.get("debug", False)
+            )
+            
+            if server.connect():
+                self.servers[name] = server
+                for tool in server.tools:
+                    tool_name = tool["function"]["name"]
+                    self._name_to_server[tool_name] = name
+                return {"success": True, "name": name, "tool_count": len(server.tools), "err": ""}
+            else:
+                return {"success": False, "name": name, "tool_count": 0, "err": f"MCP SSE 服务器 [{name}] 连接失败，请检查 URL 和网络"}
         else:
             return {"success": False, "name": name, "err": f"不支持的传输层: {transport}"}
 
