@@ -4523,6 +4523,7 @@ def main():
                 # ---------- 逐个执行工具 ----------
                 terminal_tool_called = False  # 标记是否调用了终止型工具
                 image_tool_called = False     # 标记是否调用了图片工具
+                pending_image_msgs = []       # 收集待注入的图片 user 消息，循环结束后统一注入
 
                 for tool in tool_calls_list:
                     # 每次执行工具前检查中断
@@ -4651,7 +4652,7 @@ def main():
                                 })
                             })
                             # 第二步：再注入 role:user 的多模态消息，让 AI 看到图片内容
-                            messages.append({
+                            pending_image_msgs.append({
                                 "role": "user",
                                 "content": [
                                     {
@@ -4814,7 +4815,7 @@ def main():
                             if len(mcp_images) > 1:
                                 img_label += f" {img_idx + 1}/{len(mcp_images)}"
                             img_label += f" ({img_size_kb}KB)]"
-                            messages.append({
+                            pending_image_msgs.append({
                                 "role": "user",
                                 "content": [
                                     {
@@ -4840,6 +4841,9 @@ def main():
                         "name": tool_name,
                         "content": tool_result
                     })
+                # 循环结束后，把收集到的图片 user 消息统一注入，确保不打断 tool_calls↔tool 配对
+                if pending_image_msgs:
+                    messages.extend(pending_image_msgs)
 
                 # 如果调用了终止型工具，跳出整个工具循环
                 if terminal_tool_called:
