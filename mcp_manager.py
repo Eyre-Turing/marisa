@@ -176,13 +176,21 @@ class MCPStdioServer:
 
             # 启动子进程
             startupinfo = None
+            popen_kwargs = {}
             if sys.platform == "win32":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
+
+                # 关键修复：让 MCP 子进程进入独立的进程组，
+                # 避免它在用户按 Ctrl+C 时被控制台广播的 CTRL_C_EVENT 连坐杀掉。
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                # POSIX：脱离控制终端成为新会话/进程组组长，同样不会接收前台 Ctrl+C。
+                popen_kwargs["start_new_session"] = True
+
             proc_env = os.environ.copy()
             proc_env.update(self.env)
-            
+
             self.proc = subprocess.Popen(
                 [command] + self.args,
                 stdin=subprocess.PIPE,
@@ -190,7 +198,8 @@ class MCPStdioServer:
                 stderr=subprocess.PIPE,
                 env=proc_env,
                 startupinfo=startupinfo,
-                bufsize=0  # 无缓冲，确保即时通信
+                bufsize=0,  # 无缓冲，确保即时通信
+                **popen_kwargs
             )
             
             # 无论 debug 是否开启，都要启动 stderr 读取线程，否则管道缓冲区满了 uvx 会卡死
