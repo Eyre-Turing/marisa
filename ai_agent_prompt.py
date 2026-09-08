@@ -148,6 +148,13 @@ _ctrl_c_state = {"ts": 0.0}
 # 两次 Ctrl+C 之间的时间窗口（秒）
 EXIT_CONFIRM_SECONDS = 2.0
 
+# API 超时/网络错误自动重试（仿运维保活）：调用 API 时若遇到网络错误或超时，
+# 等待 API_TIMEOUT_RETRY_WAIT 秒后重试，每条用户输入最多重试 API_TIMEOUT_RETRY_MAX 次；
+# 每次收到新的用户输入会刷新剩余额度，用尽后停止自动重试，回到等待用户输入。
+API_TIMEOUT_RETRY_WAIT = 10      # 每次重试前等待（秒）
+API_TIMEOUT_RETRY_MAX = 10       # 每条用户输入最多自动重试次数
+_api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
+
 # 是否为 input() 退化模式（prompt_toolkit 不可用或被 --no-prompt-toolkit 强制禁用时置 True）。
 # 用于 sigint_handler 区分 Ctrl+C 的处理方式。
 USE_INPUT_MODE = False
@@ -177,6 +184,32 @@ class UserInterrupt(Exception):
     与普通 Exception 区分开，方便调用上方捕获后做「优雅中断」而非「错误」处理。
     """
     pass
+
+
+def _should_retry_timeout():
+    """检查并消费一次「API 超时/网络错误」的自动重试名额。
+
+    返回 True 表示应重试（已消耗一次额度）；返回 False 表示额度已用尽，应停止重试。
+    额度为每条用户输入一份，由主循环在收到新输入时重置为 API_TIMEOUT_RETRY_MAX。
+    """
+    global _api_timeout_retry_remaining
+    if _api_timeout_retry_remaining > 0:
+        _api_timeout_retry_remaining -= 1
+        return True
+    return False
+
+
+def _interruptible_sleep(seconds):
+    """可被 Ctrl+C 中断的 sleep：在等待期间轮询全局 interrupted 标志。
+
+    用于 API 超时/网络错误后的重试等待。用户按 Ctrl+C（工具执行中 interrupted=True）
+    时能在 ~0.1s 内检测到并抛出 UserInterrupt，立即结束等待，而不会干等整段 sleep。
+    """
+    deadline = time.time() + seconds
+    while not interrupted and time.time() < deadline:
+        time.sleep(0.1)
+    if interrupted:
+        raise UserInterrupt()
 
 
 def _urlopen_interruptible(req, timeout=180, poll_interval=0.2):
@@ -529,6 +562,21 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
                     guard_multimodal=guard_multimodal
                 )
             raise RuntimeError(f"API 请求失败 (HTTP {code}): {error_body}")
+        elif r["kind"] == "url":
+            if _should_retry_timeout():
+                retry_left = _api_timeout_retry_remaining
+                print(
+                    f"   ⏳ API 超时/网络错误，等待 {API_TIMEOUT_RETRY_WAIT}s 后自动重试"
+                    f"（剩余 {retry_left} 次）...",
+                    flush=True,
+                )
+                _interruptible_sleep(API_TIMEOUT_RETRY_WAIT)
+                return _do_openai_request(
+                    url, headers, model, messages, tools, tool_choice,
+                    allow_retry=allow_retry,
+                    guard_multimodal=guard_multimodal,
+                )
+            raise RuntimeError(f"API 请求失败 (网络错误): {r['reason']}")
         else:
             raise RuntimeError(f"API 请求失败 (网络错误): {r['reason']}")
     result = r["result"]
@@ -917,6 +965,21 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
                     guard_multimodal=guard_multimodal
                 )
             raise RuntimeError(f"Anthropic API 请求失败 (HTTP {code}): {error_body}")
+        elif r["kind"] == "url":
+            if _should_retry_timeout():
+                retry_left = _api_timeout_retry_remaining
+                print(
+                    f"   ⏳ Anthropic API 超时/网络错误，等待 {API_TIMEOUT_RETRY_WAIT}s 后自动重试"
+                    f"（剩余 {retry_left} 次）...",
+                    flush=True,
+                )
+                _interruptible_sleep(API_TIMEOUT_RETRY_WAIT)
+                return _call_anthropic_api(
+                    config, messages, tools,
+                    allow_retry=allow_retry,
+                    guard_multimodal=guard_multimodal,
+                )
+            raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {r['reason']}")
         else:
             raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {r['reason']}")
     result = r["result"]
@@ -4162,7 +4225,7 @@ def split_pipe_messages(text):
 # ============================================================
 def main():
     global tool_executing, interrupted, messages, CWD_SKILLS_DIR, CODE_SKILLS_DIR
-    global _main_model_no_multimodal
+    global _main_model_no_multimodal, _api_timeout_retry_remaining
 
     # 注册信号处理器——只用于工具执行中的中断
     # 用户输入中的 Ctrl+C 由 prompt_toolkit 处理
@@ -4400,6 +4463,9 @@ def main():
             # EOF（管道关闭）触发，届时 read_multiline_input 会抛 EOFError 由外层捕获退出。
             continue
 
+        # 每次收到新的用户输入，刷新本轮的超时自动重试额度（最多 API_TIMEOUT_RETRY_MAX 次）
+        _api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
+
         # ════════════════════════════════════════════════════════════
         # 智能预压缩：上下文超阈值时，先搁置用户输入，让 AI 压缩完再处理
         # ════════════════════════════════════════════════════════════
@@ -4490,6 +4556,9 @@ def main():
             # 现在追加用户真实输入，进入正常处理流程
             if not interrupted:
                 messages.append({"role": "user", "content": user_input})
+                # 若预压缩阶段大模型调用了 compress 等工具成功，进入正式工具循环前也「续命」一次
+                if tool_calls:
+                    _api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
         else:
             # 上下文没超阈值，正常追加用户输入
             messages.append({"role": "user", "content": user_input})
@@ -4941,6 +5010,10 @@ def main():
                         "name": tool_name,
                         "content": tool_result
                     })
+                # 本轮工具调用已成功执行完毕 → 触发下一次获取大模型响应前，刷新超时重试额度
+                #（无人值守长跑场景：每完成一轮工具调用都「续命」一次 10 次超时重试）
+                _api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
+
                 # 循环结束后，把收集到的图片 user 消息统一注入，确保不打断 tool_calls↔tool 配对
                 if pending_image_msgs:
                     messages.extend(pending_image_msgs)
