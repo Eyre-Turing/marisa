@@ -143,6 +143,11 @@ def save_config(config):
 tool_executing = False
 interrupted = False
 
+# Ctrl+C 连续两次确认退出（仿 Claude 风格）：记录上次 Ctrl+C 的时间戳
+_ctrl_c_state = {"ts": 0.0}
+# 两次 Ctrl+C 之间的时间窗口（秒）
+EXIT_CONFIRM_SECONDS = 2.0
+
 # 是否为 input() 退化模式（prompt_toolkit 不可用或被 --no-prompt-toolkit 强制禁用时置 True）。
 # 用于 sigint_handler 区分 Ctrl+C 的处理方式。
 USE_INPUT_MODE = False
@@ -4366,9 +4371,16 @@ def main():
                     # 退化版 input() 多行输入（单行 '.' 结束）
                     user_input = read_multiline_input("我: ")
             except KeyboardInterrupt:
-                # Ctrl+C 在输入时引发 KeyboardInterrupt
-                print("\n👋 再见！DA⭐ZE！\n", flush=True)
-                break
+                # Ctrl+C 在输入时引发 KeyboardInterrupt —— 仿照 Claude：按一次提示、连按两次才退出
+                now = time.time()
+                if now - _ctrl_c_state["ts"] < EXIT_CONFIRM_SECONDS:
+                    # 2 秒内的第二次 Ctrl+C → 真正退出
+                    print("\n👋 再见！DA⭐ZE！\n", flush=True)
+                    break
+                # 第一次（或间隔太久）的 Ctrl+C → 只提示，不退出，继续输入
+                _ctrl_c_state["ts"] = now
+                print("\n⚠️ 再按一次 Ctrl+C 退出（2 秒内）\n", flush=True)
+                continue
             except EOFError:
                 # Ctrl+D 也可能引发 EOFError（取决于配置）
                 print("\n👋 再见！DA⭐ZE！\n", flush=True)
