@@ -165,6 +165,83 @@ def sigint_handler(signum, frame):
     if USE_INPUT_MODE:
         raise KeyboardInterrupt
 
+
+class UserInterrupt(Exception):
+    """用户按 Ctrl+C 中断了 API 请求，需要立即停止等待。
+
+    与普通 Exception 区分开，方便调用上方捕获后做「优雅中断」而非「错误」处理。
+    """
+    pass
+
+
+def _urlopen_interruptible(req, timeout=180, poll_interval=0.2):
+    """
+    在后台线程中执行 urllib.request.urlopen，主线程以 poll_interval 粒度轮询
+    全局 interrupted 标志，实现「按 Ctrl+C 立即结束网络等待」。
+
+    背景：
+      原有 urllib.request.urlopen 是阻塞调用，按 Ctrl+C 时 sigint_handler 仅设置
+      interrupted=True，并不会打断这个阻塞等待，导致用户白白等待 network/API 卡顿。
+      本函数把请求放到 daemon 子线程，主线程循环 join(timeout) 并检查 interrupted，
+      一旦中断就抛出 UserInterrupt，立即结束等待（最多 poll_interval 秒延迟）。
+      即使后台线程仍在跑（daemon），也不阻塞进程退出，用户可立刻回到对话。
+
+    返回：
+      成功   -> {"ok": True, "result": <解析后的 JSON dict>}
+      HTTP 错 -> {"ok": False, "kind": "http", "code": <int>, "body": <str>}
+      网络错  -> {"ok": False, "kind": "url", "reason": <str>}
+
+    抛出：
+      UserInterrupt：用户中断。
+    """
+    container = {
+        "ok": False,
+        "result": None,
+        "kind": None,
+        "code": None,
+        "body": None,
+        "reason": None,
+        "done": False,
+    }
+
+    def worker():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                container["result"] = json.loads(resp.read().decode("utf-8"))
+            container["ok"] = True
+        except urllib.error.HTTPError as e:
+            # 在线程内读取错误 body，避免跨线程读取网络对象
+            container["kind"] = "http"
+            container["code"] = e.code
+            try:
+                container["body"] = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                container["body"] = ""
+        except urllib.error.URLError as e:
+            container["kind"] = "url"
+            container["reason"] = str(e.reason)
+        except Exception as e:
+            container["kind"] = "url"
+            container["reason"] = str(e)
+        finally:
+            container["done"] = True
+
+    # daemon=True：用户中断后，即使后台请求仍在跑，也不会阻止进程退出
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    # 主线程轮询：请求一旦完成立即返回；否则每 poll_interval 秒检查一次中断
+    while not container["done"]:
+        if interrupted:
+            raise UserInterrupt()
+        t.join(timeout=poll_interval)
+
+    if container["kind"] == "http":
+        return {"ok": False, "kind": "http", "code": container["code"], "body": container["body"]}
+    if container["kind"] == "url":
+        return {"ok": False, "kind": "url", "reason": container["reason"]}
+    return {"ok": True, "result": container["result"]}
+
 # ============================================================
 #  0. 上下文压缩相关常量 & 全局 messages
 # ============================================================
@@ -330,6 +407,9 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None, gua
         else:
             result = _call_openai_api(config, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
         return result
+    except UserInterrupt:
+        # 用户按 Ctrl+C 中断，不保存错误快照，直接向上传播（主循环检测 interrupted）
+        raise
     except Exception as e:
         # 出错时保存 err 日志
         save_error_snapshot(messages, str(e))
@@ -423,35 +503,30 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        
-        # 🗑️ 检测到 400 错误且 messages 中包含多模态内容，删除并重试
-        # 不依赖错误信息中的关键字，直接检查我们发送的数据结构
-        # 仅主模型调用（guard_multimodal=True）执行此防护，子 Agent 直接抛异常
-        if allow_retry and guard_multimodal and e.code == 400 and _has_multimodal_content(messages):
-            print(
-                "   🗑️ HTTP 400 且上下文含多模态数据，自动清理后重试...",
-                flush=True
-            )
-            _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
-            _main_model_no_multimodal = True  # 记住：主模型不支持多模态
-            return _do_openai_request(
-                url, headers, model, messages, tools, tool_choice,
-                allow_retry=False,  # 防止无限递归
-                guard_multimodal=guard_multimodal
-            )
-        
-        raise RuntimeError(f"API 请求失败 (HTTP {e.code}): {error_body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"API 请求失败 (网络错误): {e.reason}")
-        
-        raise RuntimeError(f"API 请求失败 (HTTP {e.code}): {error_body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"API 请求失败 (网络错误): {e.reason}")
+    r = _urlopen_interruptible(req, timeout=180)
+    if not r["ok"]:
+        if r["kind"] == "http":
+            error_body = r["body"]
+            code = r["code"]
+            # 🗑️ 检测到 400 错误且 messages 中包含多模态内容，删除并重试
+            # 不依赖错误信息中的关键字，直接检查我们发送的数据结构
+            # 仅主模型调用（guard_multimodal=True）执行此防护，子 Agent 直接抛异常
+            if allow_retry and guard_multimodal and code == 400 and _has_multimodal_content(messages):
+                print(
+                    "   🗑️ HTTP 400 且上下文含多模态数据，自动清理后重试...",
+                    flush=True
+                )
+                _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+                _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+                return _do_openai_request(
+                    url, headers, model, messages, tools, tool_choice,
+                    allow_retry=False,  # 防止无限递归
+                    guard_multimodal=guard_multimodal
+                )
+            raise RuntimeError(f"API 请求失败 (HTTP {code}): {error_body}")
+        else:
+            raise RuntimeError(f"API 请求失败 (网络错误): {r['reason']}")
+    result = r["result"]
 
     # 提取消息
     choice = result["choices"][0]
@@ -818,28 +893,28 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-
-        # 🗑️ 检测到 400 错误且原始 messages 中包含多模态内容，清理并重试
-        if allow_retry and guard_multimodal and e.code == 400 and _has_multimodal_content(messages):
-            print(
-                "   🗑️ Anthropic HTTP 400 且上下文含多模态数据，自动清理后重试...",
-                flush=True
-            )
-            _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
-            _main_model_no_multimodal = True  # 记住：主模型不支持多模态
-            return _call_anthropic_api(
-                config, messages, tools,
-                allow_retry=False,  # 防止无限递归
-                guard_multimodal=guard_multimodal
-            )
-        raise RuntimeError(f"Anthropic API 请求失败 (HTTP {e.code}): {error_body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {e.reason}")
+    r = _urlopen_interruptible(req, timeout=180)
+    if not r["ok"]:
+        if r["kind"] == "http":
+            error_body = r["body"]
+            code = r["code"]
+            # 🗑️ 检测到 400 错误且原始 messages 中包含多模态内容，清理并重试
+            if allow_retry and guard_multimodal and code == 400 and _has_multimodal_content(messages):
+                print(
+                    "   🗑️ Anthropic HTTP 400 且上下文含多模态数据，自动清理后重试...",
+                    flush=True
+                )
+                _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+                _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+                return _call_anthropic_api(
+                    config, messages, tools,
+                    allow_retry=False,  # 防止无限递归
+                    guard_multimodal=guard_multimodal
+                )
+            raise RuntimeError(f"Anthropic API 请求失败 (HTTP {code}): {error_body}")
+        else:
+            raise RuntimeError(f"Anthropic API 请求失败 (网络错误): {r['reason']}")
+    result = r["result"]
 
     # ---------- 转换响应为 OpenAI 格式（方便上层统一处理） ----------
     # Anthropic 响应结构：
@@ -1618,6 +1693,9 @@ def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description,
 
     try:
         sub_msg, _ = call_api(sub_messages, tools=None, config_override=mul_config, guard_multimodal=False)
+    except UserInterrupt:
+        print("   ⏹️ 用户中断了读图辅助模型调用\n", flush=True)
+        return json.dumps({"success": 0, "err": "用户中断"})
     except Exception as e:
         err_msg = f"多模态辅助模型调用失败: {e}"
         print(f"   ⚠️ {err_msg}\n", flush=True)
@@ -3580,6 +3658,10 @@ def load_skill(task_description):
             # 调用 API
             try:
                 sub_msg, sub_reasoning = call_api(sub_messages, tools=sub_tools, tool_choice="auto", guard_multimodal=False)
+            except UserInterrupt:
+                print("   ⏹️ 用户中断了技能检索子Agent调用\n", flush=True)
+                result_dict = {"success": 0, "err": "用户中断"}
+                return json.dumps(result_dict)
             except Exception as e:
                 err_msg = f"技能检索子Agent API 调用失败: {e}"
                 print(f"   ⚠️ {err_msg}\n", flush=True)
@@ -4330,6 +4412,9 @@ def main():
             tool_executing = True
             try:
                 msg, reasoning_content = call_api(messages, tools=tools)
+            except UserInterrupt:
+                # 用户按 Ctrl+C 中断，不当作 API 翻车；interrupted 已置 True，外层会清理并 continue
+                msg = None
             except Exception as e:
                 print(f"\n💥 API调用翻车了: {e}\n", flush=True)
                 msg = None
@@ -4434,6 +4519,9 @@ def main():
                     # api_messages = get_context_aware_messages(messages)
                     # msg, reasoning_content = call_api(api_messages, tools=tools)
                     msg, reasoning_content = call_api(messages, tools=tools)
+                except UserInterrupt:
+                    # 用户按 Ctrl+C 中断，立即退出工具循环（interrupted 已置 True）
+                    break
                 except Exception as e:
                     print(f"\n💥 API调用翻车了: {e}\n", flush=True)
                     # # 🧹 回滚：如果最后一条消息是 assistant（含 tool_use），删掉它
