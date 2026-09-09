@@ -411,6 +411,79 @@ def save_error_snapshot(msg_list, error_msg):
 
 
 # ============================================================
+#  Loading 转圈动画 —— 仅在交互式终端下启用
+#  非交互 / 管道 / 重定向模式（stdin 非 TTY）下退化为空操作，
+#  避免污染管道输出与重定向结果。
+# ============================================================
+
+def _disp_width(text):
+    """计算文本在终端中的近似显示列宽（全角/宽字符算 2 列）。"""
+    try:
+        import unicodedata
+        width = 0
+        for ch in text:
+            width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        return width
+    except Exception:
+        return len(text)
+
+
+class _Spinner:
+    """一个轻量、线程安全的命令行转圈动画上下文管理器。
+
+    用法::
+
+        with spinner("✨ 魔理沙思考中"):
+            resp = call_api(...)
+
+    ``__enter__`` 时启动一个守护线程刷新转圈帧；
+    ``__exit__`` 时停止动画并清除所在行。
+    仅当 ``sys.stdin`` 与 ``sys.stderr`` 均为 TTY（交互式终端）时启用。
+    """
+    FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+    def __init__(self, message="✨ 魔理沙思考中"):
+        self.message = message
+        self._thread = None
+        self._stop = threading.Event()
+        self._stream = sys.stderr
+
+    def __enter__(self):
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            self._stream.write(f"\r{self.message} {frame}")
+            self._stream.flush()
+            i += 1
+            self._stop.wait(0.08)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=0.5)
+            # 用空格覆盖转圈所在行，再回到行首。不使用 ANSI 转义序列，
+            # 避免在不支持转义的终端上把 \x1b 显示成乱码（如 ?[2K）。
+            width = _disp_width(self.message) + 2
+            self._stream.write("\r" + " " * width + "\r")
+            self._stream.flush()
+            self._thread = None
+        return False
+
+
+def spinner(message="✨ 魔理沙思考中"):
+    """返回一个转圈上下文管理器（见 :class:`_Spinner`）。"""
+    return _Spinner(message)
+
+
+# ============================================================
 #  1. 调用 DeepSeek Chat API（纯标准库，不依赖 openai）
 # ============================================================
 def call_api(messages, tools=None, tool_choice="auto", config_override=None, guard_multimodal=True):
@@ -4426,7 +4499,7 @@ def main():
                     # 管道/重定向模式：与退化 input 一致，流式逐条读取。
                     # 每收到一条以 '.' 结尾（或以 EOF 结束）的消息就返回一段，
                     # 由主循环回答一次后继续读下一条，直到 EOF 自动退出。
-                    user_input = read_multiline_input("我: ")
+                    user_input = read_multiline_input("")
                 elif use_prompt_toolkit:
                     # 使用 prompt_toolkit 的多行输入
                     user_input = session.prompt("我: ")
@@ -4489,7 +4562,8 @@ def main():
             # 单次 API 调用：让 AI 调用 compress
             tool_executing = True
             try:
-                msg, reasoning_content = call_api(messages, tools=tools)
+                with spinner("✨ 正在预压缩上下文..."):
+                    msg, reasoning_content = call_api(messages, tools=tools)
             except UserInterrupt:
                 # 用户按 Ctrl+C 中断，不当作 API 翻车；interrupted 已置 True，外层会清理并 continue
                 msg = None
@@ -4599,7 +4673,8 @@ def main():
                     # # 如果上下文超过阈值，会自动追加一条 system 提醒
                     # api_messages = get_context_aware_messages(messages)
                     # msg, reasoning_content = call_api(api_messages, tools=tools)
-                    msg, reasoning_content = call_api(messages, tools=tools)
+                    with spinner("✨ 魔理沙思考中..."):
+                        msg, reasoning_content = call_api(messages, tools=tools)
                 except UserInterrupt:
                     # 用户按 Ctrl+C 中断，立即退出工具循环（interrupted 已置 True）
                     break
