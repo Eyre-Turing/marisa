@@ -205,9 +205,16 @@ def _interruptible_sleep(seconds):
     用于 API 超时/网络错误后的重试等待。用户按 Ctrl+C（工具执行中 interrupted=True）
     时能在 ~0.1s 内检测到并抛出 UserInterrupt，立即结束等待，而不会干等整段 sleep。
     """
+    global interrupted
     deadline = time.time() + seconds
-    while not interrupted and time.time() < deadline:
-        time.sleep(0.1)
+    try:
+        while not interrupted and time.time() < deadline:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        # 部分平台（尤其 Linux/CentOS）上 sleep 被 Ctrl+C 打断时可能直接抛
+        # KeyboardInterrupt。转成统一的优雅中断，交由调用方捕获。
+        interrupted = True
+        raise UserInterrupt()
     if interrupted:
         raise UserInterrupt()
 
@@ -232,6 +239,7 @@ def _urlopen_interruptible(req, timeout=180, poll_interval=0.2):
     抛出：
       UserInterrupt：用户中断。
     """
+    global interrupted
     container = {
         "ok": False,
         "result": None,
@@ -272,7 +280,14 @@ def _urlopen_interruptible(req, timeout=180, poll_interval=0.2):
     while not container["done"]:
         if interrupted:
             raise UserInterrupt()
-        t.join(timeout=poll_interval)
+        try:
+            t.join(timeout=poll_interval)
+        except KeyboardInterrupt:
+            # 部分平台（尤其 Linux/CentOS + Python3.6）上，阻塞等待线程 join 时
+            # 收到 SIGINT 会直接抛 KeyboardInterrupt，而不是先让 sigint_handler
+            # 设置 interrupted。这里转成统一的优雅中断（UserInterrupt）。
+            interrupted = True
+            raise UserInterrupt()
 
     if container["kind"] == "http":
         return {"ok": False, "kind": "http", "code": container["code"], "body": container["body"]}
@@ -318,7 +333,9 @@ messages = []
 def get_context_size(msg_list):
     """估算 messages 的 JSON 字节数（接近 API 实际传输量）"""
     json_str = json.dumps(msg_list, ensure_ascii=False)
-    return len(json_str.encode('utf-8'))
+    # 用户粘贴/外部输入可能带入 UTF-8 surrogate（\ud800-\udfff），直接 encode 会抛
+    # UnicodeEncodeError。这里用 replace 兜底，保证上下文估算永不因编码崩溃。
+    return len(json_str.encode('utf-8', errors='replace'))
 
 
 # def get_context_aware_messages(msg_list):
@@ -468,7 +485,11 @@ class _Spinner:
     def __exit__(self, exc_type, exc, tb):
         if self._thread is not None:
             self._stop.set()
-            self._thread.join(timeout=0.5)
+            try:
+                self._thread.join(timeout=0.5)
+            except KeyboardInterrupt:
+                # 转圈结束瞬间被 Ctrl+C 打断也无妨——忽略即可，继续清行收尾。
+                pass
             # 用空格覆盖转圈所在行，再回到行首。不使用 ANSI 转义序列，
             # 避免在不支持转义的终端上把 \x1b 显示成乱码（如 ?[2K）。
             width = _disp_width(self.message) + 2
@@ -2102,7 +2123,7 @@ def run_bash(command, timeout=10, force_use_bash=False):
                 stdout_data, stderr_data = proc.communicate(timeout=3)
                 result_container["stdout"] = stdout_data
                 result_container["stderr"] = stderr_data
-            except Exception:
+            except (Exception, KeyboardInterrupt):
                 pass
             # 中断结果留给下方统一处理（stderr 里说明是用户中断）
             result_container["user_interrupted"] = True
@@ -2125,11 +2146,32 @@ def run_bash(command, timeout=10, force_use_bash=False):
                     result_container["stdout"] = stdout_data
                 if result_container["stderr"] == b"":
                     result_container["stderr"] = stderr_data
-            except Exception:
+            except (Exception, KeyboardInterrupt):
                 pass
 
         # 等待看门狗线程结束（最多等 2 秒）
-        watchdog_thread.join(timeout=2)
+        try:
+            watchdog_thread.join(timeout=2)
+        except KeyboardInterrupt:
+            # 部分平台（尤其 Linux/CentOS）上阻塞等待 join 时收到 SIGINT
+            # 会直接抛 KeyboardInterrupt。转成一致的“用户中断”，走下方
+            # user_interrupted 分支优雅返回，而不是崩掉整个程序。
+            result_container["user_interrupted"] = True
+            try:
+                # 若子进程还在，尝试结束它
+                if sys.platform == "win32":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=5
+                    )
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
         if result_container["timed_out"]:
             stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
