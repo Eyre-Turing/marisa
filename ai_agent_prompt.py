@@ -2415,17 +2415,33 @@ def start_bg_task(command, force_use_bash=False):
     out_path = _bg_log_path(task_id, "out")
     err_path = _bg_log_path(task_id, "err")
 
+    # 后台任务要“免疫用户 Ctrl+C”：用户按 Ctrl+C 只应打断/停止前端对话，
+    # 而不是借机把后台任务一起干掉。因此这里做三件事：
+    #   - Unix：start_new_session=True，子进程进入新会话，不再随前台进程组收到终端 SIGINT
+    #   - Windows bash：给命令前缀 trap '' INT，让 bash 及其后代忽略 SIGINT/控制台中断
+    #   - Windows cmd：依赖 CREATE_NEW_PROCESS_GROUP 放入独立进程组
+    # 另外统一把 stdin 置为 DEVNULL，后台任务不应占用控制台输入。
     extra_kwargs = {}
     if sys.platform == "win32":
         extra_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
-        extra_kwargs["preexec_fn"] = os.setsid
+        extra_kwargs["start_new_session"] = True
+    extra_kwargs["stdin"] = subprocess.DEVNULL
+
+    # 记录给模型的原始 command（不带 signal 包装），保持报告干净
+    orig_command = command
+    spawn_command = command
+    is_bash_spawn = False
+    if force_use_bash or (sys.platform == "win32" and bash_path):
+        is_bash_spawn = True
+        # 让 bash 子树忽略 Ctrl+C（SIGINT 被 SIG_IGN 会被子进程继承）
+        spawn_command = f"trap '' INT; {command}"
 
     try:
         out_f = open(out_path, "wb")
         err_f = open(err_path, "wb")
-        if force_use_bash or (sys.platform == "win32" and bash_path):
-            bash_cmd = ["bash", "-c", command] if force_use_bash else [bash_path, "-c", command]
+        if is_bash_spawn:
+            bash_cmd = ["bash", "-c", spawn_command] if force_use_bash else [bash_path, "-c", spawn_command]
             proc = subprocess.Popen(
                 bash_cmd, shell=False,
                 stdout=out_f, stderr=err_f,
@@ -2433,7 +2449,7 @@ def start_bg_task(command, force_use_bash=False):
             )
         else:
             proc = subprocess.Popen(
-                command, shell=True,
+                spawn_command, shell=True,
                 stdout=out_f, stderr=err_f,
                 **extra_kwargs
             )
@@ -2445,7 +2461,7 @@ def start_bg_task(command, force_use_bash=False):
 
     info = {
         "task_id": task_id,
-        "command": command,
+        "command": orig_command,
         "pid": proc.pid,
         "proc": proc,            # 退出清理时需等待进程真正结束（Windows 句柄释放）
         "shell": used_shell,
@@ -2461,6 +2477,9 @@ def start_bg_task(command, force_use_bash=False):
 
     # wait 线程：等待进程结束 → 更新状态 → 入完成队列
     threading.Thread(target=_bg_wait_process, args=(task_id, proc), daemon=True).start()
+
+    # 🔊 让用户在界面上能看到启动了哪个后台任务
+    print(f"\n⏳ 后台任务 #{task_id} 已启动（PID {proc.pid}）\n    ⚙️ 命令: {orig_command}\n    📄 输出: {out_path}", flush=True)
 
     return json.dumps({
         "success": 1,
@@ -2505,6 +2524,8 @@ def bg_task_status(task_id):
     hint = ""
     if info["status"] == "running" and not stdout and not stderr:
         hint = "（任务运行中暂无输出，可能是程序自身缓冲或刚开始执行）"
+    # 🔊 让用户能感知查询结果
+    print(f"   🔍 后台任务 #{task_id} 状态: {info['status']}（命令: {info['command']}）", flush=True)
 
     return json.dumps({
         "success": 1,
