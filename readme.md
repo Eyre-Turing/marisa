@@ -39,6 +39,8 @@ pip3 install rich
 
 > `rich` 为**可选依赖**：未安装、非交互模式（管道/重定向）、或未使用 prompt_toolkit 时，一律退回原来的纯文本输出。
 > 渲染仅作用于**大模型自己说的话**，工具函数/命令的输出始终保持原样。可用 `--no-markdown` 强制关闭渲染。
+> - Python 3.6 上 rich 最高只能装到 12.6.0（其 Markdown 不支持表格），程序内置了轻量 GFM 表格渲染器自动补齐。
+> - Windows（含 Git Bash/mintty、winpty、老式 conhost）上强制走 Win32 控制台 API，避免 ANSI 转义码被显示成 `?[1;36m` 乱码。
 
 ### 配置大模型
 

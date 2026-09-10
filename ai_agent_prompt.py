@@ -52,13 +52,19 @@ except ImportError:
 # 工具函数/命令的一切输出仍走普通 print，不参与渲染。
 try:
     from rich.console import Console as _RichConsole
+    from rich.console import Group as _RichGroup
     from rich.markdown import Markdown as _RichMarkdown
     from rich.padding import Padding as _RichPadding
+    from rich.table import Table as _RichTable
+    from rich import box as _RichBox
     HAS_RICH = True
 except ImportError:
     _RichConsole = None
+    _RichGroup = None
     _RichMarkdown = None
     _RichPadding = None
+    _RichTable = None
+    _RichBox = None
     HAS_RICH = False
 
 # 是否启用 markdown 渲染。默认关闭，由 main() 根据「rich 可用 + 交互模式 + 使用 prompt_toolkit」最终裁定。
@@ -69,6 +75,130 @@ USE_MARKDOWN = False
 # 否则在 mintty/winpty、老式 conhost 等不解析 ANSI 的终端里，颜色码会被原样显示成 ?[1;36m 乱码。
 _rich_kwargs = {"legacy_windows": True} if os.name == "nt" else {}
 _rich_console = _RichConsole(**_rich_kwargs) if HAS_RICH else None
+
+
+def _rich_markdown_supports_tables():
+    """探测当前 rich 的 Markdown 是否渲染 GFM 表格。
+
+    rich < 13.4 的 Markdown 基于 commonmark，不支持表格（Python 3.6 能装到的最高版本
+    rich 12.6.0 正属此列）。这里渲染一个极小的表格，看输出里是否还残留原始竖线 '|'。
+    """
+    if not HAS_RICH or _rich_console is None:
+        return False
+    try:
+        with _rich_console.capture() as cap:
+            _rich_console.print(_RichMarkdown("| a | b |\n| - | - |\n| 1 | 2 |"))
+        return "|" not in cap.get()   # 渲染成表格则不再出现原始竖线
+    except Exception:
+        return False
+
+
+# 当前 rich 能否自己渲染 markdown 表格；不能则由下面的轻量表格渲染器补齐
+RICH_MD_TABLES = _rich_markdown_supports_tables()
+
+
+# ============ 轻量 GFM 表格渲染（补齐旧版 rich 不支持的 markdown 表格）============
+_MD_DELIM_CELL = re.compile(r":?-{1,}:?")
+
+
+def _md_split_row(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _md_is_delim_row(line):
+    """判断是否为表格的 '| --- | --- |' 分隔行。"""
+    if "-" not in line:
+        return False
+    cells = [c for c in _md_split_row(line) if c]
+    return bool(cells) and all(_MD_DELIM_CELL.fullmatch(c) for c in cells)
+
+
+def _md_justify(delim_cell):
+    left = delim_cell.startswith(":")
+    right = delim_cell.endswith(":")
+    if left and right:
+        return "center"
+    if right:
+        return "right"
+    return "left"
+
+
+def _md_build_table(header, delims, rows):
+    table = _RichTable(box=_RichBox.SIMPLE, show_header=True,
+                       header_style="bold", pad_edge=False)
+    for idx, col in enumerate(header):
+        cell = delims[idx] if idx < len(delims) else ""
+        table.add_column(col, justify=_md_justify(cell))
+    for row in rows:
+        table.add_row(*row)
+    return table
+
+
+def _md_render_blocks(content):
+    """把 markdown 拆成「表格块」与「其余块」：表格用 rich.Table 渲染，其余交给 rich.Markdown。
+
+    仅用于当前 rich 自身不支持 markdown 表格时（如 Python 3.6 上的 rich 12.x）。
+    代码围栏（``` / ~~~）内的一律不当表格处理。
+    """
+    renderables = []
+    buf = []
+    lines = content.split("\n")
+    in_fence = False
+    fence = None
+    i = 0
+
+    def flush_md():
+        if buf:
+            text = "\n".join(buf).strip("\n")
+            if text.strip():
+                renderables.append(_RichMarkdown(text, code_theme="monokai"))
+            del buf[:]
+
+    while i < len(lines):
+        line = lines[i]
+        s = line.strip()
+
+        # 代码围栏跟踪（围栏内不解析表格）
+        if s.startswith("```") or s.startswith("~~~"):
+            mark = s[:3]
+            if not in_fence:
+                in_fence, fence = True, mark
+            elif mark == fence:
+                in_fence, fence = False, None
+            buf.append(line)
+            i += 1
+            continue
+
+        # 表格起始：当前行含 '|' 且下一行是分隔行
+        if (not in_fence) and ("|" in line) and (i + 1 < len(lines)) and _md_is_delim_row(lines[i + 1]):
+            flush_md()
+            header = _md_split_row(line)
+            delims = _md_split_row(lines[i + 1])
+            ncol = len(header)
+            i += 2
+            rows = []
+            while i < len(lines) and lines[i].strip() and "|" in lines[i] and not _md_is_delim_row(lines[i]):
+                cells = _md_split_row(lines[i])
+                cells = (cells + [""] * ncol)[:ncol]
+                rows.append(cells)
+                i += 1
+            renderables.append(_md_build_table(header, delims, rows))
+            continue
+
+        buf.append(line)
+        i += 1
+
+    flush_md()
+    if not renderables:
+        return _RichMarkdown(content, code_theme="monokai")
+    if len(renderables) == 1:
+        return renderables[0]
+    return _RichGroup(*renderables)
 
 
 def print_assistant(content, name="魔理沙"):
@@ -84,14 +214,18 @@ def print_assistant(content, name="魔理沙"):
             # capture 会把样式强制序列化成 ANSI 转义码，从而绕过 rich 的 Win32 控制台渲染路径，
             # 在 legacy Windows 终端（mintty/winpty、老式 conhost）下就会显示成 ?[1;36m 之类的乱码。
             _rich_console.print(f"[bold cyan]{name}:[/bold cyan]")
-            _rich_console.print(
-                _RichPadding(_RichMarkdown(content, code_theme="monokai"), (0, 0, 0, 4))
-            )
+            if RICH_MD_TABLES:
+                body = _RichMarkdown(content, code_theme="monokai")
+            else:
+                # 旧版 rich（如 Python 3.6 上的 12.x）不认 markdown 表格，用自带渲染器补齐
+                body = _md_render_blocks(content)
+            _rich_console.print(_RichPadding(body, (0, 0, 0, 4)))
             sys.stdout.flush()
             return
         except Exception:
             pass  # 渲染翻车就退回纯文本，绝不拖累主流程
     print(f"{name}:\n    {content.replace(chr(10), chr(10) + '    ')}", flush=True)
+
 
 # MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
 # 通过 mcp_manager.py 统一管理 stdio/HTTP 模式的 MCP 服务器连接
