@@ -47,6 +47,52 @@ except ImportError:
     get_app = None
     HAS_PROMPT_TOOLKIT = False
 
+# rich 为可选依赖 —— 有则把「大模型自己说的话」渲染成终端 markdown 样式（表格/加粗/代码块），
+# 无则退化为纯文本缩进输出。注意：只用于大模型的自然语言回复，
+# 工具函数/命令的一切输出仍走普通 print，不参与渲染。
+try:
+    from rich.console import Console as _RichConsole
+    from rich.markdown import Markdown as _RichMarkdown
+    from rich.padding import Padding as _RichPadding
+    HAS_RICH = True
+except ImportError:
+    _RichConsole = None
+    _RichMarkdown = None
+    _RichPadding = None
+    HAS_RICH = False
+
+# 是否启用 markdown 渲染。默认关闭，由 main() 根据「rich 可用 + 交互模式 + 使用 prompt_toolkit」最终裁定。
+USE_MARKDOWN = False
+
+# rich Console 实例（仅 HAS_RICH 时创建；非 TTY 环境下 rich 会自动剥离样式）。
+# Windows 上强制 legacy_windows=True，让 rich 走 Win32 控制台 API 而非吐 ANSI 转义码——
+# 否则在 mintty/winpty、老式 conhost 等不解析 ANSI 的终端里，颜色码会被原样显示成 ?[1;36m 乱码。
+_rich_kwargs = {"legacy_windows": True} if os.name == "nt" else {}
+_rich_console = _RichConsole(**_rich_kwargs) if HAS_RICH else None
+
+
+def print_assistant(content, name="魔理沙"):
+    """打印大模型回复：满足条件时走 markdown 渲染，否则退回纯文本缩进（与旧行为一致）。
+
+    仅供「大模型自己说的话」使用；工具函数的输出请勿调用本函数。
+    """
+    if not content:
+        return
+    if USE_MARKDOWN and _rich_console is not None:
+        try:
+            # 直接交给 rich 输出，绝不要 capture 成字符串再 print——
+            # capture 会把样式强制序列化成 ANSI 转义码，从而绕过 rich 的 Win32 控制台渲染路径，
+            # 在 legacy Windows 终端（mintty/winpty、老式 conhost）下就会显示成 ?[1;36m 之类的乱码。
+            _rich_console.print(f"[bold cyan]{name}:[/bold cyan]")
+            _rich_console.print(
+                _RichPadding(_RichMarkdown(content, code_theme="monokai"), (0, 0, 0, 4))
+            )
+            sys.stdout.flush()
+            return
+        except Exception:
+            pass  # 渲染翻车就退回纯文本，绝不拖累主流程
+    print(f"{name}:\n    {content.replace(chr(10), chr(10) + '    ')}", flush=True)
+
 # MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
 # 通过 mcp_manager.py 统一管理 stdio/HTTP 模式的 MCP 服务器连接
 from mcp_manager import get_mcp_manager, load_mcp_config
@@ -4380,6 +4426,8 @@ def main():
                                 '用法：-c /path/to/context.log')
     parser.add_argument('--no-prompt-toolkit', action='store_true',
                         help='强制退化使用 input() 输入（即使环境装有 prompt_toolkit 也不用）')
+    parser.add_argument('--no-markdown', action='store_true',
+                        help='关闭大模型回复的 markdown 渲染，改为纯文本输出（仅在装有 rich 的交互模式下有意义）')
     args = parser.parse_args()
 
     # 加载 API 配置（如果配置文件不存在或字段缺失，会提示用户输入）
@@ -4512,10 +4560,21 @@ def main():
     global USE_INPUT_MODE
     USE_INPUT_MODE = not use_prompt_toolkit
 
+    # markdown 渲染：仅在「装了 rich + 交互模式 + 使用 prompt_toolkit」时启用；
+    # 非交互（管道/重定向）或未使用 prompt_toolkit 时，一律保持纯文本 print。
+    global USE_MARKDOWN
+    USE_MARKDOWN = bool(HAS_RICH and use_prompt_toolkit and not args.no_markdown)
+
     if use_prompt_toolkit:
         print("🧙 魔理沙 (多行输入模式 prompt_toolkit)", flush=True)
         print("   📝 回车=换行  |  Alt+Enter(或Esc+Enter)=提交", flush=True)
         print("   ❌ Ctrl+C=退出  |  Ctrl+D=退出", flush=True)
+        if not HAS_RICH:
+            print("   🖋️ Markdown 渲染：关闭（未安装 rich）", flush=True)
+        elif args.no_markdown:
+            print("   🖋️ Markdown 渲染：关闭（--no-markdown）", flush=True)
+        else:
+            print("   🖋️ Markdown 渲染：开启（仅美化大模型回复，工具输出保持原样）", flush=True)
         print("   ⚡ 工具执行中按Ctrl+C=中断魔法\n", flush=True)
     else:
         if pipe_mode:
@@ -4646,7 +4705,7 @@ def main():
             tool_calls = msg.get("tool_calls")
 
             if content:
-                print(f"魔理沙:\n    {content.replace(chr(10), chr(10)+'    ')}", flush=True)
+                print_assistant(content)  # 大模型回复走 markdown 渲染（未启用时自动纯文本）
 
             if tool_calls:
                 # 处理工具调用（预期是 compress）
@@ -4761,7 +4820,7 @@ def main():
 
                 # AI有话说的输出
                 if content:
-                    print(f"魔理沙:\n    {content.replace(chr(10), chr(10)+'    ')}", flush=True)
+                    print_assistant(content)  # 大模型回复走 markdown 渲染（未启用时自动纯文本）
 
                 # 没有工具调用 → AI总结完毕，跳出内层循环
                 if not tool_calls:

@@ -29,10 +29,16 @@
 
 - Python 3.8+
 - [prompt-toolkit](https://pypi.org/project/prompt-toolkit/)
+- [rich](https://pypi.org/project/rich/)（**可选**，用于把大模型回复渲染成 markdown 样式）
 
 ```bash
 pip3 install prompt_toolkit
+# 可选：安装 rich 后，交互模式下大模型的回复会自动渲染表格 / 加粗 / 代码块
+pip3 install rich
 ```
+
+> `rich` 为**可选依赖**：未安装、非交互模式（管道/重定向）、或未使用 prompt_toolkit 时，一律退回原来的纯文本输出。
+> 渲染仅作用于**大模型自己说的话**，工具函数/命令的输出始终保持原样。可用 `--no-markdown` 强制关闭渲染。
 
 ### 配置大模型
 
