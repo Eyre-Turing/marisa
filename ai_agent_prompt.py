@@ -928,8 +928,17 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
                             except (ValueError, IndexError):
                                 # 转换失败，保留原样
                                 converted_blocks.append(block)
+                        elif image_url.startswith(("http://", "https://")):
+                            # http(s) URL：转换为 Anthropic 的 url 源，由其服务端获取（免下载）
+                            converted_blocks.append({
+                                "type": "image",
+                                "source": {
+                                    "type": "url",
+                                    "url": image_url
+                                }
+                            })
                         else:
-                            # 不是 data URL（如 http URL），保留原样
+                            # 其他未知形式，保留原样
                             converted_blocks.append(block)
                     else:
                         converted_blocks.append(block)
@@ -1560,20 +1569,24 @@ tools = [
         "type": "function",
         "function": {
             "name": "read_image",
-            "description": "读取图片文件并转为 base64 编码。当用户提供了图片文件路径时，调用此工具读取图片。读取成功后图片会自动以多模态格式（role:user）注入对话，你可以直接看到图片内容。如果配置了多模态辅助模型（mul_api_key 等），可以同时传入 description 参数描述你想从这个图片读到什么，工具会调用辅助多模态模型识别图片并直接返回文本描述，无需主模型支持多模态。支持的格式: png, jpg, jpeg, gif, bmp, webp 等。最大支持 5MB。",
+            "description": "读取图片。支持两种来源（二选一）：①本地图片文件（filepath）；②网络图片 URL（url）。当用户提供本地图片路径时传 filepath；当用户给出图片网址时传 url。读取成功后图片会自动以多模态格式（role:user）注入对话，你可以直接看到图片内容：本地源转 base64 内联，url 源直接把链接交给多模态 API 由其服务端获取（无需下载）。如果配置了多模态辅助模型（mul_api_key 等），可以同时传入 description 参数描述你想从图片读到什么，工具会调用辅助多模态模型识别并直接返回文本描述，无需主模型支持多模态。支持格式: png, jpg, jpeg, gif, bmp, webp 等。本地图片最大 5MB。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filepath": {
                         "type": "string",
-                        "description": "图片文件的完整路径（支持绝对路径和相对路径）"
+                        "description": "（与 url 二选一）本地图片文件的完整路径（支持绝对路径和相对路径）"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "（与 filepath 二选一）网络图片的 http(s) 链接。默认不下载，直接把 URL 交给多模态 API 由其服务端获取"
                     },
                     "description": {
                         "type": "string",
                         "description": "（可选）描述你想从这个图片读到什么。如果配置了多模态辅助模型（mul_api_key/mul_base_url/mul_model/mul_protocol），将调用辅助多模态模型识别图片并返回文本描述；不传则按原方式注入多模态图片消息"
                     }
                 },
-                "required": ["filepath"]
+                "required": []
             }
         }
     },
@@ -1889,23 +1902,39 @@ def set_main_model_multimodal(supported):
     }, ensure_ascii=False)
 
 
-def read_image(filepath, description=""):
-    """读取图片文件，转为 base64 编码返回
-    
-    这个工具由大模型调用，读取用户指定的图片文件并转为 base64 格式。
-    工具本身不修改全局 messages，调用结果由主循环特殊处理：
-    不追加 tool response，而是注入一条 role:user 的多模态消息。
+def read_image(filepath=None, url=None, description=""):
+    """读取图片（本地文件或网络 URL 二选一），供主循环注入多模态消息或以子 Agent 识别。
 
-    如果配置了多模态辅助模型（mul_api_key / mul_base_url / mul_model / mul_protocol），
-    且传入了 description 参数（描述你想从这个图片读到什么），
-    则会启动"读图子 Agent"：调用辅助多模态模型识别图片，直接返回文本描述，
-    无需主模型支持多模态也能"看懂"图片。
+    参数（filepath 与 url 二选一，必须且只能提供一个）：
+      - filepath: 本地图片文件路径（绝对/相对均可）
+      - url:      网络图片的 http(s) 链接。默认不下载，直接把 URL 交给多模态 API 由其服务端获取；
+                  仅当需要 base64（如辅助模型读图且直读失败）时才本地回退下载。
+      - description: 可选。描述你想从图片读到什么。若配置了多模态辅助模型（mul_api_key 等），
+                     将调用辅助模型识别并直接返回文本描述。
+
+    工具本身不修改全局 messages，调用结果由主循环特殊处理：
+      - 本地源：转 base64，注入 role:user 的 data URL 多模态消息；
+      - url 源：直接把 http 链接作为多模态消息的 image_url.url（免下载）。
     """
     try:
         import base64
         import mimetypes
     except ImportError:
         return json.dumps({"success": 0, "err": "缺少 base64 或 mimetypes 模块"})
+
+    # —— 参数二选一校验 ——
+    filepath = filepath.strip() if isinstance(filepath, str) else filepath
+    url = url.strip() if isinstance(url, str) else url
+    has_file = bool(filepath)
+    has_url = bool(url)
+    if has_file and has_url:
+        return json.dumps({"success": 0, "err": "filepath 与 url 只能二选一，请只传其中一个"})
+    if not has_file and not has_url:
+        return json.dumps({"success": 0, "err": "必须提供 filepath（本地图片）或 url（网络图片）之一"})
+
+    # —— URL 源：默认免下载，交由多模态 API 服务端获取 ——
+    if has_url:
+        return _read_image_from_url(url, description)
 
     filepath = _normalize_path(filepath)
     
@@ -1953,12 +1982,102 @@ def read_image(filepath, description=""):
     
     return json.dumps({
         "success": 1,
+        "source": "local",
         "filepath": filepath,
         "mime": mime_type,
         "base64": b64,
         "size_kb": b64_size_kb,
         "message": f"图片已读取，大小约 {b64_size_kb}KB"
     })
+
+
+def _read_image_from_url(url, description=""):
+    """按 URL 读取网络图片，默认不下载。
+
+    - 主模型支持多模态：返回 url 源，由主循环把 http 链接作为 image_url.url，
+      交给多模态 API 在服务端获取（无需本地落盘）。
+    - 配置了多模态辅助模型且传了 description：调用辅助模型识别；优先把 URL 直接
+      交给辅助模型，若其无法获取该 URL，则本地下载后回退为 base64 再识别。
+    """
+    import mimetypes
+
+    low = url.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        return json.dumps({"success": 0, "err": f"url 必须是 http(s) 链接: {url}"})
+
+    # 尽力从扩展名猜 mime（服务端会按实际内容解码，猜不准也不影响）
+    mime_type, _ = mimetypes.guess_type(url.split("?")[0].split("#")[0])
+    if not mime_type or not mime_type.startswith("image/"):
+        mime_type = "image/png"
+
+    # ---- 🔮 辅助多模态模型读图模式 ----
+    mul_config = _build_mul_config()
+    if mul_config is not None and isinstance(description, str) and description.strip():
+        res = _read_image_via_subagent(
+            url, mime_type, None, 0, description, mul_config, url_ref=url
+        )
+        # 辅助模型抓不到该 URL 时，回退：本地下载 → base64 → 再识别一次
+        try:
+            ok = bool(json.loads(res).get("success"))
+        except (json.JSONDecodeError, TypeError):
+            ok = False
+        if not ok:
+            print(f"   ↩️ 辅助模型无法直接获取该 URL，回退本地下载: {url}", flush=True)
+            dl = _download_image_to_temp(url)
+            if dl.get("success"):
+                return _read_image_via_subagent(
+                    url, dl["mime"], dl["base64"], dl["size_kb"],
+                    description, mul_config
+                )
+        return res
+
+    print(
+        f"\n🌐 网络图片已按 URL 读取（免下载，交由多模态 API 服务端获取）\n"
+        f"   URL: {url}\n",
+        flush=True
+    )
+    return json.dumps({
+        "success": 1,
+        "source": "url",
+        "url": url,
+        "filepath": url,
+        "mime": mime_type,
+        "size_kb": 0,
+        "message": f"已按 URL 读取网络图片（免下载）: {url}",
+    })
+
+
+def _download_image_to_temp(url, max_size=None):
+    """把网络图片下载后转为 base64（URL 直读失败时的回退手段）。
+
+    返回 {success, base64, mime, size_kb}；失败返回 {success: 0, err}。
+    """
+    import base64
+    import mimetypes
+    import urllib.request
+
+    if max_size is None:
+        max_size = MAX_IMAGE_SIZE
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            mime_type = resp.headers.get_content_type() or ""
+            data = resp.read(max_size + 1)
+            if len(data) > max_size:
+                return {"success": 0, "err": f"图片过大（超过 {max_size // 1024 // 1024}MB）"}
+            if not mime_type or not mime_type.startswith("image/"):
+                guess, _ = mimetypes.guess_type(url.split("?")[0])
+                mime_type = guess or "image/png"
+    except Exception as e:
+        return {"success": 0, "err": f"下载失败: {e}"}
+
+    return {
+        "success": 1,
+        "base64": base64.b64encode(data).decode("utf-8"),
+        "mime": mime_type,
+        "size_kb": len(data) // 1024,
+    }
 
 
 def _build_mul_config():
@@ -1990,7 +2109,7 @@ def _build_mul_config():
     }
 
 
-def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description, mul_config):
+def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description, mul_config, url_ref=None):
     """通过多模态辅助模型（子 Agent）识别图片内容，返回文本描述。
 
     类似 load_skill 的子 Agent 模式，但更简单：
@@ -2019,6 +2138,9 @@ def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description,
         "4. 如果图片内容无法回答该问题，请如实说明"
     )
 
+    # 图片来源：url_ref（http 链接，免下载，交给 API 服务端获取）优先，
+    # 否则用本地 base64 拼成 data URL
+    _img_url_str = url_ref if url_ref else f"data:{mime_type};base64,{b64}"
     sub_messages = [
         {"role": "system", "content": sub_system_prompt},
         {
@@ -2027,7 +2149,7 @@ def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description,
                 {"type": "text", "text": f"问题：{description}\n\n请根据图片内容回答。"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{b64}"}
+                    "image_url": {"url": _img_url_str}
                 }
             ]
         }
@@ -5096,11 +5218,18 @@ def main():
                         except (json.JSONDecodeError, TypeError):
                             result_data = {"success": 0}
 
-                        if result_data.get("success") and "base64" in result_data:
+                        _is_url_src = result_data.get("source") == "url"
+                        if result_data.get("success") and ("base64" in result_data or _is_url_src):
                             # 原多模态注入逻辑（未配置多模态辅助模型，或未传 description）
-                            img_base64 = result_data["base64"]
-                            img_mime = result_data["mime"]
-                            img_path = result_data["filepath"]
+                            img_base64 = result_data.get("base64", "")
+                            img_mime = result_data.get("mime", "image/png")
+                            img_path = result_data.get("filepath", result_data.get("url", ""))
+                            # 图片在 API 侧的表示：url 源直接用 http 链接（免下载，由服务端获取），
+                            # 本地源用 data URL（base64 内联）
+                            if _is_url_src:
+                                img_url_ref = result_data.get("url", "")
+                            else:
+                                img_url_ref = f"data:{img_mime};base64,{img_base64}"
 
                             # 🛡️ 已知主模型不支持多模态：不再注入图片消息，避免毒化对话
                             if _main_model_no_multimodal:
@@ -5115,7 +5244,8 @@ def main():
                                         img_path, img_mime, img_base64,
                                         result_data.get("size_kb", 0),
                                         read_prompt,
-                                        mul_config
+                                        mul_config,
+                                        url_ref=(img_url_ref if _is_url_src else None)
                                     )
                                     print(f"   🔮 主模型不支持多模态，已改用辅助多模态模型读图: {img_path}", flush=True)
                                 else:
@@ -5162,7 +5292,7 @@ def main():
                                     {
                                         "type": "image_url",
                                         "image_url": {
-                                            "url": f"data:{img_mime};base64,{img_base64}"
+                                            "url": img_url_ref
                                         }
                                     }
                                 ]
