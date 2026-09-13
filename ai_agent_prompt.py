@@ -543,19 +543,59 @@ _main_model_no_multimodal = False
 messages = []
 
 
-def get_context_size(msg_list):
-    """messages 的 JSON 字节数（贴近 API 实际传输量，用于和 token 数对照）"""
-    json_str = json.dumps(msg_list, ensure_ascii=False)
+def _json_bytes(obj):
+    """任意对象序列化成 JSON 后的 UTF-8 字节数。"""
+    json_str = json.dumps(obj, ensure_ascii=False)
     # 用户粘贴/外部输入可能带入 UTF-8 surrogate（\ud800-\udfff），直接 encode 会抛
     # UnicodeEncodeError。这里用 replace 兜底，保证上下文估算永不因编码崩溃。
     return len(json_str.encode('utf-8', errors='replace'))
+
+
+def get_context_size(msg_list):
+    """messages 的 JSON 字节数（只算对话本身，不含工具 schema）。"""
+    return _json_bytes(msg_list)
+
+
+def get_tools_size(tools=None):
+    """工具 schema 在请求体里占的 JSON 字节数（tools 为空则返回 0）。
+
+    这是请求体里最容易被忽略的大头：内置工具 + MCP 工具的 schema 加起来
+    通常有十几 KB，却会实实在在消耗 prompt_tokens。tools 随 MCP 连接变化，
+    所以每次实时算，不做缓存（十几 KB 的序列化开销可以忽略）。
+    """
+    if tools is None:
+        tools = ai_agent_tools.tools
+    if not tools:
+        return 0
+    return _json_bytes({"tools": tools, "tool_choice": "auto"})
+
+
+def get_request_size(msg_list=None, tools=None):
+    """估算「实际发出去的请求体」的 JSON 字节数（messages + tools）。
+
+    必须按这个口径统计，才能和 API 返回的 prompt_tokens 对照——因为
+    prompt_tokens 是「整个请求」的 token 数，包含 tools schema。
+    只统计 messages 的话，短对话会出现「字节数 ≪ token 数」的假象
+    （工具 schema 一二十 KB，而消息本身可能只有几百字节）。
+
+    注：请求体里还有 model 等固定字段（几十字节），这里忽略，误差可忽略。
+    """
+    if msg_list is None:
+        msg_list = messages
+    if tools is None:
+        tools = ai_agent_tools.tools
+    payload = {"messages": msg_list}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    return _json_bytes(payload)
 
 
 # ---- 真实 token 用量（取自 API 响应的 usage 字段）----
 # 最近一次「主模型」调用的用量与请求体字节数，用于：
 #   ① 展示准确的上下文 token 数（不再靠字节数瞎猜）；② 让压缩阈值按 token 判断。
 _last_usage = None           # 归一化 usage：{"prompt_tokens","completion_tokens","total_tokens","cached_tokens"}
-_last_usage_ctx_bytes = 0    # 该次请求发送时 messages 的 JSON 字节数
+_last_usage_ctx_bytes = 0    # 该次请求发送时「完整请求体」的 JSON 字节数（含 tools，口径同 prompt_tokens）
 
 
 def _parse_token_count(raw, fallback):
@@ -660,25 +700,26 @@ def _refresh_context_limits():
     LLM_COMPRESS_THRESHOLD = _pick("llm_compress_tokens", LLM_COMPRESS_THRESHOLD)
 
 
-def _record_main_usage(usage, sent_messages):
-    """记录主模型本次调用的真实用量（子 Agent / 辅助模型调用不记录）。"""
+def _record_main_usage(usage, sent_messages, sent_tools=None):
+    """记录主模型本次调用的真实用量（子 Agent / 辅助模型调用不记录）。
+
+    字节锚点取「完整请求体」（messages + tools），与 prompt_tokens 同口径；
+    否则工具的 token 会被按比例摊到消息字节上，导致后续估算严重偏高。
+    """
     global _last_usage, _last_usage_ctx_bytes
     if not usage:
         return
     _last_usage = usage
-    _last_usage_ctx_bytes = get_context_size(sent_messages)
+    _last_usage_ctx_bytes = get_request_size(sent_messages, sent_tools)
 
 
-def get_context_tokens(msg_list=None):
-    """当前上下文的 token 数（尽量取真实值）。
+def _tokens_from_bytes(cur_bytes):
+    """把「请求体字节数」换算成 token 数。
 
-    - 有 API usage 时：以最近一次请求的 prompt_tokens / 请求字节数为比例，
-      按当前 messages 的字节数换算（每次 API 返回都会自我校正）；
+    - 有 API usage 时：以最近一次请求的 prompt_tokens / 请求体字节数为比例换算
+      （每次 API 返回都会自我校正）；
     - 没有 usage 时：退回粗略估算（约 4 字节 / token）。
     """
-    if msg_list is None:
-        msg_list = messages
-    cur_bytes = get_context_size(msg_list)
     if _last_usage and _last_usage_ctx_bytes > 0:
         pt = _last_usage.get("prompt_tokens") or 0
         if pt > 0:
@@ -686,14 +727,24 @@ def get_context_tokens(msg_list=None):
     return cur_bytes // 4
 
 
+def get_context_tokens(msg_list=None, tools=None):
+    """当前上下文的 token 数（尽量取真实值）。
+
+    锚点与换算都基于「完整请求体」（含 tools schema），与 prompt_tokens 同口径。
+    """
+    return _tokens_from_bytes(get_request_size(msg_list, tools))
+
+
 def format_usage_line():
-    """一行式用量摘要：真实 token 数与 JSON 字节数对照。"""
-    cur_bytes = get_context_size(messages)
-    tok = get_context_tokens(messages)
+    """一行式用量摘要：真实 token 数与请求体 JSON 字节数对照。"""
+    msg_bytes = get_context_size(messages)
+    tools_bytes = get_tools_size()
+    cur_bytes = get_request_size(messages)
+    # 复用同一个 cur_bytes 换算 token，保证展示出的 tok 与字节严格对得上
+    tok = _tokens_from_bytes(cur_bytes)
     limit = CONTEXT_LIMIT or 0
     pct = round(tok / limit * 100, 1) if limit else 0.0
     bpt = (cur_bytes / tok) if tok else 0.0
-    kb = cur_bytes / 1024
     approx = "" if _last_usage else "≈"
     segs = [f"上下文 {approx}{tok:,} tok / {limit:,}（{pct}%）"]
     if _last_usage:
@@ -704,7 +755,13 @@ def format_usage_line():
         if cached:
             seg += f"，缓存命中 {cached:,}"
         segs.append(seg)
-    segs.append(f"字节 {cur_bytes:,} B（{kb:.1f} KB）")
+    # 字节数按「完整请求体」给，才和上面的 token 数同口径；并拆出工具 schema 的占比，
+    # 免得再被误读成「字节数怎么比 token 还少」
+    if tools_bytes:
+        breakdown = f"，消息 {msg_bytes/1024:.1f} KB + 工具 {tools_bytes/1024:.1f} KB"
+    else:
+        breakdown = ""
+    segs.append(f"请求体 {cur_bytes:,} B（{cur_bytes/1024:.1f} KB{breakdown}）")
     segs.append(f"约 {bpt:.2f} B/tok")
     return "📊 " + " ｜ ".join(segs)
 
@@ -925,7 +982,7 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None, gua
         # 仅主模型调用（config_override 为空）才记录用量，供上下文统计与阈值判断使用；
         # 子 Agent / 辅助模型调用不会污染主上下文的口径。
         if config_override is None:
-            _record_main_usage(usage, messages)
+            _record_main_usage(usage, messages, tools)
         return msg, reasoning_content, usage
     except UserInterrupt:
         # 用户按 Ctrl+C 中断，不保存错误快照，直接向上传播（主循环检测 interrupted）
