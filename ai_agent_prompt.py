@@ -272,6 +272,21 @@ DEFAULT_CONFIG = {
     # read_image 单张图片大小上限，单位「字节」，不带单位即按字节算；
     # 也支持 k / kb（1024）、m / mb（1024×1024）后缀，如 "5mb" / "512kb"
     "max_image_size_byte": 5 * 1024 * 1024,
+    # ---- 请求直通：provider 相关的高级参数（思考等级 / 扩展思考 / beta 开关等）----
+    # 各家供应商的「思考等级」「推理预算」等参数名各不相同，且基本都在请求体（body）
+    # 而非请求头里。这里提供两个「原样透传」的出口，程序不需要认识每一个参数名：
+    #   extra_headers — 合并进 HTTP 请求头（如 anthropic-beta、额外鉴权头）
+    #   extra_body    — 合并进请求体 JSON（如 reasoning_effort、thinking、enable_thinking）
+    # 例：{"extra_body": {"reasoning_effort": "high"}}（OpenAI o 系列 / GPT-5）
+    #     {"extra_body": {"thinking": {"type": "enabled", "budget_tokens": 16000},
+    #                     "max_tokens": 32000},
+    #      "extra_headers": {"anthropic-beta": "interleaved-thinking-2025-05-14"}}
+    # 注意：messages / tools / tool_choice / stream 由程序自己构造，不允许覆盖。
+    "extra_headers": {},
+    "extra_body": {},
+    # 多模态辅助模型也有对应的透传出口（同样只在配置了 mul_* 后生效）
+    "mul_extra_headers": {},
+    "mul_extra_body": {},
 }
 
 _config_cache = None
@@ -1097,6 +1112,80 @@ def _extract_anthropic_usage(u):
     }
 
 
+# ============================================================
+#  请求直通：把 provider 相关的高级参数原样透传给 API
+#  各家「思考等级」「推理预算」等参数名不统一，且都在请求体里，
+#  这里只负责「合并 + 保护结构性字段」，不解释具体参数含义。
+# ============================================================
+
+# 请求体里由程序自己构造的字段，不允许被 extra_body 覆盖（覆盖会破坏请求结构）
+_EXTRA_BODY_RESERVED = {"messages", "tools", "tool_choice", "stream", "model"}
+# 请求头里由 urllib / 程序管理的字段，配置了也不生效
+_EXTRA_HEADER_RESERVED = {"content-length", "content-type"}
+# 同一类警告只提示一次，避免工具循环里每轮都刷屏
+_warned_extra_keys = set()
+
+
+def _sanitize_extra_fields(raw, reserved):
+    """把配置里的 extra_body / extra_headers 归一化成干净的 {str: 值} 字典。
+
+    - 非 dict（None / 字符串 / 列表 / 数字）一律当作「未配置」，返回 {}
+    - 键统一转成字符串（JSON 里键本来就是字符串，这里防手改出的意外）
+    - 剔除 reserved 里由程序管理的字段，避免用户配置破坏请求结构
+    """
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    dropped = []
+    for key, value in raw.items():
+        name = str(key)
+        if name.lower() in reserved:
+            dropped.append(name)
+            continue
+        clean[name] = value
+    if dropped:
+        signature = (frozenset(reserved), tuple(sorted(dropped)))
+        if signature not in _warned_extra_keys:
+            _warned_extra_keys.add(signature)
+            print(f"   ⚠️ 以下字段由程序管理，已忽略: {', '.join(sorted(dropped))}", flush=True)
+    return clean
+
+
+def _build_extra_headers(config):
+    """取出生效的附加请求头（值统一转成字符串，避免 urllib 报类型错）。"""
+    extra = _sanitize_extra_fields(config.get("extra_headers"), _EXTRA_HEADER_RESERVED)
+    return {k: str(v) for k, v in extra.items()}
+
+
+def _build_extra_body(config):
+    """取出生效的附加请求体字段。"""
+    return _sanitize_extra_fields(config.get("extra_body"), _EXTRA_BODY_RESERVED)
+
+
+def _report_api_extras():
+    """启动时打印当前生效的附加参数，方便一眼确认「思考等级」这类设置有没有吃上。"""
+    try:
+        cfg = load_config()
+    except Exception:
+        return
+    rows = []
+    body = _build_extra_body(cfg)
+    if body:
+        rows.append("请求体 " + json.dumps(body, ensure_ascii=False))
+    headers = _build_extra_headers(cfg)
+    if headers:
+        rows.append("请求头 " + json.dumps(headers, ensure_ascii=False))
+    mul_body = _sanitize_extra_fields(cfg.get("mul_extra_body"), _EXTRA_BODY_RESERVED)
+    mul_headers = _sanitize_extra_fields(cfg.get("mul_extra_headers"), _EXTRA_HEADER_RESERVED)
+    if mul_body or mul_headers:
+        rows.append(
+            "辅助模型 "
+            + json.dumps({"body": mul_body, "headers": mul_headers}, ensure_ascii=False)
+        )
+    if rows:
+        print("   ⚙️ 附加请求参数: " + " ｜ ".join(rows), flush=True)
+
+
 def _call_openai_api(config, messages, tools=None, tool_choice="auto", guard_multimodal=True):
     """OpenAI 风格 API 调用（兼容 DeepSeek 等）"""
     api_key = config["api_key"]
@@ -1113,11 +1202,20 @@ def _call_openai_api(config, messages, tools=None, tool_choice="auto", guard_mul
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+    # 附加请求头（配置里 extra_headers 原样透传，用于 beta 开关 / 额外鉴权头等）
+    extra_headers = _build_extra_headers(config)
+    if extra_headers:
+        headers.update(extra_headers)
+    # 附加请求体字段（配置里 extra_body 原样透传，用于 reasoning_effort / thinking 等）
+    extra_body = _build_extra_body(config)
 
-    return _do_openai_request(url, headers, model, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
+    return _do_openai_request(
+        url, headers, model, messages, tools, tool_choice,
+        guard_multimodal=guard_multimodal, extra_body=extra_body,
+    )
 
 
-def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="auto", allow_retry=True, guard_multimodal=True):
+def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="auto", allow_retry=True, guard_multimodal=True, extra_body=None):
     """
     实际执行 OpenAI 风格 API 请求。
     
@@ -1137,6 +1235,9 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice
+    # 附加请求体字段最后合并（结构性字段已在 _build_extra_body 里被剔除）
+    if extra_body:
+        payload.update(extra_body)
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -1159,7 +1260,8 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
                 return _do_openai_request(
                     url, headers, model, messages, tools, tool_choice,
                     allow_retry=False,  # 防止无限递归
-                    guard_multimodal=guard_multimodal
+                    guard_multimodal=guard_multimodal,
+                    extra_body=extra_body,
                 )
             raise RuntimeError(f"API 请求失败 (HTTP {code}): {error_body}")
         elif r["kind"] == "url":
@@ -1175,6 +1277,7 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
                     url, headers, model, messages, tools, tool_choice,
                     allow_retry=allow_retry,
                     guard_multimodal=guard_multimodal,
+                    extra_body=extra_body,
                 )
             raise RuntimeError(f"API 请求失败 (网络错误): {r['reason']}")
         else:
@@ -1544,6 +1647,10 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01"
     }
+    # 附加请求头：Anthropic 的 beta 功能开关走这里（如 interleaved-thinking）
+    extra_headers = _build_extra_headers(config)
+    if extra_headers:
+        headers.update(extra_headers)
 
     payload = {
         "model": model,
@@ -1554,6 +1661,11 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
         payload["system"] = system_prompt
     if anthropic_tools:
         payload["tools"] = anthropic_tools
+    # 附加请求体字段最后合并：扩展思考（thinking）、max_tokens 上限等都在这里给。
+    # 注意 Anthropic 要求 max_tokens > thinking.budget_tokens，开了思考要一并调大。
+    extra_body = _build_extra_body(config)
+    if extra_body:
+        payload.update(extra_body)
 
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -2192,6 +2304,8 @@ def main():
         f"图片上限 {ai_agent_tools.MAX_IMAGE_SIZE:,} 字节（{ai_agent_tools.MAX_IMAGE_SIZE / (1024 * 1024):g} MB）",
         flush=True,
     )
+    # 打印当前生效的附加请求参数（思考等级 / beta 开关等），配了才显示
+    _report_api_extras()
 
     # 初始化日志（以程序启动时间命名）
     init_logger()

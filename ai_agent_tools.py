@@ -883,6 +883,14 @@ def _build_mul_config():
         "base_url": mul_base_url,
         "model": mul_model,
         "protocol": mul_protocol,
+        # 辅助模型也有独立的附加参数透传出口（思考等级等），走 mul_extra_* 配置；
+        # 同样剔除 messages / tools 这类由程序管理的结构性字段
+        "extra_headers": _RT._sanitize_extra_fields(
+            config.get("mul_extra_headers"), _RT._EXTRA_HEADER_RESERVED
+        ),
+        "extra_body": _RT._sanitize_extra_fields(
+            config.get("mul_extra_body"), _RT._EXTRA_BODY_RESERVED
+        ),
     }
 
 

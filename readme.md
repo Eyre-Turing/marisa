@@ -126,6 +126,53 @@ pip3 install rich
 - 同一行里给出换算比 `约 x B/tok`，正常落在 **3~4 字节/token** 附近，两者对照一目了然；
 - 若接口未返回 `usage`，则退化为按字节粗略估算（约 4 字节 / token），并在数值前标 `≈`。
 
+### 🎛️ 思考等级 / 供应商专有参数（请求直通）
+
+各家 API 的「思考等级」「推理预算」这类参数**名字互不相同，而且都放在请求体（JSON body）里，不是请求头**。请求头只承担三件事：认证、协议版本、以及极少数 beta 功能开关。所以程序提供两个「原样透传」的出口，不需要认识每一个参数名：
+
+```jsonc
+{
+  // 合并进请求体 JSON —— 思考等级、推理预算、输出上限等都写这里
+  "extra_body": { "reasoning_effort": "high" },
+  // 合并进 HTTP 请求头 —— beta 开关、额外鉴权头等写这里
+  "extra_headers": { "anthropic-beta": "interleaved-thinking-2025-05-14" }
+}
+```
+
+**常见供应商的对应参数**（名称与可用值以各家官方文档为准，不同版本会变）：
+
+| 供应商 | 参数 | 位置 | 备注 |
+|---|---|---|---|
+| OpenAI（o 系列 / GPT-5） | `reasoning_effort`：`minimal` / `low` / `medium` / `high` | body | GPT-5 另有 `verbosity` |
+| OpenAI Responses API | `reasoning: { effort, summary }` | body | 本程序走 chat.completions，一般用不上 |
+| Anthropic（Claude） | `thinking: { type: "enabled", budget_tokens: N }` | body | 需同时把 `max_tokens` 调到**大于** `budget_tokens`；且不能同时改 `temperature` / `top_p` |
+| Anthropic | `anthropic-beta: interleaved-thinking-2025-05-14` | **header** | 少数「开关在头里」的例子 |
+| DeepSeek | 用**模型名**切换：`deepseek-reasoner`（思考）/ `deepseek-chat`（非思考） | body | 推理内容从 `reasoning_content` 自动解析 |
+| 通义千问（DashScope） | `enable_thinking: true`、`thinking_budget: N` | body | OpenAI 兼容模式下走这里 |
+| 智谱 GLM | `thinking: { type: "enabled" }` | body | |
+
+**Anthropic 开扩展思考的完整写法**（`max_tokens` 必须一起调大，否则 400）：
+
+```jsonc
+{
+  "extra_body": {
+    "thinking": { "type": "enabled", "budget_tokens": 16000 },
+    "max_tokens": 32000
+  }
+}
+```
+
+几点说明：
+
+- **结构性字段受保护**：`messages` / `tools` / `tool_choice` / `stream` / `model` 由程序自己构造，写在 `extra_body` 里会被忽略并给出警告——否则请求结构会被破坏。`max_tokens` **不在**保护名单里，正是为了让你调扩展思考的输出上限。
+- **额外请求头**：`Content-Length` / `Content-Type` 由程序管理，写在 `extra_headers` 里会被忽略。
+- **辅助模型**：多模态辅助模型有独立的 `mul_extra_body` / `mul_extra_headers`（同样只在配置了 `mul_*` 后生效）。
+- **启动可见**：配了才会打印，方便确认有没有吃上：
+  ```
+  ⚙️ 附加请求参数: 请求体 {"reasoning_effort": "high"} ｜ 请求头 {"X-Custom": "1"}
+  ```
+- 透传的值原样进 JSON，可以是对象 / 数组 / 数字 / 布尔等任意结构。未配置（`{}` 或字段缺失）时，请求体与改造前**完全一致**，没有任何副作用。
+
 ### 启动
 
 **Linux：**
@@ -306,6 +353,7 @@ marisa/
 - 🔌 **MCP 扩展**：通过 MCP 协议连接外部工具（Blender 等）
 - 📚 **技能系统**：可按需加载领域知识，让 Agent 更聪明
 - 📊 **真实 token 统计**：解析 API 返回的 `usage`，每次回复后展示 token 与字节数对照，压缩 / 图片大小等阈值均可配置（支持 `k` / `m` 单位）
+- 🎛️ **请求直通**：`extra_body` / `extra_headers` 原样透传供应商专有参数（思考等级、扩展思考、beta 开关等），无需程序逐个适配
 - ⚡ **轻量简洁**：依赖少，启动快，即装即用
 
 ---
