@@ -491,13 +491,15 @@ class MCPHttpServer:
     生命周期：initialize → tools/list → tools/call
     """
 
-    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False):
+    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False, tls_max_version=None):
         self.name = name
         self.url = url
         self.tool_prefix = tool_prefix
         self.timeout = timeout
         self.headers = headers or {}
         self.debug = debug
+        self.tls_max_version = tls_max_version   # 可选：强制最大 TLS 版本，如 "1.2"（部分网络会拦截 TLS1.3）
+        self._ssl_context = self._build_ssl_context(tls_max_version)
 
         self.tools = []          # OpenAI 格式的工具列表
         self.mcp_tools = []      # 原始 MCP 格式的工具列表
@@ -506,6 +508,26 @@ class MCPHttpServer:
         self._next_id = 1
         # 会话 ID（服务器在 initialize 响应中可能通过 Mcp-Session-Id 头返回）
         self._session_id = None
+
+    @staticmethod
+    def _build_ssl_context(tls_max_version):
+        """根据配置构造 SSL 上下文；tls_max_version 形如 "1.2"/"1.3"，为空则返回 None 用系统默认。
+        部分网络环境会拦截 TLS1.3 握手，此时可配置 tls_max_version="1.2" 降级握手。"""
+        if not tls_max_version:
+            return None
+        import ssl
+        ctx = ssl.create_default_context()
+        ver = str(tls_max_version).strip().replace("TLS", "").replace("v", "")
+        mapping = {
+            "1.0": ssl.TLSVersion.TLSv1,
+            "1.1": ssl.TLSVersion.TLSv1_1,
+            "1.2": ssl.TLSVersion.TLSv1_2,
+            "1.3": ssl.TLSVersion.TLSv1_3,
+        }
+        if ver not in mapping:
+            raise ValueError(f"不支持的 tls_max_version: {tls_max_version}")
+        ctx.maximum_version = mapping[ver]
+        return ctx
 
     def _get_id(self):
         rid = self._next_id
@@ -541,7 +563,7 @@ class MCPHttpServer:
 
         try:
             req = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context) as resp:
                 # 捕获会话 ID
                 sid = resp.headers.get("Mcp-Session-Id")
                 if sid:
@@ -674,7 +696,7 @@ class MCPHttpServer:
 
         try:
             req = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
-            urllib.request.urlopen(req, timeout=self.timeout).read()
+            urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context).read()
         except Exception:
             pass  # 通知不需要处理响应
 
@@ -1176,7 +1198,8 @@ class MCPManager:
                     tool_prefix=cfg.get("tool_prefix", ""),
                     timeout=cfg.get("timeout", 60),
                     headers=cfg.get("headers", {}),
-                    debug=cfg.get("debug", False)
+                    debug=cfg.get("debug", False),
+                    tls_max_version=cfg.get("tls_max_version")
                 )
                 
                 if cfg.get("auto_connect", True):
@@ -1373,7 +1396,8 @@ class MCPManager:
                 tool_prefix=cfg.get("tool_prefix", ""),
                 timeout=cfg.get("timeout", 60),
                 headers=cfg.get("headers", {}),
-                debug=cfg.get("debug", False)
+                debug=cfg.get("debug", False),
+                tls_max_version=cfg.get("tls_max_version")
             )
             
             if server.connect():
