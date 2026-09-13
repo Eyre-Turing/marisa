@@ -56,7 +56,7 @@ def bind_runtime(module):
       _RT.messages / _RT.interrupted / _RT.large_content_counter /
       _RT._main_model_no_multimodal / _RT.LARGE_CONTENT_THRESHOLD /
       _RT.DEFAULT_CONFIG / _RT.load_config() / _RT.call_api() /
-      _RT.get_context_size() / _RT.UserInterrupt
+      _RT.get_context_size() / _RT._parse_size_bytes() / _RT.UserInterrupt
     """
     global _RT
     _RT = module
@@ -621,7 +621,27 @@ TERMINAL_TOOLS = {"compress"}
 IMAGE_TOOLS = {"read_image"}
 
 
-MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 图片最大 5MB
+# read_image 单张图片大小上限（字节）。默认 5MB，可由 ai_agent_config.json 的
+# max_image_size_byte 覆盖（见 _refresh_tool_limits）。注意：这里读的是模块全局，
+# 函数内部每次都重新取值，所以运行时刷新立即生效。
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 图片最大 5MB = 5242880 字节
+
+
+def _refresh_tool_limits():
+    """从 ai_agent_config.json 读取工具相关阈值，刷新本模块的全局常量。
+
+    对应配置项：
+      max_image_size_byte  read_image 单张图片大小上限（单位字节；
+                           不带单位即按字节算，也支持 k/kb、m/mb 后缀）
+
+    由主程序在启动时（load_config 之后）调用；读取失败或值非法时保持默认值。
+    """
+    global MAX_IMAGE_SIZE
+    try:
+        cfg = _RT.load_config()
+    except Exception:
+        return
+    MAX_IMAGE_SIZE = _RT._parse_size_bytes(cfg.get("max_image_size_byte"), MAX_IMAGE_SIZE)
 
 
 def set_main_model_multimodal(supported):
@@ -703,7 +723,7 @@ def read_image(filepath=None, url=None, description=""):
     if file_size > MAX_IMAGE_SIZE:
         return json.dumps({
             "success": 0, 
-            "err": f"图片过大: {file_size // 1024}KB，最大支持 {MAX_IMAGE_SIZE // 1024 // 1024}MB"
+            "err": f"图片过大: {file_size // 1024}KB，最大支持 {MAX_IMAGE_SIZE / 1024 / 1024:g}MB"
         })
     
     # 猜测 MIME 类型
@@ -822,7 +842,7 @@ def _download_image_to_temp(url, max_size=None):
             mime_type = resp.headers.get_content_type() or ""
             data = resp.read(max_size + 1)
             if len(data) > max_size:
-                return {"success": 0, "err": f"图片过大（超过 {max_size // 1024 // 1024}MB）"}
+                return {"success": 0, "err": f"图片过大（超过 {max_size / 1024 / 1024:g}MB）"}
             if not mime_type or not mime_type.startswith("image/"):
                 guess, _ = mimetypes.guess_type(url.split("?")[0])
                 mime_type = guess or "image/png"
@@ -913,7 +933,7 @@ def _read_image_via_subagent(filepath, mime_type, b64, b64_size_kb, description,
     ]
 
     try:
-        sub_msg, _ = _RT.call_api(sub_messages, tools=None, config_override=mul_config, guard_multimodal=False)
+        sub_msg, _, _sub_usage = _RT.call_api(sub_messages, tools=None, config_override=mul_config, guard_multimodal=False)
     except _RT.UserInterrupt:
         print("   ⏹️ 用户中断了读图辅助模型调用\n", flush=True)
         return json.dumps({"success": 0, "err": "用户中断"})
@@ -2537,7 +2557,7 @@ def load_skill(task_description):
 
             # 调用 API
             try:
-                sub_msg, sub_reasoning = _RT.call_api(sub_messages, tools=sub_tools, tool_choice="auto", guard_multimodal=False)
+                sub_msg, sub_reasoning, _sub_usage = _RT.call_api(sub_messages, tools=sub_tools, tool_choice="auto", guard_multimodal=False)
             except _RT.UserInterrupt:
                 print("   ⏹️ 用户中断了技能检索子Agent调用\n", flush=True)
                 result_dict = {"success": 0, "err": "用户中断"}

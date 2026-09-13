@@ -259,7 +259,19 @@ DEFAULT_CONFIG = {
     "mul_api_key": "",
     "mul_base_url": "",
     "mul_model": "",
-    "mul_protocol": "openai"
+    "mul_protocol": "openai",
+    # ---- 上下文 / 压缩阈值（均以 token 计，取自 API 返回的真实用量）----
+    # 三者都支持 k / m 单位，大小写与空格不限，如 1000000 / "1m" / "1 M" / "700k" / " 1.5 M "
+    # 当前模型最大上下文 token 数：用于计算上下文使用率百分比
+    "context_limit_tokens": 1000000,
+    # 达到此 token 数触发「无人值守压缩」：程序在工具循环里自动压缩中间的工具调用（轻量、不调用大模型）
+    "auto_compress_tokens": 700000,
+    # 达到此 token 数触发「大模型压缩」：暂缓用户输入，先让大模型调用 compress 工具重写上下文（重量、耗一次 API）
+    "llm_compress_tokens": 700000,
+    # ---- 工具阈值 ----
+    # read_image 单张图片大小上限，单位「字节」，不带单位即按字节算；
+    # 也支持 k / kb（1024）、m / mb（1024×1024）后缀，如 "5mb" / "512kb"
+    "max_image_size_byte": 5 * 1024 * 1024,
 }
 
 _config_cache = None
@@ -309,6 +321,15 @@ def load_config(force_reload=False):
                     config[key] = value
                 else:
                     config[key] = default
+
+    # 补齐 DEFAULT_CONFIG 中有实际默认值、但配置文件里缺失的字段（如上下文 / 压缩阈值），
+    # 让它们出现在 ai_agent_config.json 中，方便用户直接查看和修改。
+    # mul_* 是多模态辅助模型的可选字段，全部跳过，避免给没用上的用户塞一堆无用配置。
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key in config or key.startswith("mul_"):
+            continue
+        config[key] = default_value
+        need_save = True
 
     if need_save:
         save_config(config)
@@ -488,12 +509,15 @@ def _urlopen_interruptible(req, timeout=180, poll_interval=0.2):
 # ============================================================
 #  0. 上下文压缩相关常量 & 全局 messages
 # ============================================================
-# 上下文上限（DeepSeek 1M 上下文窗口）
+# 以下三个阈值均可通过 ai_agent_config.json 配置，这里只作为默认值；
+# main() 启动时会调用 _refresh_context_limits() 用配置覆盖。
+#
+# 当前模型最大上下文 token 数（用于计算使用率百分比）
 CONTEXT_LIMIT = 1_000_000
-
-# 压缩阈值：JSON 字节数超过此值时自动提醒 AI 压缩
-# 设为 700K 字节（约 70%），留出余量避免撞墙
-COMPRESS_THRESHOLD = 700_000
+# 「无人值守压缩」阈值（token）：工具循环中上下文超过此值时，程序自动压缩中间的工具调用（轻量、不调大模型）
+AUTO_COMPRESS_THRESHOLD = 700_000
+# 「大模型压缩」阈值（token）：新的一轮对话开始前上下文超过此值时，先让大模型调用 compress 工具重写上下文
+LLM_COMPRESS_THRESHOLD = 700_000
 
 # 长内容自动过期机制（第二层：软过期）
 # tool response 内容超过此大小时在 large_content_counter 中计数，
@@ -520,11 +544,177 @@ messages = []
 
 
 def get_context_size(msg_list):
-    """估算 messages 的 JSON 字节数（接近 API 实际传输量）"""
+    """messages 的 JSON 字节数（贴近 API 实际传输量，用于和 token 数对照）"""
     json_str = json.dumps(msg_list, ensure_ascii=False)
     # 用户粘贴/外部输入可能带入 UTF-8 surrogate（\ud800-\udfff），直接 encode 会抛
     # UnicodeEncodeError。这里用 replace 兜底，保证上下文估算永不因编码崩溃。
     return len(json_str.encode('utf-8', errors='replace'))
+
+
+# ---- 真实 token 用量（取自 API 响应的 usage 字段）----
+# 最近一次「主模型」调用的用量与请求体字节数，用于：
+#   ① 展示准确的上下文 token 数（不再靠字节数瞎猜）；② 让压缩阈值按 token 判断。
+_last_usage = None           # 归一化 usage：{"prompt_tokens","completion_tokens","total_tokens","cached_tokens"}
+_last_usage_ctx_bytes = 0    # 该次请求发送时 messages 的 JSON 字节数
+
+
+def _parse_token_count(raw, fallback):
+    """把配置里的 token 数量解析成正整数，支持 k / m 单位（大小写不限、空格与逗号忽略）。
+
+    可接受的写法：
+        1000000     "1000000"     "1m"      "1 M"      "1.5m"
+        700000      "700k"        " 700 K "  "1500K"   "1,000,000"
+    空白（含全角空格）、下划线、千分位逗号一律忽略；k = 1000，m = 1000000，
+    因此 "1500K" 与 "1.5m" 等价，都是 1500000。不带单位则视为绝对数值。
+    其余情况（空值、文本、0 / 负数、inf / nan 等）一律返回 fallback。
+    """
+    if raw is None or isinstance(raw, bool):
+        return fallback
+
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        text = str(raw).strip().lower()
+        # 去掉所有空白字符（含全角空格）、下划线和千分位逗号：" 1.5 M " -> "1.5m"
+        text = "".join(text.split()).replace("_", "").replace(",", "")
+        if not text:
+            return fallback
+        multiplier = 1.0
+        if text.endswith("k"):
+            multiplier, text = 1_000.0, text[:-1]
+        elif text.endswith("m"):
+            multiplier, text = 1_000_000.0, text[:-1]
+        try:
+            value = float(text) * multiplier
+        except ValueError:
+            return fallback
+
+    try:
+        value = int(value)  # inf / nan / 超范围会在这里抛异常
+    except (ValueError, OverflowError):
+        return fallback
+    return value if value > 0 else fallback
+
+
+def _parse_size_bytes(raw, fallback_bytes):
+    """把配置里的「字节数」解析成正整数，支持 k / kb、m / mb 单位（大小写与空格不限）。
+
+    可接受的写法：
+        5242880     "5242880"     "5m"      "5 MB"     "5120KB"    "1,048,576"
+    不带单位时按「字节」算；带单位时 k / kb = 1024，m / mb = 1024×1024
+    （采用二进制的 1024 进位，与文件管理器里的显示口径一致）。
+    其余情况（空值、文本、0 / 负数、inf / nan 等）一律返回 fallback_bytes。
+    """
+    if raw is None or isinstance(raw, bool):
+        return fallback_bytes
+
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    else:
+        text = "".join(str(raw).strip().lower().split()).replace("_", "").replace(",", "")
+        if not text:
+            return fallback_bytes
+        # 先匹配两字母后缀再匹配单字母，避免 "kb" 被当成 "k" + 尾巴 "b"
+        multiplier = 1.0
+        if text.endswith("kb"):
+            multiplier, text = 1024.0, text[:-2]
+        elif text.endswith("mb"):
+            multiplier, text = 1024.0 * 1024, text[:-2]
+        elif text.endswith("k"):
+            multiplier, text = 1024.0, text[:-1]
+        elif text.endswith("m"):
+            multiplier, text = 1024.0 * 1024, text[:-1]
+        try:
+            value = float(text) * multiplier
+        except ValueError:
+            return fallback_bytes
+
+    try:
+        value = int(value)  # inf / nan / 超范围会在这里抛异常
+    except (ValueError, OverflowError):
+        return fallback_bytes
+    return value if value > 0 else fallback_bytes
+
+
+def _refresh_context_limits():
+    """从 ai_agent_config.json 读取上下文 / 压缩阈值（token），刷新全局变量。
+
+    对应配置项（缺失或非法时保持当前默认值）：
+      context_limit_tokens  当前模型最大上下文 token 数
+      auto_compress_tokens  达到多少 token 触发「无人值守压缩」
+      llm_compress_tokens   达到多少 token 触发「大模型压缩」
+
+    三者都支持 k / m 单位，例如 1000000 / "1m" / "1 M" / "700k" 均可。
+    """
+    global CONTEXT_LIMIT, AUTO_COMPRESS_THRESHOLD, LLM_COMPRESS_THRESHOLD
+    try:
+        cfg = load_config()
+    except Exception:
+        return
+
+    def _pick(key, current):
+        return _parse_token_count(cfg.get(key, current), current)
+
+    CONTEXT_LIMIT = _pick("context_limit_tokens", CONTEXT_LIMIT)
+    AUTO_COMPRESS_THRESHOLD = _pick("auto_compress_tokens", AUTO_COMPRESS_THRESHOLD)
+    LLM_COMPRESS_THRESHOLD = _pick("llm_compress_tokens", LLM_COMPRESS_THRESHOLD)
+
+
+def _record_main_usage(usage, sent_messages):
+    """记录主模型本次调用的真实用量（子 Agent / 辅助模型调用不记录）。"""
+    global _last_usage, _last_usage_ctx_bytes
+    if not usage:
+        return
+    _last_usage = usage
+    _last_usage_ctx_bytes = get_context_size(sent_messages)
+
+
+def get_context_tokens(msg_list=None):
+    """当前上下文的 token 数（尽量取真实值）。
+
+    - 有 API usage 时：以最近一次请求的 prompt_tokens / 请求字节数为比例，
+      按当前 messages 的字节数换算（每次 API 返回都会自我校正）；
+    - 没有 usage 时：退回粗略估算（约 4 字节 / token）。
+    """
+    if msg_list is None:
+        msg_list = messages
+    cur_bytes = get_context_size(msg_list)
+    if _last_usage and _last_usage_ctx_bytes > 0:
+        pt = _last_usage.get("prompt_tokens") or 0
+        if pt > 0:
+            return int(cur_bytes * pt / _last_usage_ctx_bytes)
+    return cur_bytes // 4
+
+
+def format_usage_line():
+    """一行式用量摘要：真实 token 数与 JSON 字节数对照。"""
+    cur_bytes = get_context_size(messages)
+    tok = get_context_tokens(messages)
+    limit = CONTEXT_LIMIT or 0
+    pct = round(tok / limit * 100, 1) if limit else 0.0
+    bpt = (cur_bytes / tok) if tok else 0.0
+    kb = cur_bytes / 1024
+    approx = "" if _last_usage else "≈"
+    segs = [f"上下文 {approx}{tok:,} tok / {limit:,}（{pct}%）"]
+    if _last_usage:
+        c = _last_usage.get("completion_tokens", 0)
+        t = _last_usage.get("total_tokens", tok + c) or (tok + c)
+        seg = f"本次输出 {c:,} tok（合计 {t:,}）"
+        cached = _last_usage.get("cached_tokens") or 0
+        if cached:
+            seg += f"，缓存命中 {cached:,}"
+        segs.append(seg)
+    segs.append(f"字节 {cur_bytes:,} B（{kb:.1f} KB）")
+    segs.append(f"约 {bpt:.2f} B/tok")
+    return "📊 " + " ｜ ".join(segs)
+
+
+def print_usage():
+    """在每次大模型回复后追加一行 token / 字节用量，直观展示两者对照。"""
+    try:
+        print("   " + format_usage_line(), flush=True)
+    except Exception:
+        pass  # 用量展示失败绝不拖累主流程
 
 
 # def get_context_aware_messages(msg_list):
@@ -711,6 +901,11 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None, gua
                 _main_model_no_multimodal 标记；
         False → 子 Agent（辅助模型）调用：HTTP 400 直接抛异常交给上层处理，
                 不做剥离、不触碰全局标记，避免辅助模型的失败污染主模型判定。
+
+    返回值：(msg, reasoning_content, usage)
+        usage 为归一化的 token 用量 dict：
+        {"prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens"}；
+        接口未返回 usage 时为 None。
     """
     if config_override is not None:
         config = config_override
@@ -724,10 +919,14 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None, gua
 
     try:
         if protocol == "anthropic":
-            result = _call_anthropic_api(config, messages, tools, allow_retry=True, guard_multimodal=guard_multimodal)
+            msg, reasoning_content, usage = _call_anthropic_api(config, messages, tools, allow_retry=True, guard_multimodal=guard_multimodal)
         else:
-            result = _call_openai_api(config, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
-        return result
+            msg, reasoning_content, usage = _call_openai_api(config, messages, tools, tool_choice, guard_multimodal=guard_multimodal)
+        # 仅主模型调用（config_override 为空）才记录用量，供上下文统计与阈值判断使用；
+        # 子 Agent / 辅助模型调用不会污染主上下文的口径。
+        if config_override is None:
+            _record_main_usage(usage, messages)
+        return msg, reasoning_content, usage
     except UserInterrupt:
         # 用户按 Ctrl+C 中断，不保存错误快照，直接向上传播（主循环检测 interrupted）
         raise
@@ -778,6 +977,67 @@ def _strip_multimodal(msgs):
             modified = True
         i -= 1
     return modified
+
+
+def _as_int(v):
+    """尽量把 usage 字段转成 int，异常值一律当 0。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_openai_usage(u):
+    """把 OpenAI / DeepSeek 风格的 usage 归一化为统一结构（无则返回 None）。
+
+    OpenAI:  {"prompt_tokens", "completion_tokens", "total_tokens",
+              "prompt_tokens_details": {"cached_tokens"}}
+    DeepSeek:{"prompt_tokens", "completion_tokens", "total_tokens",
+              "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"}
+    """
+    if not isinstance(u, dict):
+        return None
+    prompt = u.get("prompt_tokens")
+    completion = u.get("completion_tokens")
+    total = u.get("total_tokens")
+    if prompt is None and completion is None and total is None:
+        return None
+    prompt = _as_int(prompt)
+    completion = _as_int(completion)
+    total = _as_int(total) if total is not None else prompt + completion
+    cached = u.get("prompt_cache_hit_tokens")
+    if cached is None:
+        details = u.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cached_tokens": _as_int(cached),
+    }
+
+
+def _extract_anthropic_usage(u):
+    """把 Anthropic 风格的 usage 归一化为统一结构（无则返回 None）。
+
+    Anthropic: {"input_tokens", "output_tokens",
+                "cache_read_input_tokens", "cache_creation_input_tokens"}
+    """
+    if not isinstance(u, dict):
+        return None
+    prompt = u.get("input_tokens")
+    completion = u.get("output_tokens")
+    if prompt is None and completion is None:
+        return None
+    prompt = _as_int(prompt)
+    completion = _as_int(completion)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "cached_tokens": _as_int(u.get("cache_read_input_tokens")),
+    }
 
 
 def _call_openai_api(config, messages, tools=None, tool_choice="auto", guard_multimodal=True):
@@ -871,7 +1131,10 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
     # 提取 reasoning_content（如果存在）
     reasoning_content = msg.get("reasoning_content")
 
-    return msg, reasoning_content
+    # 提取 token 用量（OpenAI / DeepSeek 等）
+    usage = _extract_openai_usage(result.get("usage"))
+
+    return msg, reasoning_content, usage
 
 
 def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_multimodal=True):
@@ -1316,7 +1579,10 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
     elif stop_reason == "tool_use":
         pass  # 有工具调用，已处理
 
-    return msg, reasoning_content
+    # 提取 token 用量（Anthropic：input_tokens / output_tokens）
+    usage = _extract_anthropic_usage(result.get("usage"))
+
+    return msg, reasoning_content, usage
 
 # ============================================================
 #  2. 工具定义 & 执行
@@ -1859,6 +2125,17 @@ def main():
     # 加载 API 配置（如果配置文件不存在或字段缺失，会提示用户输入）
     load_config()
 
+    # 用配置里的上下文 / 压缩阈值（token）覆盖默认值
+    _refresh_context_limits()
+    # 工具阈值（图片大小上限等）也一并从配置刷新
+    ai_agent_tools._refresh_tool_limits()
+    print(
+        f"   📊 上下文窗口 {CONTEXT_LIMIT:,} tok ｜ 无人值守压缩 {AUTO_COMPRESS_THRESHOLD:,} tok "
+        f"｜ 大模型压缩 {LLM_COMPRESS_THRESHOLD:,} tok ｜ "
+        f"图片上限 {ai_agent_tools.MAX_IMAGE_SIZE:,} 字节（{ai_agent_tools.MAX_IMAGE_SIZE / (1024 * 1024):g} MB）",
+        flush=True,
+    )
+
     # 初始化日志（以程序启动时间命名）
     init_logger()
 
@@ -2088,17 +2365,18 @@ def main():
         # ════════════════════════════════════════════════════════════
         # 智能预压缩：上下文超阈值时，先搁置用户输入，让 AI 压缩完再处理
         # ════════════════════════════════════════════════════════════
-        # 先检查当前上下文（不含用户新输入）是否超阈值
-        need_pre_compress = get_context_size(messages) > COMPRESS_THRESHOLD
+        # 先检查当前上下文（不含用户新输入）的 token 数是否超「大模型压缩」阈值
+        cur_tokens = get_context_tokens(messages)
+        need_pre_compress = cur_tokens > LLM_COMPRESS_THRESHOLD
 
         if need_pre_compress:
-            pct = round(get_context_size(messages) / CONTEXT_LIMIT * 100, 1)
-            print(f"   📊 上下文使用率 {pct}%，先让 AI 压缩再处理你的问题...", flush=True)
+            pct = round(cur_tokens / CONTEXT_LIMIT * 100, 1) if CONTEXT_LIMIT else 0.0
+            print(f"   📊 上下文 {cur_tokens:,} tok / {CONTEXT_LIMIT:,}（{pct}%），先让 AI 压缩再处理你的问题...", flush=True)
             # 追加压缩请求（不追加用户真实输入）
             messages.append({
                 "role": "user",
                 "content": (
-                    f"[上下文使用率：{pct}%（{get_context_size(messages)//1000}K / {CONTEXT_LIMIT//1000}K），"
+                    f"[上下文使用率：{pct}%（{cur_tokens:,} tok / {CONTEXT_LIMIT:,} tok），"
                     "对话历史较长，请先调用 compress 工具压缩历史对话以节省空间。"
                     "压缩时请保留 system prompt 和最近 2-3 轮完整对话，"
                     "更早的内容用一段摘要代替。"
@@ -2109,7 +2387,7 @@ def main():
             tool_executing = True
             try:
                 with spinner("✨ 正在预压缩上下文..."):
-                    msg, reasoning_content = call_api(messages, tools=ai_agent_tools.tools)
+                    msg, reasoning_content, _usage = call_api(messages, tools=ai_agent_tools.tools)
             except UserInterrupt:
                 # 用户按 Ctrl+C 中断，不当作 API 翻车；interrupted 已置 True，外层会清理并 continue
                 msg = None
@@ -2130,6 +2408,9 @@ def main():
 
             if content:
                 print_assistant(content)  # 大模型回复走 markdown 渲染（未启用时自动纯文本）
+
+            # 📊 预压缩这次调用的用量
+            print_usage()
 
             if tool_calls:
                 # 处理工具调用（预期是 compress）
@@ -2197,11 +2478,11 @@ def main():
                 if not interrupted:
                     _expire_large_content()
 
-                # 📦 无人值守自动压缩：工具循环中上下文超阈值时自动压缩中间的工具调用
-                if not interrupted and get_context_size(messages) > COMPRESS_THRESHOLD:
+                # 📦 无人值守自动压缩：工具循环中上下文 token 超阈值时自动压缩中间的工具调用
+                if not interrupted and get_context_tokens(messages) > AUTO_COMPRESS_THRESHOLD:
                     _squash_tool_calls_automatically(messages)
                     # 压缩后重新检查上下文，如果还是超阈值就继续压缩（最多再试一次）
-                    if get_context_size(messages) > COMPRESS_THRESHOLD:
+                    if get_context_tokens(messages) > AUTO_COMPRESS_THRESHOLD:
                         _squash_tool_calls_automatically(messages)
 
                 # 🛡 兜底防御：发送 API 前，修复可能残留的"孤立 tool_calls"
@@ -2220,7 +2501,7 @@ def main():
                     # api_messages = get_context_aware_messages(messages)
                     # msg, reasoning_content = call_api(api_messages, tools=tools)
                     with spinner("✨ 魔理沙思考中..."):
-                        msg, reasoning_content = call_api(messages, tools=ai_agent_tools.tools)
+                        msg, reasoning_content, _usage = call_api(messages, tools=ai_agent_tools.tools)
                 except UserInterrupt:
                     # 用户按 Ctrl+C 中断，立即退出工具循环（interrupted 已置 True）
                     break
@@ -2245,6 +2526,9 @@ def main():
                 # AI有话说的输出
                 if content:
                     print_assistant(content)  # 大模型回复走 markdown 渲染（未启用时自动纯文本）
+
+                # 📊 每次大模型回复后追加一行 token / 字节用量（一眼看出两者对照）
+                print_usage()
 
                 # 没有工具调用 → AI总结完毕，跳出内层循环
                 if not tool_calls:
