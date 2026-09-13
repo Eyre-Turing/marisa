@@ -238,13 +238,21 @@ Marisa 支持加载自定义技能（Skill）文件，让 Agent 获得特定领�
 marisa/
 ├── marisa                  # 启动脚本（Linux / Bash）
 ├── marisa.bat              # 启动脚本（Windows CMD）
-├── ai_agent_prompt.py      # AI Agent 核心逻辑
+├── ai_agent_prompt.py      # 主程序：配置 / API 调用 / 输入处理 / 对话主循环
+├── ai_agent_tools.py       # 工具层：工具定义与实现、MCP 注册、技能加载
 ├── ai_agent_config.json    # 大模型配置（自动生成）
 ├── mcp_manager.py          # MCP 服务管理
 ├── mcp_config.json         # MCP 服务配置
 ├── skills/                 # 技能知识库
 └── README.md               # 就是本文件啦 ✨
 ```
+
+### 🧩 两个核心模块
+
+- **`ai_agent_prompt.py`（主程序）**：负责配置读取、大模型 API 调用（OpenAI / Anthropic 协议）、终端输入输出、信号处理，以及最关键的工具调用主循环。
+- **`ai_agent_tools.py`（工具层）**：负责工具的 JSON schema 定义、各工具函数的具体实现（命令执行、文件读写、图片读取、后台任务、技能加载等）、工具名到函数的映射表 `tool_func_map`，以及 MCP 工具的动态注册。
+
+> 💡 工具函数有时需要访问主程序里的运行时状态（如全局对话历史 `messages`、中断标志 `interrupted`、子 Agent 调用 `call_api()` 等）。为此主程序启动时会把自己的模块对象通过 `ai_agent_tools.bind_runtime(...)` 注入，工具层再以 `_RT.<name>` 的形式访问这些共享状态——既避免了两个模块之间的循环导入，也保证了状态始终一致。
 
 ---
 
