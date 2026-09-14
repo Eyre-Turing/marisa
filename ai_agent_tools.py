@@ -1118,6 +1118,9 @@ def run_bash(command, timeout=10, force_use_bash=False):
             proc = subprocess.Popen(
                 bash_cmd,
                 shell=False,
+                # 🛡️ 关键修复：重定向 stdin，避免子进程继承终端、与 prompt_toolkit
+                #    共享/污染 Windows 控制台输入模式（导致 Ctrl+C / 方向键失灵）。
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 **extra_kwargs
@@ -1127,6 +1130,8 @@ def run_bash(command, timeout=10, force_use_bash=False):
             proc = subprocess.Popen(
                 command,
                 shell=True,
+                # 🛡️ 同上：切断子进程对终端的 stdin 继承，防止污染控制台模式。
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 **extra_kwargs
