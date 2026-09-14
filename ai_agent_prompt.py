@@ -6,6 +6,9 @@
 【输入架构：多路复用 + 分区渲染】
   · 主线程 = UI 线程：常驻键盘输入循环。用 prompt_toolkit 的 patch_stdout() 做分区渲染，
     输入框常驻底部，模型输出画在输入框上方 —— 输出时照样能打字，输入排队追加到后续。
+  · 输入框下方有一条状态栏（bottom_toolbar）：实时显示
+      💤 等待输入 / ✨ 思考中… / 🔧 执行工具：<工具名> / 📦 压缩上下文…
+    并在右侧展示上下文 token 用量 —— 一眼就能看出模型现在是在等你，还是在干活。
   · 后台线程 = agent 工作线程：从「输入总线」取事件，逐条驱动一轮对话。
   · 输入总线（io_bus.py，纯标准库）把 键盘 / socket / 管道(stdin) / 后台任务完成
     统一成一个事件队列：任意来源有输入，都会唤醒 agent（谁先来谁触发）。
@@ -509,6 +512,55 @@ UI_ANSI_OK = False
 # 当前的输入总线实例（由 main() 创建，供后台任务完成钩子投递事件）
 _input_bus = None
 
+# ---- 常驻输入模式下的「输入框下方状态栏」数据 ----
+# agent 工作线程写，主线程渲染时读。
+#   state  : idle(等待输入) / thinking(思考中) / tool(执行工具) / compress(压缩上下文)
+#   detail : 附加信息，例如正在执行的工具名
+#   usage  : 精简用量行（懒计算后缓存，状态栏只读不算，避免每次重绘都去序列化上下文）
+_status_lock = threading.Lock()
+_agent_status = {"state": "idle", "detail": "", "usage": ""}
+
+_STATUS_LABEL = {
+    "idle": "💤 等待输入",
+    "thinking": "✨ 思考中…",
+    "tool": "🔧 执行工具",
+    "compress": "📦 压缩上下文…",
+}
+
+
+def _set_agent_status(state, detail=""):
+    """更新 agent 运行状态（工作线程调用）。"""
+    with _status_lock:
+        _agent_status["state"] = state
+        _agent_status["detail"] = detail or ""
+
+
+def _set_usage(text):
+    """更新状态栏里的用量行（工作线程调用）。"""
+    with _status_lock:
+        _agent_status["usage"] = text or ""
+
+
+def _bottom_toolbar():
+    """prompt_toolkit 的 bottom_toolbar 回调：渲染「输入框下方」的状态栏。
+
+    这个回调运行在主线程的渲染循环里，会被频繁调用，
+    所以这里只做字符串拼接，绝不重复计算 token（用量走缓存）。
+    """
+    with _status_lock:
+        state = _agent_status["state"]
+        detail = _agent_status["detail"]
+        usage = _agent_status["usage"]
+
+    label = _STATUS_LABEL.get(state, state)
+    if detail:
+        label = f"{label}：{detail}"
+    text = f" {label}"
+    if usage:
+        text += f"   ｜   📊 {usage}"
+    text += " "
+    return [("class:bottom-toolbar", text)]
+
 
 def sigint_handler(signum, frame):
     """Ctrl+C 信号处理器"""
@@ -904,10 +956,51 @@ def format_usage_line():
     segs.append(f"约 {bpt:.2f} B/tok")
     return "📊 " + " ｜ ".join(segs)
 
+def _fmt_tok(n):
+    """把 token 数压成短格式（1_000_000 → 1M，700_000 → 700k），状态栏用。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:g}M"
+    if n >= 1_000:
+        return f"{n / 1_000:g}k"
+    return str(n)
+
+
+def format_usage_short():
+    """状态栏用的精简用量：上下文 tok / 上限（百分比）｜本次输出 tok。
+
+    跟 format_usage_line() 一样会做一次请求体序列化来估算 token，代价不低，
+    所以只在每次 API 返回后算一次并缓存进 _agent_status，状态栏渲染时直接读缓存。
+    """
+    msg_bytes = get_context_size(messages)
+    tools_bytes = get_tools_size()
+    cur_bytes = get_request_size(messages)
+    tok = _tokens_from_bytes(cur_bytes)
+    limit = CONTEXT_LIMIT or 0
+    pct = round(tok / limit * 100, 1) if limit else 0.0
+    approx = "" if _last_usage else "≈"
+    segs = [f"上下文 {approx}{tok:,} / {_fmt_tok(limit)} tok ({pct}%)"]
+    if _last_usage:
+        c = _last_usage.get("completion_tokens", 0)
+        segs.append(f"本次输出 {c:,} tok")
+    if tools_bytes:
+        segs.append(f"请求体 {(msg_bytes + tools_bytes) / 1024:.1f} KB")
+    return " ｜ ".join(segs)
+
 
 def print_usage():
-    """在每次大模型回复后追加一行 token / 字节用量，直观展示两者对照。"""
+    """展示 token / 字节用量。
+
+    · 普通模式：像以前一样，在大模型回复后追加打印一行完整用量
+    · 常驻输入模式（TUI）：不再往输出区刷屏，改为更新输入框下方状态栏的一行精简用量
+    """
     try:
+        if UI_PROMPT_ACTIVE:
+            _set_usage(format_usage_short())
+            return
         print("   " + format_usage_line(), flush=True)
     except Exception:
         pass  # 用量展示失败绝不拖累主流程
@@ -2569,6 +2662,7 @@ def main():
         print("🧙 魔理沙 (常驻输入框 · 分区渲染 prompt_toolkit)", flush=True)
         print("   📝 回车=换行  |  Alt+Enter(或Esc+Enter)=提交", flush=True)
         print("   ⚡ 模型输出时照样能打字 —— 输入会排队追加到后续，不会被输出干扰", flush=True)
+        print("   📊 输入框下方状态栏：💤等待输入 / ✨思考中 / 🔧执行工具 ＋ 上下文 token 用量", flush=True)
         print("   ❌ Ctrl+C 连按两次=退出  |  Ctrl+D=退出", flush=True)
         if not HAS_RICH:
             print("   🖋️ Markdown 渲染：关闭（未安装 rich）", flush=True)
@@ -2802,10 +2896,21 @@ def _run_ui_loop(bus, session, use_prompt_toolkit):
 
         if ctx is not None:
             UI_PROMPT_ACTIVE = True
+            # 先把上下文用量算一次填进状态栏（之后每次 API 返回会自动刷新）
+            try:
+                _set_usage(format_usage_short())
+            except Exception:
+                pass
             try:
                 while True:
                     try:
-                        text = session.prompt("我: ")
+                        # bottom_toolbar：在输入框下方画状态栏（当前状态 + 上下文用量）
+                        # refresh_interval：周期性自动重绘，让后台线程改的状态能及时显出来
+                        text = session.prompt(
+                            "我: ",
+                            bottom_toolbar=_bottom_toolbar,
+                            refresh_interval=0.3,
+                        )
                     except KeyboardInterrupt:
                         if not _handle_prompt_ctrl_c():
                             break
@@ -2846,9 +2951,14 @@ def _agent_worker(bus):
         # 每次回到用户输入时重置中断标志
         interrupted = False
 
+        # 💤 即将阻塞在 bus.get() 上 —— 状态栏显示「等待输入」
+        _set_agent_status("idle")
+
         # 📥 从输入总线阻塞取一条事件（多路复用：谁先来谁触发）
         try:
             event = bus.get()
+        except (KeyboardInterrupt, EOFError):
+            break
         except (KeyboardInterrupt, EOFError):
             break
         if event is None or event.text is io_bus.STOP:
@@ -2866,6 +2976,9 @@ def _agent_worker(bus):
 
         # 每次收到新的用户输入，刷新本轮的超时自动重试额度（最多 API_TIMEOUT_RETRY_MAX 次）
         _api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
+
+        # ✨ 开始干活 —— 状态栏切到「思考中」
+        _set_agent_status("thinking")
 
         # ════════════════════════════════════════════════════════════
         # 智能预压缩：上下文超阈值时，先搁置用户输入，让 AI 压缩完再处理
@@ -2890,6 +3003,7 @@ def _agent_worker(bus):
             })
             # 单次 API 调用：让 AI 调用 compress
             tool_executing = True
+            _set_agent_status("compress")
             try:
                 with spinner("✨ 正在预压缩上下文..."):
                     msg, reasoning_content, _usage = call_api(messages, tools=ai_agent_tools.tools)
@@ -2942,6 +3056,7 @@ def _agent_worker(bus):
                         })
                         continue
                     is_terminal = tool_name in TERMINAL_TOOLS
+                    _set_agent_status("tool", tool_name)
                     try:
                         tool_result = func(**args)
                     except (TypeError, Exception) as e:
@@ -3005,6 +3120,7 @@ def _agent_worker(bus):
                     # # 如果上下文超过阈值，会自动追加一条 system 提醒
                     # api_messages = get_context_aware_messages(messages)
                     # msg, reasoning_content = call_api(api_messages, tools=tools)
+                    _set_agent_status("thinking")
                     with spinner("✨ 魔理沙思考中..."):
                         msg, reasoning_content, _usage = call_api(messages, tools=ai_agent_tools.tools)
                 except UserInterrupt:
@@ -3144,9 +3260,14 @@ def _agent_worker(bus):
                     is_terminal = tool_name in TERMINAL_TOOLS  # 终止型（如 compress）
                     is_image = tool_name in IMAGE_TOOLS       # 图片型（如 read_image）
 
+                    # 🔧 状态栏显示正在执行哪个工具
+                    _set_agent_status("tool", tool_name)
+
                     # 🔧 try-except 容错：大模型传错参数名时把报错返回给它自己整改
                     try:
                         tool_result = func(**args)
+                    except (TypeError, Exception) as e:
+                        tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
                     except (TypeError, Exception) as e:
                         tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
                         print(f"\n⚠️ 工具 {tool_name} 调用失败: {e}\n", flush=True)
