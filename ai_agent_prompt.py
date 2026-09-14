@@ -2,15 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 兴趣使然的AI Agent —— 魔理沙风格
-使用 prompt_toolkit 支持多行输入！
+
+【输入架构：多路复用 + 分区渲染】
+  · 主线程 = UI 线程：常驻键盘输入循环。用 prompt_toolkit 的 patch_stdout() 做分区渲染，
+    输入框常驻底部，模型输出画在输入框上方 —— 输出时照样能打字，输入排队追加到后续。
+  · 后台线程 = agent 工作线程：从「输入总线」取事件，逐条驱动一轮对话。
+  · 输入总线（io_bus.py，纯标准库）把 键盘 / socket / 管道(stdin) / 后台任务完成
+    统一成一个事件队列：任意来源有输入，都会唤醒 agent（谁先来谁触发）。
+
+【零依赖也能跑】
+  一个第三方库都不装，只要 python3 即可运行：
+    · 多路复用能力完整保留（socket / 管道照常工作）
+    · 键盘输入自动退化为 input()（不再有常驻输入框，输出可能与输入行交织）
+    · Markdown 渲染自动关闭，退化为纯文本
+  装上 prompt_toolkit 可得常驻输入框 + 分区渲染，装上 rich 可得 Markdown 渲染。
 
 用法：
-  pip install prompt_toolkit
-  python ai_agent_prompt.py
+  python ai_agent_prompt.py                       # 直接跑（零依赖也可）
+  pip install prompt_toolkit rich                 # 可选增强
+  python ai_agent_prompt.py --no-prompt-toolkit   # 强制退化输入
+  python ai_agent_prompt.py -c ctx.log            # 指定上下文日志文件（续写）
 
-多行输入：回车换行，Alt+Enter（或 Esc+Enter）提交
-Ctrl+C 中断工具调用（回到对话），在输入时 Ctrl+C 退出
+多行输入：回车换行，Alt+Enter（或 Esc+Enter）提交；退化模式用单独一行 '.' 结束
+Ctrl+C 中断工具调用（回到对话）；空闲时连按两次 Ctrl+C 退出
 Ctrl+D 退出程序
+
+socket 输入源（可选）：在 ai_agent_config.json 的 input_sources.socket 里开启，
+  之后 `echo "帮我看看磁盘" | nc 127.0.0.1 8765` 就能从外部喂消息给 agent。
 """
 
 import os
@@ -38,6 +56,9 @@ try:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.layout import Dimension
     from prompt_toolkit.application import get_app
+    # patch_stdout：把「后台线程的输出」重定向成「输入框上方的输出」，
+    # 让输入框常驻底部、模型输出时照样能打字（B 档分区渲染的核心）
+    from prompt_toolkit.patch_stdout import patch_stdout
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
     PromptSession = None
@@ -45,6 +66,7 @@ except ImportError:
     KeyBindings = None
     Dimension = None
     get_app = None
+    patch_stdout = None
     HAS_PROMPT_TOOLKIT = False
 
 # rich 为可选依赖 —— 有则把「大模型自己说的话」渲染成终端 markdown 样式（表格/加粗/代码块），
@@ -201,6 +223,57 @@ def _md_render_blocks(content):
     return _RichGroup(*renderables)
 
 
+# ============================================================
+#  常驻输入模式（patch_stdout）下的 rich Console
+# ============================================================
+# 这里有个大坑，务必看清：
+#   patch_stdout() 在 raw=False（默认）时，底层 Output.write() 会把 ESC(\x1b)
+#   直接替换成 '?'，于是 rich 的颜色码就成了用户看到的 ?[1;36m 乱码；而 Win32Output
+#   这类后端本身就完全不解析 ANSI，写进去同样变乱码。
+#   所以：rich 能不能输出颜色，完全取决于 prompt_toolkit 当前用的是哪种输出后端。
+#     · Vt100 / Windows10 / ConEmu 后端 → ANSI 安全，开颜色（patch_stdout(raw=True)）
+#     · Win32Output 等             → 必须关颜色，只输出结构（表格/标题/列表）不带转义
+# 用一个「不带颜色的 Console」渲染时，rich 依然会画出表格框线、缩进和层级结构，
+# 只是没有颜色和加粗 —— 观感损失很小，但绝不会再出现乱码。
+_rich_console_ui = None          # 无颜色版（Win32 后端）
+_rich_console_ui_ansi = None     # 带 ANSI 版（Vt100 系后端）
+
+
+def _ui_console():
+    """懒创建「常驻输入模式」专用 rich Console（不可用返回 None）。
+
+    按 UI_ANSI_OK 选择带色 / 不带色两种实现，避免把 ANSI 塞给吃不下它的后端。
+    """
+    global _rich_console_ui, _rich_console_ui_ansi
+    if not HAS_RICH:
+        return None
+    if UI_ANSI_OK:
+        if _rich_console_ui_ansi is None:
+            try:
+                _rich_console_ui_ansi = _RichConsole(
+                    force_terminal=True, legacy_windows=False
+                )
+            except Exception:
+                _rich_console_ui_ansi = None
+        return _rich_console_ui_ansi
+    if _rich_console_ui is None:
+        try:
+            # color_system=None：一个转义序列都不吐，最安全
+            _rich_console_ui = _RichConsole(color_system=None, legacy_windows=False)
+        except Exception:
+            _rich_console_ui = None
+    return _rich_console_ui
+
+
+# 匹配 ANSI 转义序列（CSI / 两字符序列），用作最后一道保险丝
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def _strip_ansi(text):
+    """剥掉字符串里的 ANSI 转义序列（保险丝，防止任何漏网的转义码污染界面）。"""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
 def print_assistant(content, name="魔理沙"):
     """打印大模型回复：满足条件时走 markdown 渲染，否则退回纯文本缩进（与旧行为一致）。
 
@@ -210,15 +283,37 @@ def print_assistant(content, name="魔理沙"):
         return
     if USE_MARKDOWN and _rich_console is not None:
         try:
-            # 直接交给 rich 输出，绝不要 capture 成字符串再 print——
-            # capture 会把样式强制序列化成 ANSI 转义码，从而绕过 rich 的 Win32 控制台渲染路径，
-            # 在 legacy Windows 终端（mintty/winpty、老式 conhost）下就会显示成 ?[1;36m 之类的乱码。
-            _rich_console.print(f"[bold cyan]{name}:[/bold cyan]")
             if RICH_MD_TABLES:
                 body = _RichMarkdown(content, code_theme="monokai")
             else:
                 # 旧版 rich（如 Python 3.6 上的 12.x）不认 markdown 表格，用自带渲染器补齐
                 body = _md_render_blocks(content)
+
+            if UI_PROMPT_ACTIVE:
+                # 常驻输入模式：先整体渲染成字符串，再一次性写出。
+                # 这样 patch_stdout 收到的是一整块文本，输入框不会被 rich 的多次写操作撕成几截。
+                console = _ui_console()
+                if console is None:
+                    raise RuntimeError("常驻输入模式下 rich Console 不可用")
+                with console.capture() as cap:
+                    console.print(f"[bold cyan]{name}:[/bold cyan]")
+                    console.print(_RichPadding(body, (0, 0, 0, 4)))
+                text = cap.get()
+                if text:
+                    if not UI_ANSI_OK:
+                        # 保险丝：当前后端吃不下 ANSI（Win32Output）或 patch_stdout
+                        # 会把 ESC 换成 '?'，这里再剥一层，确保界面上绝不出现 ?[1;36m
+                        text = _strip_ansi(text)
+                    if not text.endswith("\n"):
+                        text += "\n"
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                return
+
+            # 直接交给 rich 输出，绝不要 capture 成字符串再 print——
+            # capture 会把样式强制序列化成 ANSI 转义码，从而绕过 rich 的 Win32 控制台渲染路径，
+            # 在 legacy Windows 终端（mintty/winpty、老式 conhost）下就会显示成 ?[1;36m 之类的乱码。
+            _rich_console.print(f"[bold cyan]{name}:[/bold cyan]")
             _rich_console.print(_RichPadding(body, (0, 0, 0, 4)))
             sys.stdout.flush()
             return
@@ -230,6 +325,9 @@ def print_assistant(content, name="魔理沙"):
 # MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
 # 通过 mcp_manager.py 统一管理 stdio/HTTP 模式的 MCP 服务器连接
 from mcp_manager import get_mcp_manager, load_mcp_config
+
+# 多路复用输入总线（纯标准库，零第三方依赖）——键盘 / socket / 管道 / 后台任务统一入口
+import io_bus
 
 # ============================================================
 #  工具模块 —— 工具定义、工具函数、MCP/Skills 已拆分到 ai_agent_tools.py
@@ -287,6 +385,19 @@ DEFAULT_CONFIG = {
     # 多模态辅助模型也有对应的透传出口（同样只在配置了 mul_* 后生效）
     "mul_extra_headers": {},
     "mul_extra_body": {},
+    # ---- 多路复用输入源配置 ----
+    # socket 输入源：开启后可用 nc / telnet / 任意 TCP 客户端把消息喂给 agent，
+    # 与键盘输入平级 —— 谁先来谁触发主循环。
+    # 协议：每行文本 = 一条消息；以 '!' 开头的行是控制指令（!exit 退出）；
+    #       auth_token 非空时，连接后第一行必须等于该 token。
+    "input_sources": {
+        "socket": {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 8765,
+            "auth_token": ""
+        }
+    },
 }
 
 _config_cache = None
@@ -380,10 +491,23 @@ EXIT_CONFIRM_SECONDS = 2.0
 API_TIMEOUT_RETRY_WAIT = 10      # 每次重试前等待（秒）
 API_TIMEOUT_RETRY_MAX = 10       # 每条用户输入最多自动重试次数
 _api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
-
 # 是否为 input() 退化模式（prompt_toolkit 不可用或被 --no-prompt-toolkit 强制禁用时置 True）。
 # 用于 sigint_handler 区分 Ctrl+C 的处理方式。
 USE_INPUT_MODE = False
+
+# ---- 多路复用输入相关全局 ----
+# 是否处于「常驻输入模式」：主线程在 patch_stdout 下跑 prompt_toolkit 输入循环，
+# agent 跑在后台线程。此标志为 True 时：
+#   ① 输出统一走被 patch_stdout 接管的 sys.stdout，画到输入框上方；
+#   ② 转圈动画（写 stderr）停用，避免撕坏输入框。
+UI_PROMPT_ACTIVE = False
+# 常驻输入模式下，prompt_toolkit 的输出后端能否安全承载原生 ANSI 转义。
+#   True （Vt100 / Windows10 / ConEmu）→ rich 可以上色，patch_stdout(raw=True)
+#   False（Win32Output / PlainTextOutput 等）→ 必须关颜色，否则界面出现 ?[1;36m 乱码
+# 由 _run_ui_loop() 在启动时用 _pt_can_use_ansi() 探测后写入。
+UI_ANSI_OK = False
+# 当前的输入总线实例（由 main() 创建，供后台任务完成钩子投递事件）
+_input_bus = None
 
 
 def sigint_handler(signum, frame):
@@ -917,6 +1041,10 @@ class _Spinner:
         self._stream = sys.stderr
 
     def __enter__(self):
+        # 常驻输入模式（patch_stdout）下禁用转圈动画：
+        # 转圈写的是 stderr 上的 '\r'，会把 prompt_toolkit 画好的输入框撕掉
+        if UI_PROMPT_ACTIVE:
+            return self
         if not (sys.stdin.isatty() and sys.stderr.isatty()):
             return self
         self._stop.clear()
@@ -2438,9 +2566,10 @@ def main():
     USE_MARKDOWN = bool(HAS_RICH and use_prompt_toolkit and not args.no_markdown)
 
     if use_prompt_toolkit:
-        print("🧙 魔理沙 (多行输入模式 prompt_toolkit)", flush=True)
+        print("🧙 魔理沙 (常驻输入框 · 分区渲染 prompt_toolkit)", flush=True)
         print("   📝 回车=换行  |  Alt+Enter(或Esc+Enter)=提交", flush=True)
-        print("   ❌ Ctrl+C=退出  |  Ctrl+D=退出", flush=True)
+        print("   ⚡ 模型输出时照样能打字 —— 输入会排队追加到后续，不会被输出干扰", flush=True)
+        print("   ❌ Ctrl+C 连按两次=退出  |  Ctrl+D=退出", flush=True)
         if not HAS_RICH:
             print("   🖋️ Markdown 渲染：关闭（未安装 rich）", flush=True)
         elif args.no_markdown:
@@ -2457,6 +2586,8 @@ def main():
             reason = "已按 --no-prompt-toolkit 强制退化"
         print("🧙 魔理沙 (多行输入模式 input)", flush=True)
         print(f"   ⚠️  检测到：{reason}", flush=True)
+        if not pipe_mode:
+            print("   ℹ️  未启用分区渲染：输出可能与输入行交织（装上 prompt_toolkit 即可获得常驻输入框）", flush=True)
         if pipe_mode:
             print("   📤 流式读取标准输入：每收到一条以 '.' 行结尾（或管道关闭时）的消息就回答一次，直到 EOF 自动退出\n", flush=True)
         else:
@@ -2466,11 +2597,247 @@ def main():
     # 创建输入会话（prompt_toolkit 模式返回 session；input 模式返回 None）
     session = create_prompt_session() if use_prompt_toolkit else None
 
-    # 说明：管道/重定向模式（stdin 非 TTY）不再预读全部 stdin。
-    # 原先用 sys.stdin.read() 一次读满会一直阻塞等 EOF——对 tail -f 这类流式
-    # 输入永远等不到管道关闭，导致用户等不到应答。现改为与退化 input 一致的
-    # 流式逐条读取：每收到一条以 '.' 结尾（或以 EOF 结束）的消息就回答一次。
-    # 由主循环中的 read_multiline_input 统一处理流式读取，读到 EOF 时自动退出。
+    # ══════════════════════════════════════════════════════════════
+    #  多路复用输入总线 —— 键盘 / socket / 管道 / 后台任务 统一入口
+    #    · 主线程 = UI 线程：常驻键盘输入循环（prompt_toolkit + patch_stdout 分区渲染）
+    #    · 后台线程 = agent 工作线程：从总线取事件，逐条驱动一轮对话
+    #    · 任意来源有输入都会唤醒 agent 工作线程（谁先来谁触发）
+    #    · 没有 prompt_toolkit 时退化为 input()：多路复用能力不减，只是没有分区渲染
+    # ══════════════════════════════════════════════════════════════
+    global _input_bus
+    _input_bus = io_bus.InputBus()
+    _register_input_sources(_input_bus, pipe_mode)
+    _input_bus.start()
+    # 后台任务完成 → 投递到输入总线（真正异步唤醒 agent，而不是等用户下次输入）
+    ai_agent_tools.set_bg_event_hook(_bg_event_hook)
+
+    worker = threading.Thread(
+        target=_agent_worker, args=(_input_bus,), name="marisa-agent", daemon=True
+    )
+    worker.start()
+
+    if pipe_mode:
+        # 管道 / 重定向：stdin 已由 StdinPipeSource 线程流式读取，读到 EOF 时投递 STOP
+        worker.join()
+    else:
+        # 交互模式：主线程跑常驻键盘输入循环，直到用户要求退出
+        _run_ui_loop(_input_bus, session, use_prompt_toolkit)
+        _input_bus.put_stop()
+        worker.join(timeout=30)
+
+    # ----- 程序退出时清理 MCP 连接 -----
+    ai_agent_tools._cleanup_mcp_tools()
+
+
+def _bg_event_hook(task_id):
+    """后台任务完成钩子：把「任务已结束」转成一条输入事件投递到输入总线。
+
+    这样后台任务完成可以真正「异步唤醒」agent，而不是像以前那样只在
+    用户下次敲回车时才被顺带发现。
+    """
+    bus = _input_bus
+    if bus is None:
+        return
+    try:
+        text = ai_agent_tools._bg_build_event_message()
+    except Exception:
+        return
+    if text is None:
+        return
+    bus.put(text, io_bus.SRC_BACKGROUND)
+
+
+def _register_input_sources(bus, pipe_mode):
+    """按配置把「后台输入源」挂到总线上（键盘源由主线程 UI 循环负责）。"""
+    # ① 管道 / 重定向：stdin 流式逐条读取
+    if pipe_mode:
+        bus.add_source(io_bus.StdinPipeSource())
+
+    # ② socket 输入源（可选；在 ai_agent_config.json 的 input_sources.socket 里开启）
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    sock_cfg = (cfg.get("input_sources") or {}).get("socket") or {}
+    if sock_cfg.get("enabled"):
+        host = sock_cfg.get("host") or "127.0.0.1"
+        token = sock_cfg.get("auth_token") or ""
+        try:
+            port = int(sock_cfg.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if port > 0:
+            bus.add_source(io_bus.SocketSource(host=host, port=port, auth_token=token))
+        else:
+            print("   ⚠️ input_sources.socket 已启用但 port 无效，已跳过", flush=True)
+
+
+
+def _pt_can_use_ansi():
+    """prompt_toolkit 当前输出后端能否安全承载原生 ANSI 转义序列。
+
+    为什么需要判断：
+      · patch_stdout() 默认 raw=False，底层 Vt100_Output.write() 会把 ESC(\x1b)
+        直接替换成 '?'  →  rich 的颜色码就变成 ?[1;36m 乱码（用户实际看到的）
+      · Win32Output 走 Win32 控制台 API，根本不解析 ANSI → 同样变乱码
+
+    判定方式（比 isinstance 白名单更耐版本变化）：
+      · Vt100_Output                → ANSI 安全
+      · Windows10_Output / ConEmuOutput → 内部持有 vt100_output，flush 时开 VT → ANSI 安全
+      · Win32Output / PlainTextOutput / DummyOutput → 不安全
+    """
+    try:
+        from prompt_toolkit.application import get_app_session
+        from prompt_toolkit.output.vt100 import Vt100_Output
+
+        out = get_app_session().output
+        if isinstance(out, Vt100_Output):
+            return True
+        # 用 __dict__ 取值，避免触发包装类 __getattr__ 的无限递归
+        inner = getattr(out, "__dict__", {}).get("vt100_output")
+        return isinstance(inner, Vt100_Output)
+    except Exception:
+        return False
+
+
+def _pt_output_name():
+    """当前 prompt_toolkit 输出后端的类名（仅用于启动时诊断打印）。"""
+    try:
+        from prompt_toolkit.application import get_app_session
+
+        return type(get_app_session().output).__name__
+    except Exception:
+        return "未知"
+
+
+def _handle_prompt_ctrl_c():
+    """在输入处按下 Ctrl+C 的统一处理。返回 True 继续，False 退出。
+
+    与改造前语义保持一致：
+      · agent 正在后台跑 → 只中断它，不退出程序
+      · 空闲时 → 2 秒内连按两次才退出（仿 Claude）
+    """
+    global interrupted
+    if tool_executing:
+        interrupted = True
+        print("\n⚠️  中断魔法吟唱！回到对话模式...\n", flush=True)
+        return True
+    now = time.time()
+    if now - _ctrl_c_state["ts"] < EXIT_CONFIRM_SECONDS:
+        return False
+    _ctrl_c_state["ts"] = now
+    print("\n⚠️ 再按一次 Ctrl+C 退出（2 秒内）\n", flush=True)
+    return True
+
+
+def _run_ui_loop(bus, session, use_prompt_toolkit):
+    """主线程 UI：常驻键盘输入循环。函数返回即代表用户要求退出。
+
+    · prompt_toolkit 模式：用 patch_stdout() 把 agent 的输出「画到输入框上方」，
+      输入框常驻底部；模型输出时照样能打字，打的内容会排队追加到后续输入。
+    · 退化模式：input() 逐行读取，功能完全一致，只是输出可能与输入行交织。
+    """
+    global UI_PROMPT_ACTIVE
+
+    def _submit(text):
+        """投递一条键盘输入。返回 True 继续循环，False 表示该退出了。"""
+        if text is None:
+            return False
+        if not text.strip():
+            return True
+        if text.strip().lower() in ("exit", "quit"):
+            return False
+        bus.put(text, io_bus.SRC_KEYBOARD)
+        return True
+
+    def _degraded_loop():
+        """退化模式：纯 input() 逐行读取（没有分区渲染，但输入输出依然互不阻塞）。"""
+        while True:
+            try:
+                text = read_multiline_input("我: ")
+            except KeyboardInterrupt:
+                if not _handle_prompt_ctrl_c():
+                    break
+                continue
+            except EOFError:
+                print("\n👋 再见！DA☆ZE！\n", flush=True)
+                break
+            if not _submit(text):
+                print("\n👋 再见！DA☆ZE！\n", flush=True)
+                break
+
+    if use_prompt_toolkit and session is not None and patch_stdout is not None:
+        # 先探测输出后端能不能吃下 ANSI —— 这决定了 rich 是否上色、patch_stdout 的 raw 开关。
+        global UI_ANSI_OK
+        UI_ANSI_OK = _pt_can_use_ansi()
+        print(
+            f"   🖥️ 终端渲染后端：{_pt_output_name()}"
+            f"（ANSI {'支持' if UI_ANSI_OK else '不支持'}）",
+            flush=True,
+        )
+        if not UI_ANSI_OK:
+            print(
+                "   ℹ️ 该后端无法解析 ANSI，Markdown 将以无颜色方式渲染"
+                "（表格 / 标题 / 列表结构保留）",
+                flush=True,
+            )
+
+        # patch_stdout() 会在构造时就探测终端输出能力（某些终端如未走 winpty 的
+        # mintty 会直接抛 NoConsoleScreenBufferError）。这里必须容错：
+        # 分区渲染不可用就退回普通输入，绝不因此让整个程序崩掉。
+        ctx = None
+        try:
+            # raw=True：让 ANSI 原样穿过，交给 Vt100 系后端渲染颜色；
+            # raw=False（默认）会把 ESC 替换成 '?'，正是 ?[1;36m 乱码的来源。
+            ctx = patch_stdout(raw=UI_ANSI_OK)
+            ctx.__enter__()
+        except Exception as e:
+            print(f"   ⚠️ 分区渲染不可用，退化为普通输入模式：{e}", flush=True)
+            try:
+                if ctx is not None:
+                    ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            ctx = None
+
+        if ctx is not None:
+            UI_PROMPT_ACTIVE = True
+            try:
+                while True:
+                    try:
+                        text = session.prompt("我: ")
+                    except KeyboardInterrupt:
+                        if not _handle_prompt_ctrl_c():
+                            break
+                        continue
+                    except EOFError:
+                        print("\n👋 再见！DA☆ZE！\n", flush=True)
+                        break
+                    if not _submit(text):
+                        print("\n👋 再见！DA☆ZE！\n", flush=True)
+                        break
+            except Exception as e:
+                # 输入会话本身崩了（终端能力不支持等）→ 退回退化模式，保住可用性
+                print(f"\n⚠️ 常驻输入框异常，退化为普通输入模式：{e}\n", flush=True)
+            finally:
+                UI_PROMPT_ACTIVE = False
+                try:
+                    ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+            return
+
+    # ---- 退化模式 ----
+    _degraded_loop()
+
+def _agent_worker(bus):
+    """Agent 工作线程：从输入总线取事件，驱动一轮又一轮对话。
+
+    任一输入源（键盘 / socket / 管道 / 后台任务通知）有输入都会唤醒本循环。
+    输出统一走 print / rich，由主线程的 patch_stdout 渲染到输入框上方。
+    """
+    global tool_executing, interrupted, messages
+    global _main_model_no_multimodal, _api_timeout_retry_remaining
 
     while True:
         # 每次外层循环开始时，执行大内容过期检查
@@ -2479,55 +2846,22 @@ def main():
         # 每次回到用户输入时重置中断标志
         interrupted = False
 
-        # 🔔 后台任务完成事件泵：有完成事件时优先自动处理（不等待用户输入）
-        # 后台任务结束 → 注入一条 user 通知消息 → 走正常处理流程让模型汇报/继续
-        bg_ev_text = None
-        if not interrupted:
-            bg_ev_text = ai_agent_tools._bg_build_event_message()
-        if bg_ev_text is not None:
-            print("   🔔 后台任务已结束，自动汇报...\n", flush=True)
-            user_input = bg_ev_text
-        else:
-            try:
-                if pipe_mode:
-                    # 管道/重定向模式：与退化 input 一致，流式逐条读取。
-                    # 每收到一条以 '.' 结尾（或以 EOF 结束）的消息就返回一段，
-                    # 由主循环回答一次后继续读下一条，直到 EOF 自动退出。
-                    user_input = read_multiline_input("")
-                elif use_prompt_toolkit:
-                    # 使用 prompt_toolkit 的多行输入
-                    user_input = session.prompt("我: ")
-                else:
-                    # 退化版 input() 多行输入（单行 '.' 结束）
-                    user_input = read_multiline_input("我: ")
-            except KeyboardInterrupt:
-                # Ctrl+C 在输入时引发 KeyboardInterrupt —— 仿照 Claude：按一次提示、连按两次才退出
-                now = time.time()
-                if now - _ctrl_c_state["ts"] < EXIT_CONFIRM_SECONDS:
-                    # 2 秒内的第二次 Ctrl+C → 真正退出
-                    print("\n👋 再见！DA⭐ZE！\n", flush=True)
-                    break
-                # 第一次（或间隔太久）的 Ctrl+C → 只提示，不退出，继续输入
-                _ctrl_c_state["ts"] = now
-                print("\n⚠️ 再按一次 Ctrl+C 退出（2 秒内）\n", flush=True)
-                continue
-            except EOFError:
-                # Ctrl+D 也可能引发 EOFError（取决于配置）
-                print("\n👋 再见！DA⭐ZE！\n", flush=True)
-                break
-
-        # 如果 Ctrl+D 导致返回 None，也退出
+        # 📥 从输入总线阻塞取一条事件（多路复用：谁先来谁触发）
+        try:
+            event = bus.get()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if event is None or event.text is io_bus.STOP:
+            break
+        user_input = event.text
         if user_input is None:
-            print("\n👋 再见！DA⭐ZE！\n", flush=True)
             break
 
-        if user_input.lower() in ("exit", "quit"):
-            break
+        if event.source != io_bus.SRC_KEYBOARD:
+            print(f"   📨 收到来自 [{event.source}] 的输入\n", flush=True)
 
         if not user_input.strip():
-            # 输入为空（只输入了逗结尾或空格）：与退化 input 一致，跳过继续读下一条。
-            # 管道模式也不在此退出——流式输入可能只是中间一条空消息，真正的终止由
-            # EOF（管道关闭）触发，届时 read_multiline_input 会抛 EOFError 由外层捕获退出。
+            # 空输入：跳过，继续等下一条（与改造前一致）
             continue
 
         # 每次收到新的用户输入，刷新本轮的超时自动重试额度（最多 API_TIMEOUT_RETRY_MAX 次）
@@ -3121,8 +3455,7 @@ def main():
         finally:
             tool_executing = False
 
-    # ----- 程序退出时清理 MCP 连接 -----
-    ai_agent_tools._cleanup_mcp_tools()
+    # 走到这里说明 worker 收到了 STOP 哨兵 —— 退出与资源清理统一由主线程负责
 
 
 if __name__ == "__main__":

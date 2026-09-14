@@ -1369,6 +1369,15 @@ _bg_tasks = {}                 # task_id -> task_info dict
 _bg_task_seq = 0               # 递增任务 id
 _bg_completed = queue.Queue()  # 已完成/失败/被杀 的 task_id 通知队列
 _bg_lock = threading.Lock()
+# 后台任务完成事件钩子（由主程序注入：把通知投递到多路复用输入总线）。
+# 不注册时行为与改造前完全一致 —— 通知只进 _bg_completed 队列，由主循环轮询取走。
+_bg_event_hook = None
+
+
+def set_bg_event_hook(fn):
+    """注册「后台任务完成」钩子。传入 None 可取消注册。"""
+    global _bg_event_hook
+    _bg_event_hook = fn
 # 本 agent 专属的日志目录（懒创建）。用 tempfile.TemporaryDirectory（mkdtemp）：
 # ① 目录名带随机后缀，OS 原子创建 → 多 agent 各自独立目录，task_id 从 1 计数也不会撞文件；
 # ② agent 退出时 cleanup() 自动删除整个目录 → 不留垃圾日志。
@@ -1403,6 +1412,14 @@ def _bg_notify(task_id):
             return
         info["notified"] = True
         _bg_completed.put(task_id)
+    # 锁外调用钩子：主程序借此把「后台任务完成」投递到多路复用输入总线，
+    # 让 agent 能被真正异步唤醒（而不是等用户下一次输入时才顺带发现）
+    hook = _bg_event_hook
+    if hook is not None:
+        try:
+            hook(task_id)
+        except Exception:
+            pass
 
 
 def _bg_log_path(task_id, kind):
