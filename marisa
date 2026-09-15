@@ -11,12 +11,25 @@ export PYTHONUTF8=1
 export PYTHONUNBUFFERED=1
 
 # 检测 Python
+# 坑：Windows 的「应用执行别名」（App Execution Aliases）会把 python3 / python
+# 指向微软商店的 stub —— 用 type/where 探测得到，但一执行就弹商店，而不是跑 Python。
+# 所以这里不能只看命令是否存在，而要实际跑一次 --version：
+# 只有能正常输出「Python 3.x」的候选才会被采用（stub 只会输出
+# "Python was not found..." 之类的提示，匹配不上）。
+_python_ok() {
+    type "$1" >/dev/null 2>&1 || return 1
+    "$1" --version 2>&1 | grep -q -E '^Python 3\.'
+}
+
 _PYTHON=""
-if type python3 >/dev/null 2>&1; then
-    _PYTHON="python3"
-elif type python >/dev/null 2>&1; then
-    _PYTHON="python"
-else
+for _cand in python3 python py; do
+    if _python_ok "$_cand"; then
+        _PYTHON="$_cand"
+        break
+    fi
+done
+
+if [ -z "$_PYTHON" ]; then
     echo "DA☆ZE☆！既没找到 python3 也没找到 python，这可没法施法了！"
     exit 1
 fi
