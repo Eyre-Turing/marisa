@@ -2025,6 +2025,125 @@ def _resume_from_log(log_path):
 
 
 # ============================================================
+#  已加载上下文的终端回放 —— 供 -r / -c 恢复会话后回顾
+# ============================================================
+
+# 回放时单条消息最多显示的字符数（超出截断，避免一加载长会话就刷屏）
+CONTEXT_REPLAY_MAX_CHARS = 1200
+# 回放时单条工具结果最多显示的字符数（工具输出通常很长，截得更狠）
+CONTEXT_REPLAY_TOOL_MAX_CHARS = 200
+
+
+def _content_to_text(content):
+    """把消息 content 归一成可显示的文本。
+
+    - str            → 原样返回
+    - list（多模态）→ 拼接各 text 段，并统计图片数量
+    - None / 其他    → 空串 / 字符串
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        n_img = 0
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "text":
+                texts.append(item.get("text", ""))
+            elif itype in ("image_url", "image", "input_image"):
+                n_img += 1
+        out = "\n".join(t for t in texts if t)
+        if n_img:
+            out += (f"\n[{n_img} 张图片]" if out else f"[{n_img} 张图片]")
+        return out
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _clip_text(text, limit):
+    """按字符数截断过长文本，并在末尾附上省略提示。"""
+    text = (text or "").rstrip()
+    if limit and len(text) > limit:
+        return text[:limit] + f"\n…（已省略 {len(text) - limit} 字，共 {len(text)} 字）"
+    return text
+
+
+def _indent_text(text, prefix="    "):
+    """给多行文本统一加缩进前缀。"""
+    return prefix + (text or "").replace("\n", "\n" + prefix)
+
+
+def _replay_loaded_context(msg_list, source=""):
+    """把 -r / -c 恢复出来的历史上下文回放到终端。
+
+    只回放对话部分（跳过 system 提示词）；单条内容过长时截断，
+    避免加载一个长会话时把屏幕刷爆。
+    """
+    try:
+        if not msg_list:
+            return
+        body = [
+            m for m in msg_list
+            if isinstance(m, dict) and m.get("role") != "system"
+        ]
+        n_sys = len(msg_list) - len(body)
+
+        title = "已加载的会话上下文"
+        if source:
+            title += f" · {source}"
+        print(f"\n{'━' * 3} {title} {'━' * 3}", flush=True)
+        tail = f"（已跳过 {n_sys} 条 system 提示词）" if n_sys else ""
+        print(f"   共 {len(body)} 条对话消息{tail}", flush=True)
+
+        if not body:
+            print("   （没有可回放的对话内容）", flush=True)
+            print(f"{'━' * 3} 回放结束 {'━' * 3}\n", flush=True)
+            return
+
+        for m in body:
+            role = m.get("role")
+            if role == "user":
+                text = _content_to_text(m.get("content"))
+                print("\n👤 我:", flush=True)
+                print(_indent_text(_clip_text(text, CONTEXT_REPLAY_MAX_CHARS)), flush=True)
+            elif role == "assistant":
+                text = _content_to_text(m.get("content"))
+                if text.strip():
+                    print(flush=True)
+                    print_assistant(_clip_text(text, CONTEXT_REPLAY_MAX_CHARS))
+                for tc in (m.get("tool_calls") or []):
+                    fn = ""
+                    if isinstance(tc, dict):
+                        fn = (
+                            (tc.get("function") or {}).get("name")
+                            or tc.get("name")
+                            or ""
+                        )
+                    print(f"   🔧 调用工具：{fn or '?'}", flush=True)
+            elif role == "tool":
+                name = m.get("name") or "tool"
+                text = _clip_text(
+                    _content_to_text(m.get("content")),
+                    CONTEXT_REPLAY_TOOL_MAX_CHARS,
+                )
+                if not text:
+                    print(f"   ↳ 🔧 {name}：（空结果）", flush=True)
+                    continue
+                first_line, *rest = text.split("\n")
+                print(f"   ↳ 🔧 {name}：{first_line}", flush=True)
+                for ln in rest:
+                    print(f"        {ln}", flush=True)
+
+        print(f"\n{'━' * 3} 回放结束 {'━' * 3}\n", flush=True)
+    except Exception:
+        # 回放只是辅助展示，任何异常都不该影响正常启动
+        pass
+
+
+# ============================================================
 #  大内容自动过期机制 —— 在外层 while 循环每次开始时调用
 # ============================================================
 
@@ -2627,7 +2746,8 @@ def main():
         "你是一个兴趣使然的AI Agent，请模仿东方project的魔理沙来回复问题"
         f"{skills_hint}"
     )
-
+    # 记录本次是否从 -r / -c 恢复了历史上下文（启动后回放到终端用）
+    loaded_context_source = None
     # ---- 处理 -c / --context-log：指定上下文日志文件并持续写入 ----
     if args.context_log:
         ctx_log_path = args.context_log
@@ -2670,6 +2790,7 @@ def main():
                 if last_user_msg:
                     print(f"   📝 最后一条用户输入: {last_user_msg}{'...' if len(last_user_msg) >= 100 else ''}", flush=True)
                 messages = restored_messages
+                loaded_context_source = f"上下文日志 {ctx_log_path}"
             else:
                 print(f"   ⚠️ 未从文件恢复（{err}），以新会话启动，后续快照仍写入该文件。", flush=True)
                 messages = [
@@ -2685,6 +2806,8 @@ def main():
 
     # ---- 处理 -r / --resume 恢复会话 ----
     if args.resume:
+        # -r 优先级高于 -c：它会覆盖 messages，这里同步重置回放来源（成功后重设）
+        loaded_context_source = None
         log_path = args.resume
         print(f"📥 正在从日志恢复会话: {log_path}", flush=True)
         restored_messages, err = _resume_from_log(log_path)
@@ -2706,6 +2829,7 @@ def main():
             if last_user_msg:
                 print(f"   📝 最后一条用户输入: {last_user_msg}{'...' if len(last_user_msg) >= 100 else ''}", flush=True)
             messages = restored_messages
+            loaded_context_source = f"日志 {log_path}"
     elif not args.context_log:
         # 初始化全局 messages（未指定 -r 或 -c 时的新会话）
         messages = [
@@ -2756,6 +2880,9 @@ def main():
             print("   📝 每行输入一段，单行 '.' 结束整句话；以 '..' 开头的行会还原为 '.'", flush=True)
             print("   ❌ 按 Ctrl+C 退出（Windows 下 Ctrl+D 不标准，请用 Ctrl+C 或输入 exit）  |  ⚡ 工具执行中按Ctrl+C=中断魔法\n", flush=True)
 
+    # ---- 若从 -r / -c 恢复了历史上下文，先把这段对话回放到终端（开工前先回顾）----
+    if loaded_context_source:
+        _replay_loaded_context(messages, loaded_context_source)
     # 创建输入会话（prompt_toolkit 模式返回 session；input 模式返回 None）
     session = create_prompt_session() if use_prompt_toolkit else None
 
