@@ -2409,7 +2409,7 @@ def create_prompt_session():
         multiline=True,          # 支持多行输入！
         history=InMemoryHistory(),
         key_bindings=bindings,
-        prompt_continuation="   ",  # 续行提示缩进
+        prompt_continuation="    ",  # 续行缩进 4 空格，与首行 "我: "（显示宽度 4 列）对齐
     )
 
     session.app.paste_mode = lambda: True
@@ -2448,6 +2448,74 @@ def read_multiline_input(prompt):
             line = line[1:]
         lines.append(line)
     return "\n".join(lines)
+
+
+def _display_width(s):
+    """计算字符串在终端里的显示宽度：东亚宽/全角字符算 2 列，组合字符算 0。"""
+    import unicodedata
+
+    width = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _input_may_scroll(text):
+    """粗略判断这段输入在 prompt_toolkit 输入框里是否可能发生滚动。
+
+    输入框高度上限见 _BoundedInputSession：终端行数的 40%，并 clamp 到 [6, 16]。
+    只要行数超过该上限、或有单行发生软换行（显示宽度超过终端列宽），
+    提交后就会丢掉上方被滚走的部分 —— 仅这种情况才需要补打完整内容。
+    """
+    import shutil
+
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    try:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        cols, rows = size.columns or 80, size.lines or 24
+    except Exception:
+        cols, rows = 80, 24
+    max_h = max(6, min(16, int(rows * 0.4)))
+    if len(lines) > max_h:
+        return True
+    if any(_display_width(ln) + 5 > cols for ln in lines):  # +5 ≈ "我: " 前缀占位
+        return True
+    return False
+
+
+def _echo_user_input(text):
+    """把用户刚提交的完整提示词补打到终端滚动历史。
+
+    背景：prompt_toolkit 的多行输入框高度有上限（见 _BoundedInputSession），
+    当提示词很长、在输入框里滚动过之后，按回车提交只会把「最后可视的那一屏」
+    留在终端上，上方被滚掉的部分不会进入滚动历史，后续也就回看不到了。
+
+    这里在提交之后（输入框已 accept 结束、patch_stdout 仍接管输出）重新把
+    完整内容打印一遍，作为普通历史输出保留，方便回看/复制。仅在确实可能
+    发生滚动时才补打，避免短输入被重复显示。
+    """
+    try:
+        if text is None:
+            return
+        body = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not body.strip():
+            # 纯空白提交会被 _submit 丢弃，不必回显
+            return
+        if not _input_may_scroll(body):
+            return
+        # 续行缩进 = 首行前缀的显示宽度，保证多行时每行左缘对齐
+        plain_head = "👤 我: "
+        body = body.replace("\n", "\n" + " " * _display_width(plain_head))
+        if UI_ANSI_OK:
+            head = "\x1b[1;36m👤 我:\x1b[0m "
+        else:
+            head = plain_head
+        print(f"\n{head}{body}", flush=True)
+    except Exception:
+        # 补打只是辅助显示，任何异常都不该影响主输入循环
+        pass
 
 
 def split_pipe_messages(text):
@@ -2911,6 +2979,9 @@ def _run_ui_loop(bus, session, use_prompt_toolkit):
                             bottom_toolbar=_bottom_toolbar,
                             refresh_interval=0.3,
                         )
+                        # 提交后补打完整提示词——长提示词在输入框里滚动过之后，
+                        # 终端上只留下最后一屏，这里补一份完整记录到滚动历史
+                        _echo_user_input(text)
                     except KeyboardInterrupt:
                         if not _handle_prompt_ctrl_c():
                             break
