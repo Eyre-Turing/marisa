@@ -453,6 +453,11 @@ def mcp_call_tool(tool_name, **arguments):
     """
     try:
         mcp = get_mcp_manager()
+        # 注入中断检查回调：MCP 等待响应期间若用户按 Ctrl+C，能快速中断而不是干等到超时
+        try:
+            mcp.set_interrupt_check(lambda: bool(_RT.interrupted))
+        except Exception:
+            pass
         result = mcp.call_tool(tool_name, arguments)
         # result 现在是 dict: {"text": "...", "images": [{"base64": "...", "mimeType": "..."}]}
         if isinstance(result, dict):
@@ -1052,6 +1057,145 @@ _bash_path_probed = False
 _bash_path_cache = None
 
 
+# ============================================================
+#  Windows 进程树强杀辅助（Job Object）
+# ------------------------------------------------------------
+# 背景：Windows 下用 Git-Bash（MSYS2）执行「复合命令」（如 `sleep 30 && echo done`）
+#   时，bash 会 fork 出子进程。MSYS2 的 fork 模拟会让子进程在 Windows 的
+#   「父子进程链」上与 bash 脱钩，于是 `taskkill /F /T /PID <bash_pid>` 只能杀掉
+#   bash 自己、杀不到子进程；孤儿进程继续占着 stdout 管道，主线程的
+#   proc.communicate() 就会一直阻塞到它自然结束 —— 表现为「Ctrl+C 按了也没用」。
+#
+# 解法：把子进程加入一个 Windows Job Object，杀的时候直接 TerminateJobObject，
+#   Job 内的所有后代（含 fork 后父子链断裂的）会被一并干掉。
+# ============================================================
+
+_win_job_api = None   # 惰性初始化的 ctypes API；False 表示不可用
+
+
+def _win_job_setup():
+    """惰性构建 Job Object 所需的 ctypes 绑定，返回 dict；不可用/失败返回 None。"""
+    global _win_job_api
+    if _win_job_api is not None:
+        return _win_job_api or None
+    if sys.platform != "win32":
+        _win_job_api = False
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.TerminateJobObject.restype = wintypes.BOOL
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        _win_job_api = {"k32": k32}
+    except Exception:
+        _win_job_api = False
+    return _win_job_api or None
+
+
+def _win_make_job():
+    """创建一个 Job Object 句柄（不设 kill-on-close，避免误杀正常跑完后遗留的后台进程）。
+
+    返回句柄；不可用或失败返回 None。
+    """
+    api = _win_job_setup()
+    if not api:
+        return None
+    try:
+        return api["k32"].CreateJobObjectW(None, None) or None
+    except Exception:
+        return None
+
+
+def _win_assign_job(h_job, pid):
+    """把 pid 对应进程加入 Job。成功返回 True。"""
+    api = _win_job_setup()
+    if not api or not h_job:
+        return False
+    PROCESS_SET_QUOTA = 0x0100
+    PROCESS_TERMINATE = 0x0001
+    try:
+        k32 = api["k32"]
+        h_proc = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not h_proc:
+            return False
+        try:
+            return bool(k32.AssignProcessToJobObject(h_job, h_proc))
+        finally:
+            k32.CloseHandle(h_proc)
+    except Exception:
+        return False
+
+
+def _win_terminate_job(h_job):
+    """终止 Job 内所有进程（含 fork 后父子链断裂的后代）。"""
+    api = _win_job_setup()
+    if not api or not h_job:
+        return False
+    try:
+        return bool(api["k32"].TerminateJobObject(h_job, 1))
+    except Exception:
+        return False
+
+
+def _win_close_job(h_job):
+    """关闭 Job 句柄（仅回收句柄，不杀进程）。"""
+    if not h_job:
+        return
+    try:
+        api = _win_job_setup()
+        if api:
+            api["k32"].CloseHandle(h_job)
+    except Exception:
+        pass
+
+
+def _kill_process_tree(proc, h_job=None):
+    """强杀进程树。
+
+    Windows：优先 TerminateJobObject（可杀掉 Git-Bash/MSYS2 fork 后 Windows
+             父子链断裂的子进程），再补一刀 taskkill /F /T 作为兜底。
+    Unix   ：杀进程组（Popen 时用 start_new_session 建了新会话，后代默认同组；
+             即使组长已退出（僵尸态），killpg 仍能杀到组内存活的后台子进程）。
+    """
+    if sys.platform == "win32":
+        if h_job:
+            _win_terminate_job(h_job)
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        # start_new_session 让子进程成为新会话/进程组组长，故 pgid == pid；
+        # 组长即使已退出，killpg 也能连带杀掉组内存活的后台子进程。
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
 def run_bash(command, timeout=10, force_use_bash=False):
     """执行一条命令，打印人类可读结果，返回 json.dumps 后的字符串
 
@@ -1100,16 +1244,23 @@ def run_bash(command, timeout=10, force_use_bash=False):
 
     print(f"\n🔮 发动魔法，咒语: {command}, 超时时间: {timeout}s\n", flush=True)
 
+    # Windows Job Object 句柄：用于强杀 fork 后 Windows 父子链断裂的进程树
+    hJob = None
+
     # ====== 新方案：使用 Popen + 进程组 + watchdog 线程 ======
     try:
         # 创建子进程，设置新的进程组，这样我们可以杀整个进程树
-        # Unix: 用 preexec_fn=os.setsid 创建新会话（进程组）
+        # Unix: 用 start_new_session=True 创建新会话/进程组
         # Windows: 用 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         extra_kwargs = {}
         if sys.platform == "win32":
             extra_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
-            extra_kwargs["preexec_fn"] = os.setsid
+            # start_new_session 与 preexec_fn=os.setsid 效果相同（子进程成为新会话/
+            # 进程组组长），但不走「fork 后执行任意 Python 代码」的危险路径：
+            # Python 官方明确警告 preexec_fn 在存在多线程时可能死锁，
+            # 而本 agent 后台常驻多个线程（watchdog / MCP 读取 / 状态栏……）。
+            extra_kwargs["start_new_session"] = True
         if force_use_bash or (sys.platform == "win32" and bash_path):
             # 用 bash 执行：不经过 cmd 解析，单引号/管道/重定向都由 bash 处理
             # force_use_bash=True 时用 "bash" 名字走 PATH 解析；找不到会抛 FileNotFoundError，
@@ -1137,6 +1288,14 @@ def run_bash(command, timeout=10, force_use_bash=False):
                 **extra_kwargs
             )
 
+        # Windows：把子进程放进 Job Object，便于用 TerminateJobObject 强杀整棵
+        # 进程树（含 Git-Bash/MSYS2 fork 后 Windows 父子链断裂的子进程）。
+        if sys.platform == "win32":
+            hJob = _win_make_job()
+            if hJob and not _win_assign_job(hJob, proc.pid):
+                _win_close_job(hJob)
+                hJob = None
+
         result_container = {
             "stdout": b"",
             "stderr": b"",
@@ -1146,39 +1305,43 @@ def run_bash(command, timeout=10, force_use_bash=False):
         }
 
         def watchdog():
-            """看门狗线程：超时后强杀进程组"""
+            """看门狗线程：轮询「用户 Ctrl+C 中断」与「超时」，一旦命中立即强杀进程组。
+
+            核心修复：原来只 sleep(timeout) 后检查一次超时，导致用户按 Ctrl+C 时
+            proc.communicate() 仍会阻塞直到子进程结束/超时，无法快速中断。
+            现在改为每 0.1s 轮询全局 interrupted 标志（由主线程 sigint_handler 写入），
+            一旦用户中断就立刻杀进程树、放行 communicate()，实现快速回到对话。
+            """
             import time as _time
-            _time.sleep(timeout)
-            if proc.poll() is None:
-                # 进程还在跑，强杀！
-                result_container["timed_out"] = True
-                try:
-                    # 先尝试杀进程树
-                    if sys.platform == "win32":
-                        # Windows: 用 taskkill 杀进程树
-                        subprocess.run(
-                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            timeout=5
-                        )
-                    else:
-                        # Unix/Linux: 杀进程组（负 PID 表示进程组）
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except Exception:
-                    # 如果上面失败，至少杀进程自己
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                # 确保读取剩余输出（防止管道死锁）
-                try:
-                    stdout_remain, stderr_remain = proc.communicate(timeout=3)
-                    if result_container["stdout"] == b"":
-                        result_container["stdout"] = stdout_remain
-                    if result_container["stderr"] == b"":
-                        result_container["stderr"] = stderr_remain
-                except Exception:
-                    pass
+            deadline = _time.time() + timeout
+            while True:
+                # 主线程已拿到结果 → 看门狗收工，不再做任何事。
+                # 这是「命令正常结束后，其后台进程按设计继续存活」的关键保障。
+                if result_container.get("main_done"):
+                    return
+                # 用户按 Ctrl+C：优雅中断（区别于超时）
+                if _RT.interrupted:
+                    result_container["user_interrupted"] = True
+                    break
+                # 超时
+                if _time.time() >= deadline:
+                    result_container["timed_out"] = True
+                    break
+                _time.sleep(0.1)
+
+            # 能走到这里 = 用户中断 或 超时，需要强杀整棵树。
+            # 注意即使顶层进程已退出也要杀：像 `sleep 30 &` 这类命令 bash 会秒退，
+            # 但后台子进程仍占着 stdout 管道，不杀它主线程的 communicate() 会一直干等。
+            _kill_process_tree(proc, hJob)
+            # 确保读取剩余输出（防止管道死锁）
+            try:
+                stdout_remain, stderr_remain = proc.communicate(timeout=3)
+                if result_container["stdout"] == b"":
+                    result_container["stdout"] = stdout_remain
+                if result_container["stderr"] == b"":
+                    result_container["stderr"] = stderr_remain
+            except Exception:
+                pass
 
         # 启动看门狗线程
         watchdog_thread = threading.Thread(target=watchdog, daemon=True)
@@ -1194,21 +1357,8 @@ def run_bash(command, timeout=10, force_use_bash=False):
             # Ctrl+C 时 signal handler 已把 interrupted 置 True，这里捕获后做善后：
             # 杀掉子进程、读取残留输出，然后返回"用户中断"结果，程序继续存活。
             result_container["timed_out"] = False
-            # 杀掉整个进程组（跟 watchdog 一样的杀法）
-            try:
-                if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=5
-                    )
-                else:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            # 杀掉整棵进程树（跟 watchdog 一样的杀法）
+            _kill_process_tree(proc, hJob)
             # 读取残留输出（短暂等待，失败就算了）
             try:
                 stdout_data, stderr_data = proc.communicate(timeout=3)
@@ -1240,6 +1390,9 @@ def run_bash(command, timeout=10, force_use_bash=False):
             except (Exception, KeyboardInterrupt):
                 pass
 
+        # 主线程已拿到结果：通知看门狗收工（避免它继续空转，或误杀正常的后台进程）
+        result_container["main_done"] = True
+
         # 等待看门狗线程结束（最多等 2 秒）
         try:
             watchdog_thread.join(timeout=2)
@@ -1248,21 +1401,8 @@ def run_bash(command, timeout=10, force_use_bash=False):
             # 会直接抛 KeyboardInterrupt。转成一致的“用户中断”，走下方
             # user_interrupted 分支优雅返回，而不是崩掉整个程序。
             result_container["user_interrupted"] = True
-            try:
-                # 若子进程还在，尝试结束它
-                if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        timeout=5
-                    )
-                else:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            # 若子进程还在，尝试结束整棵进程树
+            _kill_process_tree(proc, hJob)
 
         if result_container["timed_out"]:
             stdout = smart_decode(result_container["stdout"]) if result_container["stdout"] else ""
@@ -1358,6 +1498,10 @@ def run_bash(command, timeout=10, force_use_bash=False):
             flush=True
         )
         return json.dumps(result_dict)
+
+    finally:
+        # 回收 Job Object 句柄（仅关句柄、不杀进程，正常跑完的后台进程不受影响）
+        _win_close_job(hJob)
 
 
 # ============================================================
@@ -1478,19 +1622,35 @@ def _bg_wait_process(task_id, proc):
         if info.get("status") != "killed":
             info["status"] = "error"
         info["finish_time"] = time.time()
+    finally:
+        # 回收 Job Object 句柄（仅关句柄、不杀进程），置空避免重复关闭
+        _win_close_job(info.get("hJob"))
+        info["hJob"] = None
     _bg_notify(task_id)
     print(f"\n🔔 后台任务 #{task_id} 已结束（exit={info['returncode']}）\n", flush=True)
 
 
-def _bg_kill_process_tree(pid):
-    """杀死整个进程树（Windows: taskkill /F /T；Unix: killpg）"""
+def _bg_kill_process_tree(pid, h_job=None):
+    """杀死整个进程树。
+
+    Windows：优先 TerminateJobObject（能杀掉 Git-Bash/MSYS2 fork 后 Windows
+             父子链断裂的子进程），再补 taskkill /F /T 兜底；Unix：killpg。
+    """
     if sys.platform == "win32":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
-        )
+        if h_job:
+            _win_terminate_job(h_job)
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+            )
+        except Exception:
+            pass
     else:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def start_bg_task(command, force_use_bash=False):
@@ -1567,11 +1727,19 @@ def start_bg_task(command, force_use_bash=False):
     except Exception as e:
         return json.dumps({"success": 0, "task_id": task_id, "err": f"启动后台任务失败: {e}"})
 
+    # Windows：把后台任务进程加入 Job Object，使 bg_task_kill 能连 fork 出来的
+    # 子进程一起干掉（Git-Bash/MSYS2 的 Windows 父子链可能与 bash 脱钩）。
+    h_job = _win_make_job() if sys.platform == "win32" else None
+    if h_job and not _win_assign_job(h_job, proc.pid):
+        _win_close_job(h_job)
+        h_job = None
+
     info = {
         "task_id": task_id,
         "command": orig_command,
         "pid": proc.pid,
         "proc": proc,            # 退出清理时需等待进程真正结束（Windows 句柄释放）
+        "hJob": h_job,           # Windows Job Object 句柄（None 表示不可用）
         "shell": used_shell,
         "status": "running",
         "returncode": None,
@@ -1662,7 +1830,7 @@ def bg_task_kill(task_id):
     if info["status"] != "running":
         return json.dumps({"success": 0, "err": f"任务 #{task_id} 已不在运行（状态: {info['status']}）"})
     try:
-        _bg_kill_process_tree(info["pid"])
+        _bg_kill_process_tree(info["pid"], info.get("hJob"))
         info["status"] = "killed"
         info["finish_time"] = time.time()
         _bg_notify(task_id)
@@ -1721,7 +1889,7 @@ def _bg_shutdown():
         for tid in running:
             try:
                 info = _bg_tasks[tid]
-                _bg_kill_process_tree(info["pid"])
+                _bg_kill_process_tree(info["pid"], info.get("hJob"))
                 info["status"] = "killed"
                 print(f"   ✂️  后台任务 #{tid}（PID {info['pid']}）已终止", flush=True)
             except Exception:
@@ -1729,12 +1897,16 @@ def _bg_shutdown():
         # 等待子进程真正退出：Windows 上进程终止后句柄才释放，
         # 否则紧接着删除日志文件会因占用而失败（WinError 32）。
         for tid in running:
-            proc = (_bg_tasks.get(tid) or {}).get("proc")
+            _info = _bg_tasks.get(tid) or {}
+            proc = _info.get("proc")
             if proc is not None:
                 try:
                     proc.wait(timeout=3)
                 except Exception:
                     pass
+            # 回收 Job Object 句柄，置空避免重复关闭
+            _win_close_job(_info.get("hJob"))
+            _info["hJob"] = None
     # 清理本 agent 的专属日志目录（TemporaryDirectory.cleanup → 删除整个目录）。
     # 句柄释放可能有延迟，重试几次兜底；仍失败则交给系统临时目录清理。
     global _bg_tmpdir

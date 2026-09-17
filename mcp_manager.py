@@ -28,6 +28,9 @@ import sys
 import uuid
 import shutil
 import time
+import queue
+import urllib.request
+import urllib.error
 
 # ============================================================
 # 配置管理
@@ -125,7 +128,7 @@ class MCPStdioServer:
     生命周期：initialize → tools/list → tools/call → shutdown
     """
     
-    def __init__(self, name, command, args=None, env=None, tool_prefix="", timeout=60, debug=False):
+    def __init__(self, name, command, args=None, env=None, tool_prefix="", timeout=60, debug=False, interrupt_check=None):
         self.name = name
         self.command = command
         self.args = args or []
@@ -133,7 +136,9 @@ class MCPStdioServer:
         self.tool_prefix = tool_prefix
         self.timeout = timeout
         self.debug = debug
-        
+        # 中断检查回调（可选）：调用返回 True 表示用户按了 Ctrl+C，应尽快中断等待
+        self.interrupt_check = interrupt_check
+
         self.proc = None
         self.tools = []          # OpenAI 格式的工具列表
         self.mcp_tools = []      # 原始 MCP 格式的工具列表
@@ -142,6 +147,9 @@ class MCPStdioServer:
         self._lock = threading.Lock()
         self._next_id = 1
         self._stderr_thread = None
+        # 后台 stdout 读取线程 + 队列（用于轮询式等待响应，实现可被 Ctrl+C 中断）
+        self._stdout_q = None
+        self._stdout_thread = None
     
     def _get_id(self):
         """获取递增的请求 ID"""
@@ -201,6 +209,14 @@ class MCPStdioServer:
                 bufsize=0,  # 无缓冲，确保即时通信
                 **popen_kwargs
             )
+
+            # 后台 stdout 读取线程：持续把读到的数据块入队，供 _read_response 轮询消费，
+            # 避免 readline() 阻塞导致 Ctrl+C 无法中断。
+            self._stdout_q = queue.Queue()
+            self._stdout_thread = threading.Thread(
+                target=self._read_stdout, daemon=True
+            )
+            self._stdout_thread.start()
             
             # 无论 debug 是否开启，都要启动 stderr 读取线程，否则管道缓冲区满了 uvx 会卡死
             # debug=True 时打印到终端，debug=False 时只读取不显示
@@ -238,6 +254,18 @@ class MCPStdioServer:
             self._cleanup()
             return False
     
+    def _read_stdout(self):
+        """后台线程：持续读取子进程 stdout 并逐行放入队列，使 _read_response 可轮询式等待，
+        避免 readline() 同步阻塞导致用户按 Ctrl+C 无法中断。
+        """
+        try:
+            if self.proc and self.proc.stdout:
+                for line in iter(self.proc.stdout.readline, b''):
+                    if line:
+                        self._stdout_q.put(line)
+        except Exception:
+            pass
+
     def _read_stderr(self):
         """在后台线程中读取 stderr，避免管道阻塞
         无论 debug 是否开启都会读取，但只在 debug=True 时打印到终端
@@ -277,7 +305,12 @@ class MCPStdioServer:
         return response
     
     def _read_response(self, expected_id=None):
-        """从 stdout 中读取 JSON-RPC 响应"""
+        """从 stdout 读取 JSON-RPC 响应（可被 Ctrl+C 中断）
+
+        由后台 `_read_stdout` 线程把读到的行放入 `self._stdout_q`，
+        这里以 0.1s 粒度轮询队列并检查 interrupt_check，实现快速中断：
+        用户按 Ctrl+C 后 interrupt_check 返回 True，立即抛 InterruptedError 放行上层。
+        """
         if not self.proc or not self.proc.stdout:
             raise ConnectionError(f"MCP 服务器 [{self.name}] 已断开")
         
@@ -285,17 +318,21 @@ class MCPStdioServer:
         deadline = time.time() + self.timeout
         
         while time.time() < deadline:
+            # 用户按 Ctrl+C：中断检查
+            if self.interrupt_check is not None and self.interrupt_check():
+                raise InterruptedError(f"MCP 服务器 [{self.name}] 调用被用户中断")
+
             # 检查进程是否还活着
             if self.proc.poll() is not None:
                 raise ConnectionError(
                     f"MCP 服务器 [{self.name}] 已退出，返回码: {self.proc.returncode}"
                 )
             
-            # 读取一行
+            # 非阻塞从队列取一行（0.1s 超时，用于轮询中断/超时）
             try:
-                line = self.proc.stdout.readline()
-            except Exception as e:
-                raise ConnectionError(f"读取 MCP 响应失败: {e}")
+                line = self._stdout_q.get(timeout=0.1)
+            except Exception:
+                continue
             
             if not line:
                 # 空行 = 连接关闭？
@@ -420,6 +457,9 @@ class MCPStdioServer:
         self.connected = False
         self.tools = []
         self.mcp_tools = []
+        # 停止并清空后台 stdout 读取（readline 会在进程/管道关闭后自然返回并退出线程）
+        self._stdout_q = None
+        self._stdout_thread = None
         
         if self.proc:
             try:
@@ -491,7 +531,7 @@ class MCPHttpServer:
     生命周期：initialize → tools/list → tools/call
     """
 
-    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False, tls_max_version=None):
+    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False, tls_max_version=None, interrupt_check=None):
         self.name = name
         self.url = url
         self.tool_prefix = tool_prefix
@@ -499,6 +539,7 @@ class MCPHttpServer:
         self.headers = headers or {}
         self.debug = debug
         self.tls_max_version = tls_max_version   # 可选：强制最大 TLS 版本，如 "1.2"（部分网络会拦截 TLS1.3）
+        self.interrupt_check = interrupt_check   # 中断检查回调（可选）
         self._ssl_context = self._build_ssl_context(tls_max_version)
 
         self.tools = []          # OpenAI 格式的工具列表
@@ -561,36 +602,54 @@ class MCPHttpServer:
         if self.debug:
             print(f"   [MCP:{self.name} http] -> {method} (id={req_id})", flush=True)
 
-        try:
-            req = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context) as resp:
-                # 捕获会话 ID
-                sid = resp.headers.get("Mcp-Session-Id")
-                if sid:
-                    self._session_id = sid
+        # 可被 Ctrl+C 中断的请求：放到 daemon 线程执行，主线程轮询 interrupt_check + 完成标志
+        container = {"done": False, "result": None, "error": None}
 
-                body = resp.read().decode("utf-8")
-                content_type = resp.headers.get("Content-Type", "")
-
-                if self.debug:
-                    print(f"   [MCP:{self.name} http] <- {content_type}: {body[:500]}", flush=True)
-
-                result = self._parse_http_response(body, content_type, req_id)
-                return result
-
-        except urllib.error.HTTPError as e:
-            body = ""
+        def worker():
             try:
-                body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise ConnectionError(
-                f"MCP HTTP 服务器 [{self.name}] 返回 HTTP {e.code}: {body[:500]}"
-            )
-        except urllib.error.URLError as e:
-            raise ConnectionError(
-                f"MCP HTTP 服务器 [{self.name}] 连接失败: {e.reason}"
-            )
+                req = urllib.request.Request(self.url, data=data, headers=req_headers, method="POST")
+                with urllib.request.urlopen(req, timeout=self.timeout, context=self._ssl_context) as resp:
+                    # 捕获会话 ID
+                    sid = resp.headers.get("Mcp-Session-Id")
+                    if sid:
+                        self._session_id = sid
+
+                    body = resp.read().decode("utf-8")
+                    content_type = resp.headers.get("Content-Type", "")
+
+                    if self.debug:
+                        print(f"   [MCP:{self.name} http] <- {content_type}: {body[:500]}", flush=True)
+
+                    result = self._parse_http_response(body, content_type, req_id)
+                    container["result"] = result
+
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                container["error"] = ConnectionError(
+                    f"MCP HTTP 服务器 [{self.name}] 返回 HTTP {e.code}: {body[:500]}"
+                )
+            except urllib.error.URLError as e:
+                container["error"] = ConnectionError(
+                    f"MCP HTTP 服务器 [{self.name}] 连接失败: {e.reason}"
+                )
+            except Exception as e:
+                container["error"] = e
+            finally:
+                container["done"] = True
+
+        threading.Thread(target=worker, daemon=True).start()
+        while not container["done"]:
+            # 用户按 Ctrl+C：中断检查
+            if self.interrupt_check is not None and self.interrupt_check():
+                raise InterruptedError(f"MCP HTTP 服务器 [{self.name}] 调用被用户中断")
+            time.sleep(0.1)
+        if container["error"]:
+            raise container["error"]
+        return container["result"]
 
     def _parse_http_response(self, body, content_type, expected_id):
         """
@@ -806,7 +865,7 @@ class MCPHttpSseServer:
       3. 响应通过 SSE 长连接异步推回（同一 SSE 流）
     """
 
-    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False):
+    def __init__(self, name, url, tool_prefix="", timeout=60, headers=None, debug=False, interrupt_check=None):
         self.name = name
         self.sse_url = url          # SSE 入口 URL，如 http://host/sse
         self.url = url              # 连接后会被 SSE 流更新为 messages 端点
@@ -814,6 +873,7 @@ class MCPHttpSseServer:
         self.timeout = timeout
         self.headers = headers or {}
         self.debug = debug
+        self.interrupt_check = interrupt_check   # 中断检查回调（可选）
 
         self.tools = []          # OpenAI 格式工具列表
         self.mcp_tools = []      # 原始 MCP 格式工具列表
@@ -958,7 +1018,16 @@ class MCPHttpSseServer:
             entry = self._pending.get(rid)
         if not entry:
             raise RuntimeError(f"MCP SSE 服务器 [{self.name}] 无挂起的请求 id={rid}")
-        if not entry["event"].wait(self.timeout):
+        # 循环轮询：每 0.1s 检查一次中断标志，实现可被 Ctrl+C 中断的等待
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            if self.interrupt_check is not None and self.interrupt_check():
+                with self._pending_lock:
+                    self._pending.pop(rid, None)
+                raise InterruptedError(f"MCP SSE 服务器 [{self.name}] 调用被用户中断")
+            if entry["event"].wait(0.1):
+                break
+        else:
             with self._pending_lock:
                 self._pending.pop(rid, None)
             raise TimeoutError(f"MCP SSE 服务器 [{self.name}] 请求 id={rid} 等待响应超时")
@@ -1151,6 +1220,14 @@ class MCPManager:
         self.config_path = config_path or MCP_CONFIG_FILE
         self.servers = {}  # name -> MCPStdioServer
         self._name_to_server = {}  # 工具名(含前缀) -> MCPStdioServer
+        # 中断检查回调（可选）：返回 True 表示用户按了 Ctrl+C，各 server 等待时据此快速中断
+        self.interrupt_check = None
+
+    def set_interrupt_check(self, fn):
+        """设置全局中断检查回调，并同步到已创建的 server（新建 server 也会自动继承）"""
+        self.interrupt_check = fn
+        for server in self.servers.values():
+            server.interrupt_check = fn
     
     def connect_all(self):
         """连接所有配置中启用的 MCP 服务器"""
@@ -1178,7 +1255,8 @@ class MCPManager:
                     env=cfg.get("env", {}),
                     tool_prefix=cfg.get("tool_prefix", ""),
                     timeout=cfg.get("timeout", 60),
-                    debug=cfg.get("debug", False)
+                    debug=cfg.get("debug", False),
+                    interrupt_check=self.interrupt_check
                 )
                 
                 if cfg.get("auto_connect", True):
@@ -1199,7 +1277,8 @@ class MCPManager:
                     timeout=cfg.get("timeout", 60),
                     headers=cfg.get("headers", {}),
                     debug=cfg.get("debug", False),
-                    tls_max_version=cfg.get("tls_max_version")
+                    tls_max_version=cfg.get("tls_max_version"),
+                    interrupt_check=self.interrupt_check
                 )
                 
                 if cfg.get("auto_connect", True):
@@ -1218,7 +1297,8 @@ class MCPManager:
                     tool_prefix=cfg.get("tool_prefix", ""),
                     timeout=cfg.get("timeout", 60),
                     headers=cfg.get("headers", {}),
-                    debug=cfg.get("debug", False)
+                    debug=cfg.get("debug", False),
+                    interrupt_check=self.interrupt_check
                 )
                 
                 if cfg.get("auto_connect", True):
@@ -1378,7 +1458,8 @@ class MCPManager:
                 env=cfg.get("env", {}),
                 tool_prefix=cfg.get("tool_prefix", ""),
                 timeout=cfg.get("timeout", 60),
-                debug=cfg.get("debug", False)
+                debug=cfg.get("debug", False),
+                interrupt_check=self.interrupt_check
             )
             
             if server.connect():
@@ -1397,7 +1478,8 @@ class MCPManager:
                 timeout=cfg.get("timeout", 60),
                 headers=cfg.get("headers", {}),
                 debug=cfg.get("debug", False),
-                tls_max_version=cfg.get("tls_max_version")
+                tls_max_version=cfg.get("tls_max_version"),
+                interrupt_check=self.interrupt_check
             )
             
             if server.connect():
@@ -1415,7 +1497,8 @@ class MCPManager:
                 tool_prefix=cfg.get("tool_prefix", ""),
                 timeout=cfg.get("timeout", 60),
                 headers=cfg.get("headers", {}),
-                debug=cfg.get("debug", False)
+                debug=cfg.get("debug", False),
+                interrupt_check=self.interrupt_check
             )
             
             if server.connect():
