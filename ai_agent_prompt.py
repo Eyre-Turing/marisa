@@ -1142,6 +1142,27 @@ def save_error_snapshot(msg_list, error_msg):
     except Exception:
         pass  # 日志写入失败不影响主流程
 
+# ============================================================
+#  退出提示 — 告诉用户如何用 -r 回到本次对话
+# ============================================================
+def print_resume_hint():
+    """退出时提示如何用 `marisa -r "日志路径"` 回到本次对话。
+
+    ⚠️ 必须在「退出清理」之前调用：清理（断开 MCP 等）一旦抛错，
+    这句提示就打不出来了，用户会以为会话丢了。
+
+    路径统一用正斜杠 '/' 输出——Windows / Linux 都适用，
+    整条命令复制粘贴都不会因反斜杠触发语法错误。
+    """
+    path = _context_log_file or _log_file
+    if not path:
+        return
+    try:
+        display = os.path.abspath(path).replace("\\", "/")
+        print(f'\n💡 使用 marisa -r "{display}" 回到对话\n', flush=True)
+    except Exception:
+        # 提示打印失败绝不能拖累退出流程
+        pass
 
 # ============================================================
 #  Loading 转圈动画 —— 仅在交互式终端下启用
@@ -2959,6 +2980,9 @@ def main():
     else:
         # 交互模式：主线程跑常驻键盘输入循环，直到用户要求退出
         _run_ui_loop(_input_bus, session, use_prompt_toolkit)
+        # 💡 退出提示：务必放在「清理」之前——清理（断开 MCP 等）一旦报错，
+        #    这句「如何回到对话」就打不出来了，用户会以为会话丢了。
+        print_resume_hint()
         _input_bus.put_stop()
         worker.join(timeout=30)
 
