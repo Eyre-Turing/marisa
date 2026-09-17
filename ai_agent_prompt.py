@@ -927,24 +927,34 @@ def get_context_tokens(msg_list=None, tools=None):
 
 
 def format_usage_line():
-    """一行式用量摘要：真实 token 数与请求体 JSON 字节数对照。"""
+    """一行式用量摘要：真实 token 数与请求体 JSON 字节数对照。
+
+    上下文口径与 API 对齐：窗口占用 = 输入（prompt_tokens）+ 输出（completion_tokens），
+    也就是 API 返回的 total_tokens。
+
+    本函数（经 print_usage）在「每次 API 返回后、assistant 回复尚未写回 messages 之前」
+    被调用，此时 messages 恰好等于刚发出去的那份 prompt，所以：
+        prompt_tok（输入估算）≈ 刚发出的 prompt_tokens
+        prompt_tok + completion_tokens = 刚那次调用的 total_tokens
+    因为回复还没写回 messages，加输出不会把同一段内容重复计入。
+    """
     msg_bytes = get_context_size(messages)
     tools_bytes = get_tools_size()
     cur_bytes = get_request_size(messages)
     # 复用同一个 cur_bytes 换算 token，保证展示出的 tok 与字节严格对得上
-    tok = _tokens_from_bytes(cur_bytes)
+    prompt_tok = _tokens_from_bytes(cur_bytes)                        # 输入侧
+    comp_tok = _last_usage.get("completion_tokens", 0) if _last_usage else 0
+    total_tok = prompt_tok + comp_tok                                 # 总占用（≈ total_tokens）
     limit = CONTEXT_LIMIT or 0
-    pct = round(tok / limit * 100, 1) if limit else 0.0
-    bpt = (cur_bytes / tok) if tok else 0.0
+    pct = round(total_tok / limit * 100, 1) if limit else 0.0
+    bpt = (cur_bytes / prompt_tok) if prompt_tok else 0.0
     approx = "" if _last_usage else "≈"
-    segs = [f"上下文 {approx}{tok:,} tok / {limit:,}（{pct}%）"]
+    segs = [f"上下文 {approx}{total_tok:,} tok / {limit:,}（{pct}%）"]
     if _last_usage:
-        c = _last_usage.get("completion_tokens", 0)
-        t = _last_usage.get("total_tokens", tok + c) or (tok + c)
-        seg = f"本次输出 {c:,} tok（合计 {t:,}）"
+        seg = f"输入 {prompt_tok:,} + 输出 {comp_tok:,}"
         cached = _last_usage.get("cached_tokens") or 0
         if cached:
-            seg += f"，缓存命中 {cached:,}"
+            seg += f"（缓存命中 {cached:,}）"
         segs.append(seg)
     # 字节数按「完整请求体」给，才和上面的 token 数同口径；并拆出工具 schema 的占比，
     # 免得再被误读成「字节数怎么比 token 还少」
@@ -970,7 +980,15 @@ def _fmt_tok(n):
 
 
 def format_usage_short():
-    """状态栏用的精简用量：上下文 tok / 上限（百分比）｜本次输出 tok。
+    """状态栏用的精简用量：上下文总占用（输入+输出）tok / 上限（百分比）｜输入 / 输出。
+
+    口径与 API 对齐：窗口占用 = prompt_tokens + completion_tokens（= total_tokens）。
+
+    调用时机同 format_usage_line()：本函数在「每次 API 返回后、assistant 回复尚未写回
+    messages 之前」执行，此时 messages 正好等于刚发出的 prompt，因此
+        prompt_tok（输入估算）≈ 刚发出的 prompt_tokens
+        prompt_tok + completion_tokens = 刚那次调用的 total_tokens
+    回复还没写回 messages，所以加输出不会重复计入。
 
     跟 format_usage_line() 一样会做一次请求体序列化来估算 token，代价不低，
     所以只在每次 API 返回后算一次并缓存进 _agent_status，状态栏渲染时直接读缓存。
@@ -978,14 +996,15 @@ def format_usage_short():
     msg_bytes = get_context_size(messages)
     tools_bytes = get_tools_size()
     cur_bytes = get_request_size(messages)
-    tok = _tokens_from_bytes(cur_bytes)
+    prompt_tok = _tokens_from_bytes(cur_bytes)                        # 输入侧
+    comp_tok = _last_usage.get("completion_tokens", 0) if _last_usage else 0
+    total_tok = prompt_tok + comp_tok                                 # 总占用（≈ total_tokens）
     limit = CONTEXT_LIMIT or 0
-    pct = round(tok / limit * 100, 1) if limit else 0.0
+    pct = round(total_tok / limit * 100, 1) if limit else 0.0
     approx = "" if _last_usage else "≈"
-    segs = [f"上下文 {approx}{tok:,} / {_fmt_tok(limit)} tok ({pct}%)"]
+    segs = [f"上下文 {approx}{total_tok:,} / {_fmt_tok(limit)} tok ({pct}%)"]
     if _last_usage:
-        c = _last_usage.get("completion_tokens", 0)
-        segs.append(f"本次输出 {c:,} tok")
+        segs.append(f"输入 {prompt_tok:,} + 输出 {comp_tok:,}")
     if tools_bytes:
         segs.append(f"请求体 {(msg_bytes + tools_bytes) / 1024:.1f} KB")
     return " ｜ ".join(segs)
