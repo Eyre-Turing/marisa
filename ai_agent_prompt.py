@@ -787,6 +787,8 @@ def get_request_size(msg_list=None, tools=None):
 #   ① 展示准确的上下文 token 数（不再靠字节数瞎猜）；② 让压缩阈值按 token 判断。
 _last_usage = None           # 归一化 usage：{"prompt_tokens","completion_tokens","total_tokens","cached_tokens"}
 _last_usage_ctx_bytes = 0    # 该次请求发送时「完整请求体」的 JSON 字节数（含 tools，口径同 prompt_tokens）
+_last_usage_sent_id = 0      # 该次请求发送时 messages 列表的对象 id（判「回复是否已写回」用）
+_last_usage_msg_count = 0    # 该次请求发送时 messages 的条数（判「回复是否已写回」用）
 
 
 def _parse_token_count(raw, fallback):
@@ -897,11 +899,15 @@ def _record_main_usage(usage, sent_messages, sent_tools=None):
     字节锚点取「完整请求体」（messages + tools），与 prompt_tokens 同口径；
     否则工具的 token 会被按比例摊到消息字节上，导致后续估算严重偏高。
     """
-    global _last_usage, _last_usage_ctx_bytes
+    global _last_usage, _last_usage_ctx_bytes, _last_usage_sent_id, _last_usage_msg_count
     if not usage:
         return
     _last_usage = usage
     _last_usage_ctx_bytes = get_request_size(sent_messages, sent_tools)
+    # 记下发送时 messages 的对象 id 与条数，供 _pending_completion_tokens 判断
+    # 「这次回复是否已写回 messages」（写回后列表变长 / 被整体替换，就视为已计入）
+    _last_usage_sent_id = id(sent_messages)
+    _last_usage_msg_count = len(sent_messages)
 
 
 def _tokens_from_bytes(cur_bytes):
@@ -918,12 +924,35 @@ def _tokens_from_bytes(cur_bytes):
     return cur_bytes // 4
 
 
-def get_context_tokens(msg_list=None, tools=None):
-    """当前上下文的 token 数（尽量取真实值）。
+def _pending_completion_tokens():
+    """最近一次主模型调用的 completion_tokens —— 仅当这次回复「尚未写回 messages」时才算数。
 
-    锚点与换算都基于「完整请求体」（含 tools schema），与 prompt_tokens 同口径。
+    判据：当前 messages 仍是发送请求时那个列表（对象 id 相同）且长度未变，
+    说明本轮回复还没 append 进来 → 它的输出需要暂时补进「上下文总占用」。
+    一旦回复写回（同一个列表变长），或被 compress 工具整体替换（变成另一个列表对象），
+    输出就已经作为 prompt 的一部分存在于 messages 中 → 返回 0，绝不重复计入。
+
+    这样「上下文总占用」在任意时刻都自洽：压缩阈值与状态栏显示走同一口径。
     """
-    return _tokens_from_bytes(get_request_size(msg_list, tools))
+    if not _last_usage:
+        return 0
+    if id(messages) != _last_usage_sent_id or len(messages) != _last_usage_msg_count:
+        return 0
+    return _last_usage.get("completion_tokens") or 0
+
+
+def get_context_tokens(msg_list=None, tools=None):
+    """当前上下文的「总占用」token 数（输入 + 输出，口径同 API 的 total_tokens）。
+
+    锚点与换算都基于「完整请求体」（含 tools schema）：
+      · 输入侧 = 当前请求体折算出的 prompt_tokens；
+      · 输出侧 = 最近一次调用的 completion_tokens，且仅当回复尚未写回 messages 时才补
+        （见 _pending_completion_tokens）——因此无论何时调用都不会重复计数。
+
+    压缩判定在「上一轮回复已写回 messages」之后执行，此时返回值 ≈ 下一轮请求的
+    prompt_tokens（过去所有输出都已沉淀为 prompt），与窗口口径 total_tokens 等价。
+    """
+    return _tokens_from_bytes(get_request_size(msg_list, tools)) + _pending_completion_tokens()
 
 
 def format_usage_line():
@@ -943,14 +972,14 @@ def format_usage_line():
     cur_bytes = get_request_size(messages)
     # 复用同一个 cur_bytes 换算 token，保证展示出的 tok 与字节严格对得上
     prompt_tok = _tokens_from_bytes(cur_bytes)                        # 输入侧
-    comp_tok = _last_usage.get("completion_tokens", 0) if _last_usage else 0
+    comp_tok = _pending_completion_tokens()                           # 输出侧（回复未写回时才补）
     total_tok = prompt_tok + comp_tok                                 # 总占用（≈ total_tokens）
     limit = CONTEXT_LIMIT or 0
     pct = round(total_tok / limit * 100, 1) if limit else 0.0
     bpt = (cur_bytes / prompt_tok) if prompt_tok else 0.0
     approx = "" if _last_usage else "≈"
     segs = [f"上下文 {approx}{total_tok:,} tok / {limit:,}（{pct}%）"]
-    if _last_usage:
+    if comp_tok:
         seg = f"输入 {prompt_tok:,} + 输出 {comp_tok:,}"
         cached = _last_usage.get("cached_tokens") or 0
         if cached:
@@ -997,13 +1026,13 @@ def format_usage_short():
     tools_bytes = get_tools_size()
     cur_bytes = get_request_size(messages)
     prompt_tok = _tokens_from_bytes(cur_bytes)                        # 输入侧
-    comp_tok = _last_usage.get("completion_tokens", 0) if _last_usage else 0
+    comp_tok = _pending_completion_tokens()                           # 输出侧（回复未写回时才补）
     total_tok = prompt_tok + comp_tok                                 # 总占用（≈ total_tokens）
     limit = CONTEXT_LIMIT or 0
     pct = round(total_tok / limit * 100, 1) if limit else 0.0
     approx = "" if _last_usage else "≈"
     segs = [f"上下文 {approx}{total_tok:,} / {_fmt_tok(limit)} tok ({pct}%)"]
-    if _last_usage:
+    if comp_tok:
         segs.append(f"输入 {prompt_tok:,} + 输出 {comp_tok:,}")
     if tools_bytes:
         segs.append(f"请求体 {(msg_bytes + tools_bytes) / 1024:.1f} KB")
@@ -3281,6 +3310,8 @@ def _agent_worker(bus):
                     # 终端工具（compress）内部已修改全局 messages 并追加了 assistant 确认
                     if is_terminal:
                         print("   ↳ 压缩完成，上下文已刷新！", flush=True)
+                        # 🖥️ 同上：压缩已替换 messages，立即刷新状态栏用量
+                        print_usage()
                     else:
                         # 非预期工具，追加 tool response
                         messages.append({
@@ -3503,6 +3534,9 @@ def _agent_worker(bus):
                     if is_terminal:
                         terminal_tool_called = True
                         print("   ↳ 压缩完成，上下文已刷新！", flush=True)
+                        # 🖥️ 压缩已整体替换 messages，立即刷新状态栏用量，
+                        # 否则输入框下方会一直显示压缩前的旧值，直到下次对话才更新。
+                        print_usage()
                         break
 
                     # 🖼️ 图片工具的特殊处理：
