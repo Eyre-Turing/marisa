@@ -1085,6 +1085,11 @@ _log_file = None
 _err_log_file = None
 # 用户通过 -c/--context-log 指定的上下文日志文件；若设置则优先写入该文件
 _context_log_file = None
+# 本次会话是否收到过任何（非空）输入事件：用于退出提示时判断「新生成的默认日志」是否为空
+_session_input_seen = False
+# 本次会话启动时若用 -r 成功恢复了已有日志，则记录那个原始路径；
+# 供「本次无任何输入就退出」时原样提示回去（而不是指向刚生成的空日志）
+_startup_resume_path = None
 
 
 def _ensure_log_dir():
@@ -1153,11 +1158,26 @@ def print_resume_hint():
 
     路径统一用正斜杠 '/' 输出——Windows / Linux 都适用，
     整条命令复制粘贴都不会因反斜杠触发语法错误。
+
+    ⭐ 特例：本次会话「什么都没输入」就退出时，本次新生成的默认日志是个空壳
+    （只有一行启动标记、没有任何 snapshot），推荐它毫无意义——第二次 -r 它会直接失败。
+    此时分两种情况：
+      · 本次是用 `-r 旧日志` 启动的 → 原样提示 `-r 旧日志`（那份才有内容）；
+      · 本次是全新会话 → 压根没有可回的对话，不提示。
+    若本次带了 -c（持续写入的上下文文件），则无论有无输入都照常提示该文件
+    （它是持久文件，即使本次没输入也可能装着之前的对话）。
     """
-    path = _context_log_file or _log_file
-    if not path:
-        return
     try:
+        if not _session_input_seen and _context_log_file is None:
+            # 本次无任何输入：默认新日志必为空壳，不能推荐
+            if _startup_resume_path:
+                display = os.path.abspath(_startup_resume_path).replace("\\", "/")
+                print(f'\n💡 使用 marisa -r "{display}" 回到对话\n', flush=True)
+            # 全新会话且零输入 → 直接不提示（没有任何可回的东西）
+            return
+        path = _context_log_file or _log_file
+        if not path:
+            return
         display = os.path.abspath(path).replace("\\", "/")
         print(f'\n💡 使用 marisa -r "{display}" 回到对话\n', flush=True)
     except Exception:
@@ -2746,6 +2766,7 @@ def split_pipe_messages(text):
 def main():
     global tool_executing, interrupted, messages
     global _main_model_no_multimodal, _api_timeout_retry_remaining
+    global _startup_resume_path
 
     # 注册信号处理器——只用于工具执行中的中断
     # 用户输入中的 Ctrl+C 由 prompt_toolkit 处理
@@ -2899,6 +2920,9 @@ def main():
                 print(f"   📝 最后一条用户输入: {last_user_msg}{'...' if len(last_user_msg) >= 100 else ''}", flush=True)
             messages = restored_messages
             loaded_context_source = f"日志 {log_path}"
+            # 记住本次是用哪个日志恢复的：若本次会话没产生任何新输入就退出，
+            # 退出提示原样指向这个日志（那份才有内容），而不是刚生成的空壳新日志。
+            _startup_resume_path = log_path
     elif not args.context_log:
         # 初始化全局 messages（未指定 -r 或 -c 时的新会话）
         messages = [
@@ -3213,6 +3237,7 @@ def _agent_worker(bus):
     """
     global tool_executing, interrupted, messages
     global _main_model_no_multimodal, _api_timeout_retry_remaining
+    global _session_input_seen
 
     while True:
         # 每次外层循环开始时，执行大内容过期检查
@@ -3246,6 +3271,9 @@ def _agent_worker(bus):
 
         # 每次收到新的用户输入，刷新本轮的超时自动重试额度（最多 API_TIMEOUT_RETRY_MAX 次）
         _api_timeout_retry_remaining = API_TIMEOUT_RETRY_MAX
+        # 记一笔：本次会话确实进来过输入——退出提示据此判断「新日志是否为空壳」，
+        # 空壳时就不再往那个没内容的日志上引（详见 print_resume_hint）。
+        _session_input_seen = True
 
         # ✨ 开始干活 —— 状态栏切到「思考中」
         _set_agent_status("thinking")
