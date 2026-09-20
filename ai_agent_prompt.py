@@ -1119,19 +1119,45 @@ def init_logger():
         pass
 
 
-def save_messages_snapshot(msg_list):
-    """把当前 messages 追加到日志文件中。若设置了 -c/--context-log 则优先写入该文件"""
+def save_messages_snapshot(msg_list, tag=""):
+    """把当前 messages 追加到日志文件中。若设置了 -c/--context-log 则优先写入该文件。
+
+    tag：可选标记，会跟在快照时间戳后面（如 ``--- snapshot <时间> (interrupted) ---``），
+        仅为便于人肉排查；_resume_from_log 的标记正则 ``--- snapshot .* ---`` 依旧兼容。
+    """
     target = _context_log_file if _context_log_file else _log_file
     if target is None:
         return
     try:
         data = json.dumps(msg_list, ensure_ascii=False, indent=2)
+        suffix = f" {tag}" if tag else ""
         with open(target, "a", encoding="utf-8") as f:
-            f.write(f"\n--- snapshot {_timestamp()} ---\n")
+            f.write(f"\n--- snapshot {_timestamp()}{suffix} ---\n")
             f.write(data)
             f.write("\n")
     except Exception:
         pass  # 日志写入失败不影响主流程
+
+
+def save_interrupt_snapshot(msg_list):
+    """Ctrl+C 中断（大模型思考中 / 工具执行中）时，把当前上下文快照补写进日志。
+
+    背景：正常节奏是「一轮对话彻底跑完」才落盘快照——最终 assistant 回复写入、
+    或终止型/图片型工具写入。若用户在大模型思考或工具执行途中按了 Ctrl+C，
+    这一轮的 messages（至少包含用户刚敲的那条输入）还没来得及写日志；
+    此时直接退出，用户输入就凭空没了，-r 回去也看不到。
+
+    所以中断时立刻补写一份快照，保证「已经进到内存的上下文」都留在日志里。
+
+    落盘的是「中断瞬间」的 messages，可能正好停在 assistant(tool_calls) 之后、
+    部分工具响应还没补齐的位置。这没关系：续聊时主循环每次调 API 前都会跑
+    _prune_incomplete_tool_calls()，会自动给缺失的 tool_call_id 补一条兜底响应，
+    不会触发 400。
+    """
+    try:
+        save_messages_snapshot(msg_list, tag="(interrupted)")
+    except Exception:
+        pass  # 兜底：中断落盘失败绝不能反过来打断中断流程
 
 
 def save_error_snapshot(msg_list, error_msg):
@@ -3318,6 +3344,15 @@ def _agent_worker(bus):
                 # API 失败或被中断，清理残留
                 if msg is None:
                     messages.pop()  # 移除压缩请求
+                    if interrupted:
+                        # 压缩本身也是一次大模型思考。此处被 Ctrl+C：用户刚敲的输入在内存里
+                        # 已被丢弃（messages 回到压缩前的状态），但「用户输入不该凭空消失」——
+                        # 于是把 [压缩前上下文 + 用户输入] 补写进日志：
+                        # 即便用户就此退出，-r 回来依然能看到自己那句话。
+                        # 注意 messages + [...] 是新建列表，不会改动内存中的 messages。
+                        save_interrupt_snapshot(
+                            messages + [{"role": "user", "content": user_input}]
+                        )
                 continue
 
             content = msg.get("content") or ""
@@ -3878,6 +3913,16 @@ def _agent_worker(bus):
 
         finally:
             tool_executing = False
+
+        # ⭐ 本轮若被 Ctrl+C 中断收尾 —— 立刻把当前上下文补写进日志。
+        # 正常节奏是「一轮对话彻底跑完」才落盘快照；中断时这一轮的 messages
+        # （至少包含用户刚敲进去的那条输入）还没来得及写日志，
+        # 此时用户若直接退出，用户输入就凭空丢了、-r 回去也看不到。
+        # 放在 finally 之后：所有中断出口（思考中 API 抛 UserInterrupt、工具执行途中被中断、
+        # 循环头部检查到中断）都会汇流到这儿，且上面该清理的都清理完了，
+        # 落盘的是「干净、可直接续聊」的状态。
+        if interrupted:
+            save_interrupt_snapshot(messages)
 
     # 走到这里说明 worker 收到了 STOP 哨兵 —— 退出与资源清理统一由主线程负责
 
