@@ -35,6 +35,9 @@ SRC_SOCKET = "socket"
 SRC_PIPE = "pipe"
 SRC_BACKGROUND = "background"
 SRC_SYSTEM = "system"
+# 状态确认输入源：计划清单非空时由 agent 主循环自动注入（见 ai_agent_prompt._acquire_next_event）。
+# 它以一条 user 事件的形式把「未完成的计划项」重新喂给 agent，防止某次 API 返回没带工具调用后任务停摆。
+SRC_PLAN = "plan"
 
 # 哨兵：投递它表示「请主循环收工退出」。
 # 用带名字的 object() 而不是 None，方便在日志里一眼看出是停止信号。

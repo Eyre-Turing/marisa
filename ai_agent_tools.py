@@ -67,6 +67,204 @@ TOOL_HARD_CUTOFF = 200 * 1024  # 200KB
 
 
 # ============================================================
+#  状态确认列表（计划板）—— 无人值守任务的「自动续命」机制
+# ============================================================
+# 背景：夜晚无人值守跑长任务时，最怕某一次 API 返回没带工具调用，
+#       于是 agent 结束本轮、回到「等待输入」——任务就此停摆。
+# 机制：这里维护一个可供大模型增删改查的清单（默认空）。agent 主循环每次进入
+#       「等待输入」时，若清单仍有未完成项，就把清单内容作为一条 user 消息
+#       自动注入，唤醒 agent 继续干活，直到清单清空为止。
+#       ——清单的所有权归大模型：它自己决定加什么、何时标记完成/清空。
+class PlanBoard:
+    """状态确认列表：线程安全的任务清单（供无人值守自动续命使用）。
+
+    每一项形如 {"id": int, "content": str, "done": bool}。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = []        # [{ "id": int, "content": str, "done": bool }, ...]
+        self._next_id = 1
+
+    # ---------------- 增删改查 ----------------
+    def add(self, content):
+        content = (content or "").strip()
+        if not content:
+            return None
+        with self._lock:
+            item = {"id": self._next_id, "content": content, "done": False}
+            self._items.append(item)
+            self._next_id += 1
+            return dict(item)
+
+    def update(self, item_id, content=None, done=None):
+        with self._lock:
+            for it in self._items:
+                if it["id"] == item_id:
+                    if content is not None:
+                        it["content"] = str(content).strip()
+                    if done is not None:
+                        it["done"] = bool(done)
+                    return dict(it)
+        return None
+
+    def delete(self, item_id):
+        with self._lock:
+            for i, it in enumerate(self._items):
+                if it["id"] == item_id:
+                    return dict(self._items.pop(i))
+        return None
+
+    def clear(self, only_done=False):
+        with self._lock:
+            if only_done:
+                before = len(self._items)
+                self._items = [it for it in self._items if not it["done"]]
+                return before - len(self._items)
+            n = len(self._items)
+            self._items = []
+            return n
+
+    # ---------------- 查询 ----------------
+    def snapshot(self):
+        with self._lock:
+            return [dict(it) for it in self._items]
+
+    def pending(self):
+        """返回所有未完成项（供主循环判断是否需要自动唤醒）。"""
+        with self._lock:
+            return [dict(it) for it in self._items if not it["done"]]
+
+    def has_pending(self):
+        with self._lock:
+            return any(not it["done"] for it in self._items)
+
+    def render(self):
+        """把未完成项渲染成文本（供主循环自动注入 user 消息）。"""
+        with self._lock:
+            items = [dict(it) for it in self._items if not it["done"]]
+        return "\n".join(f"  [{it['id']}] ○ {it['content']}" for it in items)
+
+
+# 全局单例：整个进程共用一份计划清单
+plan_board = PlanBoard()
+
+
+# 终端回显时最多展示的清单条数（超出则省略，避免刷屏）
+PLAN_DISPLAY_MAX = 20
+
+
+def _print_plan_update(result, desc):
+    """在终端回显「计划」操作 + 当前清单，让用户感知到计划被使用了。
+
+    输出形如：
+        📋 计划 · 新增 #2「清洗数据」
+           清单（待办 2 / 共 3）：
+             [ 1] ✓ 拉取数据
+             [ 2] ○ 清洗数据
+             [ 3] ○ 生成报告
+    """
+    try:
+        lines = []
+        if result.get("success"):
+            lines.append(f"   📋 计划 · {desc}")
+            snap = plan_board.snapshot()
+            done_n = sum(1 for it in snap if it["done"])
+            pending_n = len(snap) - done_n
+            if snap:
+                lines.append(f"      清单（待办 {pending_n} / 共 {len(snap)}）：")
+                for it in snap[:PLAN_DISPLAY_MAX]:
+                    mark = "✓" if it["done"] else "○"
+                    lines.append(f"        [{it['id']:>2}] {mark} {it['content']}")
+                if len(snap) > PLAN_DISPLAY_MAX:
+                    lines.append(f"        … 其余 {len(snap) - PLAN_DISPLAY_MAX} 项省略")
+            else:
+                lines.append("      清单为空")
+        else:
+            lines.append(f"   📋 计划 · 操作失败：{result.get('err')}")
+        print("\n".join(lines) + "\n", flush=True)
+    except Exception:
+        # 回显失败绝不能影响工具本身
+        pass
+
+
+def update_plan(action, content=None, item_id=None, done=None, only_done=False):
+    """状态确认列表（计划）的增删改查。
+
+    action 取值：
+      add     新增一项（需 content）
+      update  修改一项（需 item_id；可选 content / done）
+      delete  删除一项（需 item_id）
+      list    列出全部
+      clear   清空（only_done=True 时只清理已完成项、保留未完成的）
+
+    每次调用都会在终端回显「本次操作 + 当前清单」，方便用户感知计划的使用。
+    """
+    action = (action or "").strip().lower()
+    result = None
+    desc = ""
+
+    if action == "add":
+        if not content:
+            result = {"success": 0, "err": "add 需要 content 参数"}
+        else:
+            item = plan_board.add(content)
+            desc = f"新增 #{item['id']}「{item['content']}」"
+            result = {"success": 1, "action": "add", "item": item}
+
+    elif action == "update":
+        if item_id is None:
+            result = {"success": 0, "err": "update 需要 item_id 参数"}
+        else:
+            item = plan_board.update(item_id, content=content, done=done)
+            if item is None:
+                result = {"success": 0, "err": f"未找到 id={item_id} 的计划项"}
+            else:
+                tags = []
+                if content is not None:
+                    tags.append("改内容")
+                if done is not None:
+                    tags.append("标记完成" if item["done"] else "标记未完成")
+                suffix = f"（{'、'.join(tags)}）" if tags else ""
+                desc = f"更新 #{item['id']}「{item['content']}」{suffix}"
+                result = {"success": 1, "action": "update", "item": item}
+
+    elif action == "delete":
+        if item_id is None:
+            result = {"success": 0, "err": "delete 需要 item_id 参数"}
+        else:
+            item = plan_board.delete(item_id)
+            if item is None:
+                result = {"success": 0, "err": f"未找到 id={item_id} 的计划项"}
+            else:
+                desc = f"删除 #{item['id']}「{item['content']}」"
+                result = {"success": 1, "action": "delete", "item": item}
+
+    elif action == "clear":
+        n = plan_board.clear(only_done=bool(only_done))
+        desc = f"清空{'已完成项' if only_done else '全部'}（移除 {n} 项）"
+        result = {"success": 1, "action": "clear", "removed": n}
+
+    elif action == "list":
+        desc = "查看清单"
+        result = {"success": 1, "action": "list"}
+
+    else:
+        result = {"success": 0,
+                  "err": f"未知 action '{action}'，可用：add / update / delete / list / clear"}
+
+    # 终端回显：本次操作 + 当前清单（失败也算一次「用了计划」）
+    _print_plan_update(result, desc)
+
+    # 附带最新清单快照，返回给大模型
+    if result.get("success"):
+        result["pending_count"] = len(plan_board.pending())
+        result["items"] = plan_board.snapshot()
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ============================================================
 #  2. 工具定义 & 执行
 # ============================================================
 
@@ -417,6 +615,40 @@ tools = [
                     }
                 },
                 "required": ["task_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_plan",
+            "description": "维护「状态确认列表」（计划/待办清单）—— 无人值守时长任务的「续命锚点」。清单默认空；当 agent 回到「等待输入」时，若清单仍有未完成项，系统会自动把未完成项作为一条 user 消息重新发给你，唤醒你继续干活。用法：开工前用 add 把任务拆成若干项；每完成一项用 update 设 done=true（或 delete 删掉）；全部做完了用 clear 清空。注意：只要清单非空就会被反复唤醒，所以务必在真正完成后清空，否则会一直循环。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "update", "delete", "list", "clear"],
+                        "description": "操作类型：add 新增 / update 修改 / delete 删除 / list 列出 / clear 清空"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "计划项内容（action=add 必填；action=update 时可选，表示改写内容）"
+                    },
+                    "item_id": {
+                        "type": "integer",
+                        "description": "计划项 id（action=update / delete 必填）"
+                    },
+                    "done": {
+                        "type": "boolean",
+                        "description": "是否已完成（action=update 时可选）"
+                    },
+                    "only_done": {
+                        "type": "boolean",
+                        "description": "action=clear 时可选：为 true 则只清理已完成项、保留未完成项"
+                    }
+                },
+                "required": ["action"]
             }
         }
     },
@@ -3071,6 +3303,7 @@ tool_func_map = {
     "read_full_file": read_full_file,
     "read_file_lines": read_file_lines,
     "compress": compress,
+    "update_plan": update_plan,
     "edit_file_lines": edit_file_lines,
     "edit_file_match": edit_file_match,
     "load_skill": load_skill,

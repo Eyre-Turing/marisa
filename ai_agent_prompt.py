@@ -393,6 +393,14 @@ DEFAULT_CONFIG = {
     # 与键盘输入平级 —— 谁先来谁触发主循环。
     # 协议：每行文本 = 一条消息；以 '!' 开头的行是控制指令（!exit 退出）；
     #       auth_token 非空时，连接后第一行必须等于该 token。
+    # ---- 状态确认列表（计划）自动续命 ----
+    # 开启后：当 agent 回到「等待输入」且计划清单仍有未完成项时，自动把未完成项
+    # 作为一条 user 消息（状态确认输入源）注入，唤醒 agent 继续循环，
+    # 防止夜晚无人值守时某次 API 返回没带工具调用导致任务就此停摆。
+    # plan_auto_continue_max：连续自动唤醒次数上限，超过后暂停自动续命、转为等待
+    # 真实输入（收到真实输入后计数归零，从而恢复续命）。
+    "plan_auto_continue": True,
+    "plan_auto_continue_max": 50,
     "input_sources": {
         "socket": {
             "enabled": False,
@@ -3255,6 +3263,73 @@ def _run_ui_loop(bus, session, use_prompt_toolkit):
     # ---- 退化模式 ----
     _degraded_loop()
 
+
+# ============================================================
+#  状态确认输入源 —— 计划清单非空时自动唤醒 agent，防止任务停摆
+# ============================================================
+# 详见 ai_agent_tools.PlanBoard。这里只负责在主循环「等待输入」处做决策：
+#   · 计划为空（或功能关闭）→ 与原来完全一致，阻塞等待真实输入；
+#   · 计划非空 → 优先处理已到位的真实输入；否则自动注入一条 user 事件唤醒 agent，
+#     直到清单清空；连续唤醒超过上限则暂停，避免死循环。
+_plan_auto_continue_count = 0   # 连续自动唤醒计数（真实输入到来时归零）
+
+
+def _plan_auto_continue_enabled():
+    try:
+        cfg = load_config() or {}
+        return bool(cfg.get("plan_auto_continue", True))
+    except Exception:
+        return True
+
+
+def _plan_auto_continue_limit():
+    try:
+        cfg = load_config() or {}
+        return max(1, int(cfg.get("plan_auto_continue_max", 50)))
+    except Exception:
+        return 50
+
+
+def _acquire_next_event(bus):
+    """从输入总线取一条事件（含「状态确认输入源」的自动注入逻辑）。
+
+    当计划清单仍有未完成项时：
+      · 若总线上已有真实输入（键盘 / socket / 管道 / 后台任务），优先返回它，
+        并把自动续命计数归零；
+      · 否则把未完成项渲染成一条 user 事件（source=plan）返回，唤醒 agent 继续；
+      · 连续自动唤醒达到上限后暂停，改为阻塞等待真实输入。
+    计划为空（或功能关闭）时行为与原来完全一致：阻塞等待真实输入。
+    """
+    global _plan_auto_continue_count
+
+    pending = ai_agent_tools.plan_board.pending() if _plan_auto_continue_enabled() else []
+    if not pending:
+        _plan_auto_continue_count = 0
+        return bus.get()
+
+    # 真实输入优先：拿到就处理，并重置续命计数
+    ready = bus.get_nowait()
+    if ready is not None:
+        _plan_auto_continue_count = 0
+        return ready
+
+    limit = _plan_auto_continue_limit()
+    if _plan_auto_continue_count >= limit:
+        print(f"   ⚠️ 已连续自动唤醒 {_plan_auto_continue_count} 次、计划仍未清空，"
+              f"暂停自动续命，等待真实输入…\n", flush=True)
+        _plan_auto_continue_count = 0
+        return bus.get()   # 阻塞等真实输入（真实输入会重置计数，从而恢复续命）
+
+    _plan_auto_continue_count += 1
+    print(f"   📋 计划尚有 {len(pending)} 项未完成，自动唤醒继续"
+          f"（第 {_plan_auto_continue_count}/{limit} 次）…\n", flush=True)
+    text = (
+        "[状态确认 · 自动唤醒] 你的计划清单中仍有未完成项，请继续推进：\n"
+        + ai_agent_tools.plan_board.render()
+        + "\n（完成某项后请调用 update_plan 把它标记为 done 或删除；"
+          "全部完成后请调用 update_plan 清空清单，此后将不再自动唤醒。）"
+    )
+    return io_bus.InputEvent(io_bus.SRC_PLAN, text)
 def _agent_worker(bus):
     """Agent 工作线程：从输入总线取事件，驱动一轮又一轮对话。
 
@@ -3275,11 +3350,11 @@ def _agent_worker(bus):
         # 💤 即将阻塞在 bus.get() 上 —— 状态栏显示「等待输入」
         _set_agent_status("idle")
 
-        # 📥 从输入总线阻塞取一条事件（多路复用：谁先来谁触发）
+        # 📥 取一条输入事件（多路复用：谁先来谁触发）
+        # 若计划清单非空，这里会优先消化已到位的真实输入、否则自动注入
+        # 「状态确认」user 事件唤醒 agent 继续 —— 详见 _acquire_next_event。
         try:
-            event = bus.get()
-        except (KeyboardInterrupt, EOFError):
-            break
+            event = _acquire_next_event(bus)
         except (KeyboardInterrupt, EOFError):
             break
         if event is None or event.text is io_bus.STOP:
@@ -3288,7 +3363,7 @@ def _agent_worker(bus):
         if user_input is None:
             break
 
-        if event.source != io_bus.SRC_KEYBOARD:
+        if event.source != io_bus.SRC_KEYBOARD and event.source != io_bus.SRC_PLAN:
             print(f"   📨 收到来自 [{event.source}] 的输入\n", flush=True)
 
         if not user_input.strip():
