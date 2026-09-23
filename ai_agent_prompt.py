@@ -718,6 +718,13 @@ AUTO_COMPRESS_THRESHOLD = 700_000
 # 「大模型压缩」阈值（token）：新的一轮对话开始前上下文超过此值时，先让大模型调用 compress 工具重写上下文
 LLM_COMPRESS_THRESHOLD = 700_000
 
+# 工具结果写入 messages 前的统一兜底硬上限（字符）。
+# 内置工具内部已按 ai_agent_tools.TOOL_HARD_CUTOFF(200KB) 截断，
+# 但 MCP 等动态注册的工具没有这层保护——这里对所有工具结果再兜一层，
+# 阻止单条巨型结果（MCP 返回的大 JSON / base64 / 网页全文等）
+# 在「自动压缩」生效之前就把上下文甚至内存撑爆。
+TOOL_RESULT_HARD_LIMIT = 512 * 1024  # 512KB
+
 # 长内容自动过期机制（第二层：软过期）
 # tool response 内容超过此大小时在 large_content_counter 中计数，
 # 达到过期轮数后自动替换为过期提示
@@ -743,11 +750,72 @@ messages = []
 
 
 def _json_bytes(obj):
-    """任意对象序列化成 JSON 后的 UTF-8 字节数。"""
-    json_str = json.dumps(obj, ensure_ascii=False)
+    """任意对象序列化成 JSON 后的 UTF-8 字节数（流式统计，不物化整串）。
+
+    旧实现先 json.dumps 生成完整字符串、再 encode 成完整字节串，
+    峰值内存 ≈ 对象图 + 字符串 + 字节串（约数据体积的 2~4 倍）。
+    当上下文很大时，光是「量一下它多大」这个动作本身就会把内存撑爆
+    （MemoryError）——测量成本反而高于被测量对象。
+    改用 JSONEncoder.iterencode 边产出边累加，全程只保留单个 chunk，
+    时间仍是 O(n)，内存降到 O(1)。
+    """
+    encoder = json.JSONEncoder(ensure_ascii=False)
+    total = 0
     # 用户粘贴/外部输入可能带入 UTF-8 surrogate（\ud800-\udfff），直接 encode 会抛
     # UnicodeEncodeError。这里用 replace 兜底，保证上下文估算永不因编码崩溃。
-    return len(json_str.encode('utf-8', errors='replace'))
+    for chunk in encoder.iterencode(obj):
+        total += len(chunk.encode('utf-8', errors='replace'))
+    return total
+
+
+def _rough_json_bytes(obj, _depth=0):
+    """MemoryError 兜底：不真正序列化，递归累加粗略字节数。
+
+    口径略偏小（忽略引号/逗号/转义开销），但数量级正确，足够支撑
+    「是否超过压缩阈值」的判断继续运行，避免测量本身把主流程拖垮。
+    """
+    if _depth > 200:                      # 防御异常深/循环结构
+        return 0
+    if obj is None:
+        return 4
+    if isinstance(obj, bool):
+        return 5
+    if isinstance(obj, (int, float)):
+        return 24
+    if isinstance(obj, str):
+        return len(obj.encode('utf-8', errors='replace')) + 2
+    if isinstance(obj, (list, tuple)):
+        return 2 + len(obj) + sum(_rough_json_bytes(x, _depth + 1) for x in obj)
+    if isinstance(obj, dict):
+        total = 2
+        for k, v in obj.items():
+            total += _rough_json_bytes(k, _depth + 1) + _rough_json_bytes(v, _depth + 1) + 1
+        return total
+    return 16
+
+
+def _clip_tool_result(tool_result, tool_name):
+    """对单次工具结果做统一兜底硬截断，防止巨型结果撑爆上下文/内存。
+
+    内置工具内部已按 ai_agent_tools.TOOL_HARD_CUTOFF(200KB) 截断，
+    但 MCP 等动态注册的工具没有这层保护——这里对所有工具结果再兜一层。
+    """
+    if not isinstance(tool_result, str) or len(tool_result) <= TOOL_RESULT_HARD_LIMIT:
+        return tool_result
+    orig_len = len(tool_result)
+    clipped = (
+        tool_result[:TOOL_RESULT_HARD_LIMIT]
+        + f"\n\n...（工具 {tool_name} 返回结果过大，已截断。"
+          f"原始大小约 {orig_len // 1024}KB，仅保留前 "
+          f"{TOOL_RESULT_HARD_LIMIT // 1024}KB）"
+    )
+    print(
+        f"   ✂️ 工具 {tool_name} 返回结果过大"
+        f"（{orig_len // 1024}KB），已截断至 "
+        f"{TOOL_RESULT_HARD_LIMIT // 1024}KB",
+        flush=True,
+    )
+    return clipped
 
 
 def get_context_size(msg_list):
@@ -787,7 +855,13 @@ def get_request_size(msg_list=None, tools=None):
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    return _json_bytes(payload)
+    try:
+        return _json_bytes(payload)
+    except MemoryError:
+        # 兜底：极端情况下仍可能内存耗尽。退化为粗略估算，保证
+        # 「是否该压缩」这一步永不因测量自己而崩——宁可估不准，
+        # 也要让后续的压缩逻辑有机会跑起来把内存降下去。
+        return _rough_json_bytes(payload)
 
 
 # ---- 真实 token 用量（取自 API 响应的 usage 字段）----
@@ -3469,6 +3543,8 @@ def _agent_worker(bus):
                         tool_result = func(**args)
                     except (TypeError, Exception) as e:
                         tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
+                    # 🛡️ 兜底硬截断：防止巨型工具结果撑爆上下文/内存
+                    tool_result = _clip_tool_result(tool_result, tool_name)
                     # 终端工具（compress）内部已修改全局 messages 并追加了 assistant 确认
                     if is_terminal:
                         print("   ↳ 压缩完成，上下文已刷新！", flush=True)
@@ -3681,6 +3757,10 @@ def _agent_worker(bus):
                     except (TypeError, Exception) as e:
                         tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
                         print(f"\n⚠️ 工具 {tool_name} 调用失败: {e}\n", flush=True)
+
+                    # 🛡️ 兜底硬截断：拦住 MCP 等动态工具返回的巨型结果，
+                    # 防止它在本轮「自动压缩」检查之前就撑爆上下文/内存。
+                    tool_result = _clip_tool_result(tool_result, tool_name)
 
                     # 如果被中断了，不把结果加入对话
                     if interrupted:
