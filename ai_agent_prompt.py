@@ -845,6 +845,31 @@ def _strip_image_base64_for_context(tool_result, tool_name):
     return json.dumps(obj, ensure_ascii=False), b64
 
 
+def _strip_mcp_images_for_context(tool_result):
+    """把 MCP 工具结果里的内联图片（_mcp_images）摘出来走内部通道。
+
+    MCP（stdio/http/sse）工具返回的图片是以 base64 内联在结果 JSON 里的，体积可能很大。
+    若不摘出，会先撞上 TOOL_RESULT_HARD_LIMIT 被硬截断 —— JSON 被砍坏 → 解析失败 →
+    图片静默丢失，且半截 base64 会被当普通文本写进上下文。
+
+    返回 (context_result, images)：
+      - context_result：去掉 _mcp_images 后的结果字符串（纯文本）；无图片则原样返回；
+      - images：[{"base64","mimeType"}, ...]（无则 None），仅供主循环内部注入多模态消息/交辅助模型识别。
+    """
+    if not isinstance(tool_result, str) or "_mcp_images" not in tool_result:
+        return tool_result, None
+    try:
+        obj = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return tool_result, None
+    if not isinstance(obj, dict):
+        return tool_result, None
+    images = obj.pop("_mcp_images", None)
+    if not images:
+        return tool_result, None
+    return json.dumps(obj, ensure_ascii=False), images
+
+
 def get_context_size(msg_list):
     """messages 的 JSON 字节数（只算对话本身，不含工具 schema）。"""
     return _json_bytes(msg_list)
@@ -3549,6 +3574,9 @@ def _agent_worker(bus):
                         args = json.loads(tool["function"]["arguments"])
                     except json.JSONDecodeError:
                         continue
+                    # 🎛️ 摘出内部参数 _image_mode（读图方式选择），不转发给 MCP 服务器
+                    if isinstance(args, dict):
+                        args.pop("_image_mode", None)
                     func = tool_func_map.get(tool["function"]["name"])
                     tool_name = tool["function"]["name"]
                     if func is None:
@@ -3573,6 +3601,8 @@ def _agent_worker(bus):
                     # 🖼️ 图片类工具：base64 摘出走内部通道，别写进上下文 / 被硬截断
                     if tool_name in IMAGE_TOOLS:
                         tool_result, _ = _strip_image_base64_for_context(tool_result, tool_name)
+                    # 📸 MCP 内联图片同样先摘出（此阶段不注入图片，摘出丢弃即可，仅为不污染上下文）
+                    tool_result, _ = _strip_mcp_images_for_context(tool_result)
                     # 🛡️ 兜底硬截断：防止巨型工具结果撑爆上下文/内存
                     tool_result = _clip_tool_result(tool_result, tool_name)
                     # 终端工具（compress）内部已修改全局 messages 并追加了 assistant 确认
@@ -3748,6 +3778,8 @@ def _agent_worker(bus):
                     except json.JSONDecodeError:
                         continue
 
+                    # 🎛️ 摘出内部参数 _image_mode（MCP 读图方式选择），不转发给 MCP 服务器
+                    _image_mode = args.pop("_image_mode", None) if isinstance(args, dict) else None
                     tool_name = tool["function"]["name"]
 
                     # 🔥 自动路由：根据工具名查找函数，**kwargs 传参
@@ -3791,6 +3823,8 @@ def _agent_worker(bus):
                     image_b64_internal = None
                     if tool_name in IMAGE_TOOLS:
                         tool_result, image_b64_internal = _strip_image_base64_for_context(tool_result, tool_name)
+                    # 📸 MCP 工具结果里的内联图片同样先摘出，避免被硬截断砍坏 / 写进上下文
+                    tool_result, mcp_images_internal = _strip_mcp_images_for_context(tool_result)
 
                     # 🛡️ 兜底硬截断：拦住 MCP 等动态工具返回的巨型结果，
                     # 防止它在本轮「自动压缩」检查之前就撑爆上下文/内存。
@@ -3925,30 +3959,28 @@ def _agent_worker(bus):
                                 print(f"   ⚠️ 图片读取失败: {result_data.get('err', '未知错误')}", flush=True)
                         continue  # 继续处理其他工具
 
-                    # 📸 MCP 图片检测：任何工具（包括 MCP 工具）返回的结果中
-                    # 如果包含 _mcp_images 字段，像 IMAGE_TOOLS 一样注入多模态消息
-                    mcp_images = None
-                    try:
-                        _tr_parsed = json.loads(tool_result)
-                        if isinstance(_tr_parsed, dict) and "_mcp_images" in _tr_parsed:
-                            mcp_images = _tr_parsed["_mcp_images"]
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+                    # 📸 MCP 图片：_mcp_images 已在硬截断之前摘出（走内部通道），此处直接取用；
+                    # 写进上下文的 clean_tool_content 只含纯文本，不含 base64。
+                    mcp_images = mcp_images_internal
+                    if mcp_images:
+                        clean_tool_content = tool_result
 
-                    if mcp_images and isinstance(mcp_images, list) and len(mcp_images) > 0:
-                        # 从 tool_result 中去掉 _mcp_images 字段，得到纯文本 tool 响应
-                        try:
-                            _clean_result = json.loads(tool_result)
-                            if isinstance(_clean_result, dict):
-                                _clean_result.pop("_mcp_images", None)
-                                clean_tool_content = json.dumps(_clean_result)
-                            else:
-                                clean_tool_content = tool_result
-                        except (json.JSONDecodeError, TypeError):
-                            clean_tool_content = tool_result
-
-                        mul_config = ai_agent_tools._build_mul_config()
-                        if mul_config:
+                        # 🎛️ 读图方式由大模型通过 _image_mode 参数选择：auto/main/aux。
+                        #    auto（默认）：主模型支持多模态就自己看，否则交给辅助模型。
+                        _mode = _image_mode if _image_mode in ("auto", "main", "aux") else "auto"
+                        if _mode == "main":
+                            _use_main = True
+                        elif _mode == "aux":
+                            _use_main = False
+                        else:  # auto
+                            _use_main = not _main_model_no_multimodal
+                        mul_config = None if _use_main else ai_agent_tools._build_mul_config()
+                        print(
+                            f"   🎛️ MCP 图片读图方式: {_mode}"
+                            f"（{'主模型直读' if _use_main else ('辅助模型' if mul_config else '无可用读图模型')}）",
+                            flush=True,
+                        )
+                        if (not _use_main) and mul_config:
                             # 🔮 多模态辅助模型读图模式：MCP 图片交给辅助模型识别成文本描述，
                             # 并入 tool response 文本返回（主模型可能不支持多模态，不再注入图片消息）
                             # 🔮 读图 prompt 携带主模型调用 MCP 工具的原始 arguments（原文），

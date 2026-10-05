@@ -33,6 +33,33 @@ import urllib.request
 import urllib.error
 
 # ============================================================
+# MCP 图片读图方式：给每个 MCP 工具注入可选参数 _image_mode
+#   让大模型对「返回图片的 MCP 工具」自行选择：主模型直读 / 辅助模型转文字
+# ============================================================
+_IMAGE_MODE_SCHEMA_PROP = {
+    "type": "string",
+    "enum": ["auto", "main", "aux"],
+    "description": (
+        "可选。仅当该工具会返回图片时生效，用于选择读图方式："
+        "main=图片直接注入给主模型自己看（需主模型支持多模态）；"
+        "aux=交给已配置的多模态辅助模型转成文字描述；"
+        "auto=默认，按主模型是否支持多模态自动选择。"
+    ),
+}
+
+
+def _with_image_mode_prop(schema):
+    """给 MCP 工具的 parameters 注入可选的 _image_mode 参数（返回新 dict，不改原对象）。"""
+    if not isinstance(schema, dict):
+        schema = {}
+    schema = dict(schema)
+    props = dict(schema.get("properties") or {})
+    props.setdefault("_image_mode", _IMAGE_MODE_SCHEMA_PROP)
+    schema["properties"] = props
+    schema.setdefault("type", "object")
+    return schema
+
+# ============================================================
 # 配置管理
 # ============================================================
 
@@ -394,10 +421,10 @@ class MCPStdioServer:
                 "function": {
                     "name": name,
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("inputSchema", {
+                    "parameters": _with_image_mode_prop(tool.get("inputSchema", {
                         "type": "object",
                         "properties": {}
-                    })
+                    }))
                 },
                 "_mcp_server": self.name,       # 标记来自哪个 MCP 服务器
                 "_mcp_original_name": mcp_name   # 保存原始名称
@@ -778,10 +805,10 @@ class MCPHttpServer:
                 "function": {
                     "name": name,
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("inputSchema", {
+                    "parameters": _with_image_mode_prop(tool.get("inputSchema", {
                         "type": "object",
                         "properties": {}
-                    })
+                    }))
                 },
                 "_mcp_server": self.name,
                 "_mcp_original_name": mcp_name
@@ -1145,7 +1172,7 @@ class MCPHttpSseServer:
                 "function": {
                     "name": name,
                     "description": tool.get("description", ""),
-                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}})
+                    "parameters": _with_image_mode_prop(tool.get("inputSchema", {"type": "object", "properties": {}}))
                 },
                 "_mcp_server": self.name,
                 "_mcp_original_name": mcp_name
