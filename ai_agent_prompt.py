@@ -818,6 +818,33 @@ def _clip_tool_result(tool_result, tool_name):
     return clipped
 
 
+def _strip_image_base64_for_context(tool_result, tool_name):
+    """图片类工具（read_image）结果写进上下文 / 硬截断之前，先把巨大的 base64 摘出来。
+
+    返回 (context_result, image_b64)：
+      - context_result：去掉 base64 字段后的结果字符串（元信息尚在）；非图片工具原样返回；
+      - image_b64：摘出来的 base64（无则 None）。它仅供主循环内部拼「多模态 user 消息」用，
+                   绝不写进上下文、也不参与上下文大小统计。
+
+    背景：base64 动辄几百 KB～几 MB。若混在工具结果里，会先撞上 TOOL_RESULT_HARD_LIMIT
+    被硬截断——把 JSON 拦腰砍断 → json.loads 失败 → 图片被误判为「读取失败」而丢弃，
+    同时半截 base64 还会被当成普通工具文本塞进上下文。把 base64 与「写进上下文的结果」
+    分离后，硬截断永远只面对小体积元信息，天然不会再破坏图片读取，也无需按工具名开小灶。
+    """
+    if tool_name not in IMAGE_TOOLS or not isinstance(tool_result, str):
+        return tool_result, None
+    try:
+        obj = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return tool_result, None
+    if not isinstance(obj, dict) or not obj.get("success"):
+        return tool_result, None
+    b64 = obj.pop("base64", None)
+    if not b64:
+        return tool_result, None
+    return json.dumps(obj, ensure_ascii=False), b64
+
+
 def get_context_size(msg_list):
     """messages 的 JSON 字节数（只算对话本身，不含工具 schema）。"""
     return _json_bytes(msg_list)
@@ -3543,6 +3570,9 @@ def _agent_worker(bus):
                         tool_result = func(**args)
                     except (TypeError, Exception) as e:
                         tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
+                    # 🖼️ 图片类工具：base64 摘出走内部通道，别写进上下文 / 被硬截断
+                    if tool_name in IMAGE_TOOLS:
+                        tool_result, _ = _strip_image_base64_for_context(tool_result, tool_name)
                     # 🛡️ 兜底硬截断：防止巨型工具结果撑爆上下文/内存
                     tool_result = _clip_tool_result(tool_result, tool_name)
                     # 终端工具（compress）内部已修改全局 messages 并追加了 assistant 确认
@@ -3754,9 +3784,13 @@ def _agent_worker(bus):
                         tool_result = func(**args)
                     except (TypeError, Exception) as e:
                         tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
-                    except (TypeError, Exception) as e:
-                        tool_result = json.dumps({"success": 0, "err": f"工具 {tool_name} 调用失败: {e}"})
-                        print(f"\n⚠️ 工具 {tool_name} 调用失败: {e}\n", flush=True)
+
+                    # 🖼️ 图片类工具：先把 base64 摘出来走「内部通道」，只把元信息
+                    # 留在结果里写进上下文 / 交给下面的硬截断——base64 动辄几百 KB，
+                    # 混在结果里会被 TOOL_RESULT_HARD_LIMIT 砍成非法 JSON，导致图片丢失。
+                    image_b64_internal = None
+                    if tool_name in IMAGE_TOOLS:
+                        tool_result, image_b64_internal = _strip_image_base64_for_context(tool_result, tool_name)
 
                     # 🛡️ 兜底硬截断：拦住 MCP 等动态工具返回的巨型结果，
                     # 防止它在本轮「自动压缩」检查之前就撑爆上下文/内存。
@@ -3788,6 +3822,11 @@ def _agent_worker(bus):
                             result_data = json.loads(tool_result)
                         except (json.JSONDecodeError, TypeError):
                             result_data = {"success": 0}
+
+                        # 🖼️ base64 之前已被摘出（内部通道），这里补回供拼多模态 user 消息；
+                        # 它只会进入「多模态 user 消息」，不会再写回上下文里的工具结果。
+                        if image_b64_internal and result_data.get("success"):
+                            result_data["base64"] = image_b64_internal
 
                         _is_url_src = result_data.get("source") == "url"
                         if result_data.get("success") and ("base64" in result_data or _is_url_src):
