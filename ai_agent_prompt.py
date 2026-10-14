@@ -2751,11 +2751,142 @@ if HAS_PROMPT_TOOLKIT:
             return base
 
 
+# ============================================================
+#  Windows 控制台 CJK/歧义宽度对齐（仅 Windows，纯标准库）
+# ------------------------------------------------------------
+#  背景：Windows 控制台(conhost / ConPTY)按「字体」逐字符决定显示宽度，
+#  对 East Asian Ambiguous(A) 类字符（中文引号 “”、破折号 ——、
+#  αβ、→、①、★ 等）可能算 2 格；而 prompt_toolkit 底层用的 wcwidth
+#  默认把它们一律算 1 格。两者对不上，输入框里删除/移动光标就会出现
+#  「残影」「错位」——其实是删掉了、只是显示没擦干净。
+#
+#  解决：用 Windows 控制台 API 现场「实测」每个 A 类字符的真实宽度
+#  （建一个不显示的幕后屏幕缓冲区，写入字符后看光标推进了几格），
+#  再覆盖 prompt_toolkit 的宽度计算。全程 ctypes 标准库，无新依赖。
+#
+#  为什么只做 Windows：Linux/macOS 的终端默认把 A 类字符当 1 格，与
+#  wcwidth 默认值一致，本就不会出问题；且本函数探测失败会静默跳过，
+#  行为与改动前完全相同（零风险）。设环境变量 MARISA_NO_CJK_WIDTH=1
+#  可强制禁用。
+# ============================================================
+
+_WIN_CJK_WIDTH = None        # 实测得到的 A 类字符宽度函数；None = 未启用
+_WIN_CJK_WIDTH_TRIED = False
+
+
+def _install_windows_cjk_width():
+    """把 prompt_toolkit 的字符宽度对齐到真实控制台（仅 Windows）。
+
+    成功返回 True；非 Windows / 无控制台 / 任何异常 → 返回 False（调用方忽略）。
+    只重写 East Asian Ambiguous(A) 类字符的宽度，其余一律交给原 wcwidth。
+    """
+    global _WIN_CJK_WIDTH, _WIN_CJK_WIDTH_TRIED
+    if _WIN_CJK_WIDTH_TRIED:
+        return _WIN_CJK_WIDTH is not None
+    _WIN_CJK_WIDTH_TRIED = True
+
+    if os.name != "nt" or not HAS_PROMPT_TOOLKIT:
+        return False
+    if os.environ.get("MARISA_NO_CJK_WIDTH"):   # 应急开关
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import unicodedata
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        # --- 幕后屏幕缓冲区：不 SetConsoleActiveScreenBuffer → 永不显示，零闪烁 ---
+        _CreateBuf = k32.CreateConsoleScreenBuffer
+        _CreateBuf.restype = ctypes.c_void_p
+        _CreateBuf.argtypes = [wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                               wintypes.DWORD, ctypes.c_void_p]
+        GENERIC_RW = 0x80000000 | 0x40000000
+        FILE_SHARE_RW = 0x00000001 | 0x00000002
+        CONSOLE_TEXTMODE_BUFFER = 0x00000001
+        hbuf = _CreateBuf(GENERIC_RW, FILE_SHARE_RW, None, CONSOLE_TEXTMODE_BUFFER, None)
+        if not hbuf or hbuf == ctypes.c_void_p(-1).value:
+            return False
+
+        class _COORD(ctypes.Structure):
+            _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+        class _SMALL_RECT(ctypes.Structure):
+            _fields_ = [("Left", ctypes.c_short), ("Top", ctypes.c_short),
+                        ("Right", ctypes.c_short), ("Bottom", ctypes.c_short)]
+
+        class _CSBI(ctypes.Structure):
+            _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                        ("wAttributes", ctypes.c_ushort), ("srWindow", _SMALL_RECT),
+                        ("dwMaximumWindowSize", _COORD)]
+
+        k32.GetConsoleScreenBufferInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CSBI)]
+        k32.SetConsoleCursorPosition.argtypes = [ctypes.c_void_p, _COORD]
+        k32.WriteConsoleW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD,
+                                      ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        _written = wintypes.DWORD()
+
+        def _cursor_x():
+            c = _CSBI()
+            k32.GetConsoleScreenBufferInfo(ctypes.c_void_p(hbuf), ctypes.byref(c))
+            return c.dwCursorPosition.X
+
+        def _probe_one(ch):
+            # 光标置 (0,0) → 读 X → 写该字符 → 再读 X → 差值即显示宽度
+            k32.SetConsoleCursorPosition(ctypes.c_void_p(hbuf), _COORD(0, 0))
+            x0 = _cursor_x()
+            k32.WriteConsoleW(ctypes.c_void_p(hbuf), ch, 1, ctypes.byref(_written), None)
+            x1 = _cursor_x()
+            w = x1 - x0
+            return w if w in (1, 2) else 1
+
+        _table = {}
+        _lock = threading.Lock()
+
+        def _width_of_ambiguous(ch):
+            # 懒加载：某 A 类字符第一次出现才探测，之后走缓存
+            w = _table.get(ch)
+            if w is None:
+                with _lock:
+                    w = _table.get(ch)
+                    if w is None:
+                        try:
+                            w = _probe_one(ch)
+                        except Exception:
+                            w = 1
+                        _table[ch] = w
+            return w
+
+        # --- 覆盖 prompt_toolkit 的 wcwidth：只重写 A 类，其余原样 ---
+        import prompt_toolkit.utils as _ptu
+        _orig_wcwidth = _ptu.wcwidth
+
+        def _patched_wcwidth(ch):
+            try:
+                if len(ch) == 1 and unicodedata.east_asian_width(ch) == "A":
+                    return _width_of_ambiguous(ch)
+            except Exception:
+                pass
+            return _orig_wcwidth(ch)
+
+        _ptu.wcwidth = _patched_wcwidth
+        _ptu._CHAR_SIZES_CACHE.clear()   # 清掉旧缓存（可能已存了 A 类字符的旧宽度）
+
+        _WIN_CJK_WIDTH = _width_of_ambiguous
+        return True
+    except Exception:
+        return False
+
+
 def create_prompt_session():
     """创建一个支持多行输入的 PromptSession（需 prompt_toolkit 可用时调用）"""
     if not HAS_PROMPT_TOOLKIT:
         # 组件缺失时不应被调用，返回 None 让调用方走 input 分支
         return None
+
+    # Windows：把字符宽度对齐到真实控制台（修正中文引号/破折号等删除残影）
+    _install_windows_cjk_width()
 
     # 自定义快捷键绑定
     bindings = KeyBindings()
@@ -2819,14 +2950,22 @@ def read_multiline_input(prompt):
 
 
 def _display_width(s):
-    """计算字符串在终端里的显示宽度：东亚宽/全角字符算 2 列，组合字符算 0。"""
+    """计算字符串在终端里的显示宽度：东亚宽/全角字符算 2 列，组合字符算 0。
+
+    Windows 下若已实测出控制台的字符宽度（见 _install_windows_cjk_width），
+    则歧义宽度(A)字符按实测值算，与输入框渲染保持一致。
+    """
     import unicodedata
 
     width = 0
     for ch in s:
         if unicodedata.combining(ch):
             continue
-        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw == "A" and _WIN_CJK_WIDTH is not None:
+            width += _WIN_CJK_WIDTH(ch)
+        else:
+            width += 2 if eaw in ("W", "F") else 1
     return width
 
 
