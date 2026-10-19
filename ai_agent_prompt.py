@@ -277,6 +277,163 @@ def _strip_ansi(text):
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+# ============================================================
+#  终端输出完整性：影子落盘 + 分块写入 + 自检
+# ============================================================
+# 现象（真实场景里复现过两次）：大模型的长回复写到一半，后半截没出现在终端上；
+#   截断点之后"整片消失"，输入框正常，无任何报错。
+# 已排除：终端本身收不下大块（用 _bigwrite_test.py 直接写 157 行/2.2 万字节完全正常）。
+# 用最小 prompt_toolkit 场景也复现不出来（整块/40 行/15 行/15 行+节流，四种都完整）。
+# 说明差异在真实场景特有的东西上：rich 渲染后的 ANSI 密度、bottom_toolbar 的
+#   refresh_interval=0.3 持续重绘、多行输入框占用的屏高。
+# 因此这里走"规避 + 埋点"双轨：
+#   ① 影子落盘：每次真正要输出的文本先落一份到 log/*.console.log，永不丢内容
+#   ② 分块写入：把一次 write 切成小批（默认 12 行/批），避免单批过大撞上未知上限
+#   ③ 自检命令：输入 !selftest 让真实管道吐一段长文本，随时验证是否还截断
+# ------------------------------------------------------------
+# 单批最大行数。取 12 是因为常见终端可视区 24~40 行，12 行远小于一屏，
+# 既能保证每批之后 renderer 有机会重新校准光标，又不会慢得让人等。
+OUTPUT_CHUNK_LINES = 12
+# 块间让出时间（秒）。给终端渲染器和 renderer 一点喘息，别把几块挤进同一帧。
+OUTPUT_CHUNK_PAUSE = 0.03
+# 总开关：main() 里按 --no-chunk 置 False。默认开启分块。
+USE_CHUNKED_OUTPUT = True
+
+
+def _shadow_console_path():
+    """影子输出日志的路径（与会话日志同目录，名字加 .console）。"""
+    try:
+        base = _log_file
+    except NameError:
+        base = None
+    if not base:
+        return None
+    try:
+        return os.path.splitext(base)[0] + ".console.log"
+    except Exception:
+        return None
+
+
+_SHADOW_NOTICE_SHOWN = [False]
+
+
+def _shadow_console(text):
+    """把即将写到终端的文本原样落盘一份。
+
+    意义：终端显示再怎么抽风，完整内容都还在磁盘上，随时能回看/复制。
+    首次落盘时会在界面上提示一次路径，方便用户去捞内容。
+    """
+    path = _shadow_console_path()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+            f.write("\n")
+    except Exception:
+        return
+    if not _SHADOW_NOTICE_SHOWN[0]:
+        _SHADOW_NOTICE_SHOWN[0] = True
+        try:
+            sys.stdout.write("   ℹ️ 输出影子日志: %s\n" % path)
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+
+def _install_chunked_stdout(proxy, max_lines=None, pause=None):
+    """把 StdoutProxy 的 write 切成小批写出（就地替换，不改变调用方代码）。
+
+    两个动作：
+      1. proxy.sleep_between_writes 从默认 0.2s 降到 0.02s。
+         否则 flush 线程每批之间睡 0.2 秒，会把我们切好的小块又合并成大块，
+         分块就白切了。
+      2. 包装 write：含换行的数据按 max_lines 行一批逐批转发，批间 sleep。
+         按行切是安全的：rich 渲染出的 ANSI 序列不会跨行，不会把转义码劈开。
+
+    任何一步失败都退回原生行为，绝不影响主流程。
+    """
+    max_lines = max_lines or OUTPUT_CHUNK_LINES
+    pause = OUTPUT_CHUNK_PAUSE if pause is None else pause
+    try:
+        proxy.sleep_between_writes = 0.02
+    except Exception:
+        pass
+
+    orig_write = proxy.write
+    _wlock = threading.RLock()
+
+    def write(data):
+        # 加锁：agent 工作线程、后台任务、主线程都可能同时往 stdout 写，
+        # 外层分块如果不锁，几个来源的块会互相插进对方中间，反而更容易花屏。
+        with _wlock:
+            try:
+                if not isinstance(data, str) or "\n" not in data:
+                    return orig_write(data)
+                lines = data.split("\n")
+                tail = lines.pop()          # 末尾可能不以 \n 结尾，单独补发
+                total = len(lines)
+                for i in range(0, total, max_lines):
+                    orig_write("\n".join(lines[i:i + max_lines]) + "\n")
+                    if i + max_lines < total:
+                        time.sleep(pause)
+                if tail:
+                    orig_write(tail)
+                return len(data)
+            except Exception:
+                try:
+                    return orig_write(data)
+                except Exception:
+                    return len(data) if isinstance(data, str) else 0
+
+    proxy.write = write
+    return proxy
+
+
+def _selftest_markdown(n_code_lines=30):
+    """生成一段用于自检的长 markdown：含超长代码块（ANSI 最密集）+ 表格 + 中文。
+
+    刻意做成"渲染后上百行、数万字符"的真实量级，结尾是哨兵行。
+    """
+    parts = [
+        "## 🧪 终端输出完整性自检\n",
+        "\n",
+        "下面是一大段代码块（ANSI 高亮最密集的区域），最后有哨兵行。\n",
+        "\n",
+        "**只要你能看到 `=== END SELFTEST ===`，就说明这一整块完整落地了。**\n",
+        "\n",
+        "```python\n",
+    ]
+    for i in range(1, n_code_lines + 1):
+        parts.append(
+            "def line_%03d(x, y=%d):\n"
+            "    # 中文注释一二三四五六七八九十 0123456789 abcdefghijklmnop\n"
+            "    return x + y * %d\n" % (i, i, i)
+        )
+    parts.append("```\n")
+    parts.append("\n| 序号 | 说明 |\n| --- | --- |\n| 1 | 表格渲染 |\n| 2 | 中文宽度 |\n")
+    parts.append("\n=== END SELFTEST ===\n")
+    return "".join(parts)
+
+
+def run_selftest():
+    """在后台线程延迟 1 秒调用 print_assistant，复刻「输入框常驻时后台线程输出」的真实场景。"""
+    def _worker():
+        time.sleep(1.0)
+        try:
+            print_assistant(_selftest_markdown())
+        except Exception as e:
+            try:
+                sys.__stdout__.write("自检输出异常: %s\n" % e)
+                sys.__stdout__.flush()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_worker, name="marisa-selftest", daemon=True)
+    t.start()
+    return t
+
+
 def print_assistant(content, name="魔理沙"):
     """打印大模型回复：满足条件时走 markdown 渲染，否则退回纯文本缩进（与旧行为一致）。
 
@@ -309,6 +466,8 @@ def print_assistant(content, name="魔理沙"):
                         text = _strip_ansi(text)
                     if not text.endswith("\n"):
                         text += "\n"
+                    # 先影子落盘：终端显示再怎么抽风，完整内容也留在磁盘上
+                    _shadow_console(text if (UI_ANSI_OK or not USE_MARKDOWN) else _strip_ansi(text))
                     sys.stdout.write(text)
                     sys.stdout.flush()
                 return
@@ -322,7 +481,10 @@ def print_assistant(content, name="魔理沙"):
             return
         except Exception:
             pass  # 渲染翻车就退回纯文本，绝不拖累主流程
-    print(f"{name}:\n    {content.replace(chr(10), chr(10) + '    ')}", flush=True)
+    _plain = f"{name}:\n    {content.replace(chr(10), chr(10) + '    ')}\n"
+    _shadow_console(_plain)
+    sys.stdout.write(_plain)
+    sys.stdout.flush()
 
 
 # MCP (Model Context Protocol) 支持 —— 连接外部 MCP 服务器
@@ -3086,7 +3248,14 @@ def main():
                         help='强制退化使用 input() 输入（即使环境装有 prompt_toolkit 也不用）')
     parser.add_argument('--no-markdown', action='store_true',
                         help='关闭大模型回复的 markdown 渲染，改为纯文本输出（仅在装有 rich 的交互模式下有意义）')
+    parser.add_argument('--no-chunk', action='store_true',
+                        help='关闭输出分块（每批 N 行写出），改回一次性整块写出。'
+                             '用于排查：若怀疑输出变慢/断流与分块有关，可用它切回对比')
     args = parser.parse_args()
+
+    # 输出分块总开关（--no-chunk 关闭，用于排查对比）
+    global USE_CHUNKED_OUTPUT
+    USE_CHUNKED_OUTPUT = not args.no_chunk
 
     # 加载 API 配置（如果配置文件不存在或字段缺失，会提示用户输入）
     load_config()
@@ -3429,8 +3598,18 @@ def _run_ui_loop(bus, session, use_prompt_toolkit):
             return False
         if not text.strip():
             return True
-        if text.strip().lower() in ("exit", "quit"):
+        cmd = text.strip().lower()
+        if cmd in ("exit", "quit"):
             return False
+        # 本地自检命令：不投给大模型，直接在后台线程走真实输出管道吐一段长文本，
+        # 用来随时验证「长回复是否还会截断」。
+        if cmd in ("!selftest", "!自检", "!st"):
+            try:
+                run_selftest()
+                print("   🧪 自检已启动：1 秒后输出一大段，注意看结尾有没有 === END SELFTEST ===", flush=True)
+            except Exception as e:
+                print(f"   ⚠️ 自检启动失败：{e}", flush=True)
+            return True
         bus.put(text, io_bus.SRC_KEYBOARD)
         return True
 
@@ -3486,7 +3665,25 @@ def _run_ui_loop(bus, session, use_prompt_toolkit):
 
         if ctx is not None:
             UI_PROMPT_ACTIVE = True
+            # 分块写入：把 sys.stdout（此刻是 StdoutProxy）的 write 包成小批，
+            # 避免一次 write 塞太多行/太多 ANSI 撞上未知的渲染上限（详见文件前部说明）。
+            if USE_CHUNKED_OUTPUT:
+                try:
+                    _install_chunked_stdout(sys.stdout)
+                    print(
+                        f"   🧩 输出分块：每批 {OUTPUT_CHUNK_LINES} 行 / 间隔 {int(OUTPUT_CHUNK_PAUSE * 1000)}ms"
+                        f"（输入 !selftest 自检输出完整性）",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ 输出分块安装失败（保持原样输出）：{e}", flush=True)
+            else:
+                print("   🧩 输出分块：已关闭（--no-chunk），整块写出", flush=True)
             # 先把上下文用量算一次填进状态栏（之后每次 API 返回会自动刷新）
+            try:
+                _set_usage(format_usage_short())
+            except Exception:
+                pass
             try:
                 _set_usage(format_usage_short())
             except Exception:
