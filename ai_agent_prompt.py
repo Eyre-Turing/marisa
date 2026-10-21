@@ -930,6 +930,137 @@ def _json_bytes(obj):
     return total
 
 
+_B64_DIM_HEAD_CHARS = 128 * 1024   # 解析图片尺寸时最多解码这么多 base64 字符
+
+
+def _image_dimensions_from_b64(b64):
+    """从 base64 头部解析图片像素尺寸，返回 (w, h)；解析失败返回 None。
+
+    只为「估算 token」服务，所以只支持最常见的几种容器：PNG / GIF / WEBP / JPEG。
+    其余格式（AVIF、TIFF…）返回 None，由调用方退化成固定估值。
+    """
+    import base64 as _b64
+    head = re.sub(r"\s+", "", (b64 or "")[:_B64_DIM_HEAD_CHARS])
+    if len(head) < 32:
+        return None
+    head += "=" * (-len(head) % 4)
+    try:
+        raw = _b64.b64decode(head, validate=False)
+    except Exception:
+        return None
+    try:
+        if raw[:8] == b"\x89PNG\r\n\x1a\n" and raw[12:16] == b"IHDR":
+            return (int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big"))
+        if raw[:6] in (b"GIF87a", b"GIF89a"):
+            return (int.from_bytes(raw[6:8], "little"), int.from_bytes(raw[8:10], "little"))
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            fmt = raw[12:16]
+            if fmt == b"VP8X":
+                return (1 + int.from_bytes(raw[24:27], "little"),
+                        1 + int.from_bytes(raw[27:30], "little"))
+            if fmt == b"VP8 ":
+                return (int.from_bytes(raw[26:28], "little") & 0x3FFF,
+                        int.from_bytes(raw[28:30], "little") & 0x3FFF)
+            if fmt == b"VP8L":
+                b = raw[21:25]
+                w = 1 + (((b[1] & 0x3F) << 8) | b[0])
+                h = 1 + (((b[3] & 0x0F) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6))
+                return (w, h)
+            return None
+        if raw[:2] == b"\xff\xd8":          # JPEG：逐个 marker 找 SOF
+            i, n = 2, len(raw)
+            while i + 9 < n:
+                if raw[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = raw[i + 1]
+                if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                seg = int.from_bytes(raw[i + 2:i + 4], "big")
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    return (int.from_bytes(raw[i + 7:i + 9], "big"),
+                            int.from_bytes(raw[i + 5:i + 7], "big"))
+                i += 2 + seg
+    except Exception:
+        return None
+    return None
+
+
+def _image_tokens_from_b64(b64, default=1024):
+    """估算一张图片占多少 token（按像素块，不按 base64 体积）。
+
+    为什么要估算：`_tokens_from_bytes` 是「请求体字节数 × 比例」折算 token 的，
+    对纯文本很准；但一张 3MiB 的图 base64 有 4MB 字节、真实 token 只有 1~2k，
+    若按体积折算会被放大到上百万 token —— 于是「无人值守自动压缩」被误触发，
+    而压缩的第一件事就是删掉多模态消息，图片就这么凭空消失了。
+
+    公式参考主流 VLM 的 patch 计费：每 28×28 一块，加基线 85，夹在 [85, 20000]。
+    """
+    dims = _image_dimensions_from_b64(b64 or "")
+    if not dims:
+        return default
+    w, h = dims
+    if not w or not h or w > 100000 or h > 100000:
+        return default
+    tiles = ((w + 27) // 28) * ((h + 27) // 28)
+    return max(85, min(20000, tiles + 85))
+
+
+def _shrink_images_for_count(node, extra, _depth=0):
+    """把多模态节点里的图片数据换成空壳，同时把「等效字节」累加进 extra[0]。
+
+    返回结构与入参一致（只有图片字段被换掉），其余对象按引用复用，不做深拷贝——
+    否则碰到 4MB base64 的上下文，光是量一下大小就会把内存吃掉一大块。
+    """
+    if _depth > 32:
+        return node
+    if isinstance(node, list):
+        return [_shrink_images_for_count(x, extra, _depth + 1) for x in node]
+    if not isinstance(node, dict):
+        return node
+
+    t = node.get("type")
+
+    # OpenAI / DeepSeek 风格：{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+    if t == "image_url":
+        iu = node.get("image_url")
+        if isinstance(iu, dict):
+            url = iu.get("url")
+            if isinstance(url, str) and url.startswith("data:") and "," in url:
+                b64 = url.split(",", 1)[1]
+                extra[0] += _image_tokens_from_b64(b64) * 4
+                return {**node, "image_url": {**iu, "url": "data:,"}}
+        return node
+
+    # Anthropic 风格：{"type":"image","source":{"type":"base64","data":"..."}}
+    if t == "image":
+        src = node.get("source")
+        if isinstance(src, dict):
+            data = src.get("data")
+            if isinstance(data, str) and data:
+                extra[0] += _image_tokens_from_b64(data) * 4
+                return {**node, "source": {**src, "data": ""}}
+        return node
+
+    return {k: _shrink_images_for_count(v, extra, _depth + 1) for k, v in node.items()}
+
+
+def _effective_bytes_of(obj):
+    """「按 token 折算后的等效字节数」——图片按 token 计，不按 base64 体积计。
+
+    口径说明：图片折算成 `token × 4` 字节，正好等价于「这段内容在纯文本里
+    大约要占多少字节」，于是 `_tokens_from_bytes` 的比例换算对它同样成立。
+    """
+    extra = [0]
+    shrunk = _shrink_images_for_count(obj, extra)
+    try:
+        base = _json_bytes(shrunk)
+    except MemoryError:
+        base = _rough_json_bytes(shrunk)
+    return base + extra[0]
+
+
 def _rough_json_bytes(obj, _depth=0):
     """MemoryError 兜底：不真正序列化，递归累加粗略字节数。
 
@@ -956,19 +1087,268 @@ def _rough_json_bytes(obj, _depth=0):
     return 16
 
 
+# ============================================================
+#  工具结果里的「内联图片」识别与摘取
+# ============================================================
+# 有的 MCP 服务器不按规范返回 {"type":"image","data":...}，而是把 base64 / data URL
+# 直接塞进普通文本里。这种图如果不管，就会跟着文本一起撞上 TOOL_RESULT_HARD_LIMIT
+# 被拦腰砍断：JSON 坏了、图片也废了。下面这套函数负责把它们识别出来、摘走、
+# 原位换成占位符，让「文本」和「图片」彻底分开走。
+_INLINE_IMAGE_MIN_B64 = 1024          # 太短的 base64 不当作图片（避免误伤普通文本）
+_INLINE_BARE_B64_MIN = 64 * 1024      # 裸 base64（没有 data: 前缀）要足够长才认
+_INLINE_BARE_B64_FALLBACK_MIN = 256 * 1024   # 没有图片魔数时的兜底门槛
+_DATA_URL_RE = re.compile(
+    r"data:image/([A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n\t ]{100,})"
+)
+_BASE64_ONLY_RE = re.compile(r"^[A-Za-z0-9+/=\r\n\t ]+$")
+
+# 常见图片格式的魔数（解码 base64 头部后比对）——用来确认「这段裸 base64 真的是图片」，
+# 避免把长英文文本 / 长日志当成图片误摘。
+_B64_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF", "image/webp"),
+    (b"BM", "image/bmp"),
+    (b"II*\x00", "image/tiff"),
+    (b"MM\x00*", "image/tiff"),
+    (b"8BPS", "image/vnd.adobe.photoshop"),
+    (b"\x00\x00\x00", "image/heic"),
+)
+
+
+def _image_placeholder(mime, b64_len):
+    """图片被摘走后留在原位的占位符（体积恒定，几十字节）。"""
+    try:
+        kb = max(1, (int(b64_len) * 3 // 4) // 1024)
+    except (TypeError, ValueError):
+        kb = 0
+    return f"[图片已摘出：{mime}，约 {kb}KB，走内部通道注入]"
+
+
+def _b64_head_bytes(core, nbytes=16):
+    """解出 base64 头部的原始字节（用于魔数比对），失败返回 b""。"""
+    import base64
+    head = re.sub(r"\s+", "", core[: max(4, (nbytes // 3 + 1) * 4)])
+    head += "=" * (-len(head) % 4)
+    try:
+        return base64.b64decode(head)
+    except Exception:
+        return b""
+
+
+def _b64_image_mime(core):
+    """按魔数判断 base64 的图片类型；不是图片返回 None。"""
+    head = _b64_head_bytes(core)
+    if not head:
+        return None
+    for magic, mime in _B64_IMAGE_MAGIC:
+        if head.startswith(magic):
+            return mime
+    return None
+
+
+def _b64_char_variety_ok(s):
+    """粗判字符串像不像二进制数据的 base64（避免把长文本当图片）。
+
+    base64 编码后的二进制数据几乎必然同时包含大小写字母、数字和 +/= 符号中的多数；
+    而「y」*200000 这种长文本只有一种字符，应当排除。
+    """
+    sample = s[:8192]
+    has_upper = any("A" <= c <= "Z" for c in sample)
+    has_lower = any("a" <= c <= "z" for c in sample)
+    has_digit = any("0" <= c <= "9" for c in sample)
+    has_sym = any(c in "+/=" for c in sample)
+    return sum((has_upper, has_lower, has_digit, has_sym)) >= 3
+
+
+def _is_bare_base64_blob(s):
+    """判断整个字符串是否就是一大段裸 base64（有些 MCP 直接吐裸 base64）。"""
+    if not isinstance(s, str):
+        return False
+    core = s.strip()
+    if len(core) < _INLINE_BARE_B64_MIN:
+        return False
+    if not _BASE64_ONLY_RE.match(core):
+        return False
+    return _b64_char_variety_ok(core)
+
+
+def _is_image_b64_payload(core):
+    """判断一段裸 base64 是不是「真的图片」。
+
+    严格模式（要注入图片时用）：优先靠图片魔数确认；
+    没有魔数（少见编码 / 文件头被裁掉）时，只有体积足够大且字符分布像二进制才认。
+    """
+    if not _is_bare_base64_blob(core):
+        return False
+    if _b64_image_mime(core) is not None:
+        return True
+    return len(core) >= _INLINE_BARE_B64_FALLBACK_MIN and _b64_char_variety_ok(core)
+
+
+_BARE_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{%d,}" % _INLINE_BARE_B64_MIN)
+
+
+def _locate_image_start(core, max_shift=8):
+    """在一段候选 base64 里找「真正的图片起点」，容忍前面粘连的零星字符。
+
+    为什么要这个：MCP 服务器常吐 "…没有可读文字内容。\\niVBORw0KGgo…"，
+    其中换行是「反斜杠 + n」，那个 n 也在 base64 字符集里，正则会把 n 一起吞进来
+    → 头部成了 "niVBOR…" → 魔数对不上 → 整段图片被漏判（本 bug 就是这么来的）。
+
+    返回 (偏移量, mime)；找不到返回 (-1, None)。
+    """
+    limit = min(max_shift, max(0, len(core) - 4))
+    for shift in range(limit + 1):
+        mime = _b64_image_mime(core[shift:])
+        if mime:
+            return shift, mime
+    return -1, None
+
+
+def _replace_long_base64_runs(s, images, drop=False):
+    """把字符串里「夹在普通文字中间」的长裸 base64 段摘出来，原位换成占位符。
+
+    典型形态（很多 MCP 服务器就是这么吐的）：
+
+        "测试图片已生成：3145728 字节…\\niVBORw0KGgoAAAANSUhEUg…"
+
+    这种字符串整体不是 base64，也不是 data URL，前面那层「整串判断」抓不到它，
+    于是 base64 就留在文本里，一撞 TOOL_RESULT_HARD_LIMIT 就被拦腰砍断。
+
+    判定只认「图片魔数」：解出 base64 头部比对 PNG/JPEG/GIF/WEBP…，
+    普通长文本（英文长句、日志、y*200000）几乎不可能通过，误伤率极低。
+    起点允许前置几个粘连字符（见 _locate_image_start），粘连部分原样保留。
+    """
+    if not isinstance(s, str) or len(s) < _INLINE_BARE_B64_MIN:
+        return s
+
+    parts = []
+    last = 0
+    changed = False
+    for m in _BARE_RUN_RE.finditer(s):
+        core = m.group(0)
+        if len(core) < _INLINE_BARE_B64_MIN:
+            continue
+        shift, mime = _locate_image_start(core)
+        if mime is None:
+            continue  # 不是图片（或头部被裁掉）——不碰，交给别的逻辑
+        body = core[shift:]
+        if len(body) < _INLINE_BARE_B64_MIN:
+            continue
+        if not drop:
+            images.append({"base64": body, "mimeType": mime})
+        parts.append(s[last:m.start()])
+        if shift:
+            parts.append(core[:shift])  # 粘连的前缀不是图片数据，还回去
+        parts.append(_image_placeholder(mime, len(body)))
+        last = m.end()
+        changed = True
+
+    if not changed:
+        return s
+    parts.append(s[last:])
+    return "".join(parts)
+
+
+def _extract_inline_images_from_str(s, images, drop=False):
+    """从一个字符串里摘出 data URL / 裸 base64 图片。
+
+    drop=True 时只把图片段替换成占位符，不往 images 里塞数据——
+    用于「结果已被硬截断，图片本体拿不回来了」的抢救场景，
+    目标只是别把半截 base64 当普通文本塞进上下文。
+    此时判定会宽松些（宁可多切一点垃圾，也别把巨量 base64 塞进上下文）。
+    """
+    if not isinstance(s, str) or len(s) < _INLINE_IMAGE_MIN_B64:
+        return s
+
+    def _sub(m):
+        mime = f"image/{m.group(1).lower()}"
+        b64 = re.sub(r"\s+", "", m.group(2))
+        if not drop:
+            images.append({"base64": b64, "mimeType": mime})
+        return _image_placeholder(mime, len(b64))
+
+    out = _DATA_URL_RE.sub(_sub, s)
+
+    # 字符串里「夹着」长裸 base64 段（前面常有说明文字）：按图片魔数摘出来
+    out = _replace_long_base64_runs(out, images, drop=drop)
+
+    # 整串就是一个大 base64（没有 data: 前缀）：drop 模式宽松切，正常模式要验魔数
+    if _is_bare_base64_blob(out):
+        core = re.sub(r"\s+", "", out)
+        if drop:
+            return _image_placeholder("image/png", len(core))
+        if _is_image_b64_payload(core):
+            mime = _b64_image_mime(core) or "image/png"
+            images.append({"base64": core, "mimeType": mime})
+            return _image_placeholder(mime, len(core))
+    return out
+
+
+def _extract_inline_images_deep(obj, images, drop=False, _depth=0):
+    """递归遍历 JSON 结构，摘出所有字符串值里的内联图片。"""
+    if _depth > 64:
+        return obj
+    if isinstance(obj, str):
+        return _extract_inline_images_from_str(obj, images, drop=drop)
+    if isinstance(obj, list):
+        return [_extract_inline_images_deep(x, images, drop, _depth + 1) for x in obj]
+    if isinstance(obj, dict):
+        return {
+            k: _extract_inline_images_deep(v, images, drop, _depth + 1)
+            for k, v in obj.items()
+        }
+    return obj
+
+
 def _clip_tool_result(tool_result, tool_name):
     """对单次工具结果做统一兜底硬截断，防止巨型结果撑爆上下文/内存。
 
     内置工具内部已按 ai_agent_tools.TOOL_HARD_CUTOFF(200KB) 截断，
     但 MCP 等动态注册的工具没有这层保护——这里对所有工具结果再兜一层。
+
+    🔪 截断前先抢救内联图片：如果超限结果里含 base64/data URL，
+    优先把图片段换成占位符再判断长度，而不是拦腰砍断——
+    砍断会同时毁掉 JSON 结构和 base64，图和文本一起废。
     """
     if not isinstance(tool_result, str) or len(tool_result) <= TOOL_RESULT_HARD_LIMIT:
         return tool_result
     orig_len = len(tool_result)
+
+    # ① 抢救：把内联图片数据换成占位符（图片本体此时已无法注入，只求别塞半截进上下文）
+    #    能解析成 JSON 就递归处理（base64 往往藏在某个字段值里），
+    #    解析不了（可能已经是被截断的坏 JSON）就走文本正则兜底。
+    salvaged = tool_result
+    try:
+        _obj = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        _obj = None
+    if _obj is not None:
+        salvaged = json.dumps(
+            _extract_inline_images_deep(_obj, [], drop=True), ensure_ascii=False
+        )
+    else:
+        salvaged = _extract_inline_images_from_str(tool_result, [], drop=True)
+
+    if salvaged != tool_result:
+        if len(salvaged) <= TOOL_RESULT_HARD_LIMIT:
+            print(
+                f"   ✂️ 工具 {tool_name} 返回结果过大（{orig_len // 1024}KB，含内联图片数据），"
+                f"已移除图片数据后完整保留（{len(salvaged) // 1024}KB）",
+                flush=True,
+            )
+            return salvaged
+        tool_result = salvaged
+
+    # ② 仍然超限：硬截断（此时已不含图片数据）
+    cur_len = len(tool_result)
     clipped = (
         tool_result[:TOOL_RESULT_HARD_LIMIT]
         + f"\n\n...（工具 {tool_name} 返回结果过大，已截断。"
-          f"原始大小约 {orig_len // 1024}KB，仅保留前 "
+          f"原始大小约 {orig_len // 1024}KB，去图后 {cur_len // 1024}KB，仅保留前 "
           f"{TOOL_RESULT_HARD_LIMIT // 1024}KB）"
     )
     print(
@@ -988,7 +1368,7 @@ def _strip_image_base64_for_context(tool_result, tool_name):
       - image_b64：摘出来的 base64（无则 None）。它仅供主循环内部拼「多模态 user 消息」用，
                    绝不写进上下文、也不参与上下文大小统计。
 
-    背景：base64 动辄几百 KB～几 MB。若混在工具结果里，会先撞上 TOOL_RESULT_HARD_LIMIT
+    背景：base64 动辄几百 KB～几 MB。若混在结果里，会先撞上 TOOL_RESULT_HARD_LIMIT
     被硬截断——把 JSON 拦腰砍断 → json.loads 失败 → 图片被误判为「读取失败」而丢弃，
     同时半截 base64 还会被当成普通工具文本塞进上下文。把 base64 与「写进上下文的结果」
     分离后，硬截断永远只面对小体积元信息，天然不会再破坏图片读取，也无需按工具名开小灶。
@@ -1008,28 +1388,72 @@ def _strip_image_base64_for_context(tool_result, tool_name):
 
 
 def _strip_mcp_images_for_context(tool_result):
-    """把 MCP 工具结果里的内联图片（_mcp_images）摘出来走内部通道。
+    """把 MCP 工具结果里的图片摘出来走「内部通道」，只留元信息/占位符。
 
-    MCP（stdio/http/sse）工具返回的图片是以 base64 内联在结果 JSON 里的，体积可能很大。
-    若不摘出，会先撞上 TOOL_RESULT_HARD_LIMIT 被硬截断 —— JSON 被砍坏 → 解析失败 →
-    图片静默丢失，且半截 base64 会被当普通文本写进上下文。
+    支持三种形态（按顺序尝试）：
+      1. 新格式：结果里只有 _mcp_images_ref（token），图片本体在 ai_agent_tools 的
+         内存通道里，这里 take 出来（取一次即销毁）；
+      2. 旧格式：结果里内联 _mcp_images=[{"base64","mimeType"}, ...]（向后兼容）；
+      3. 兜底：MCP 服务器把图片塞进普通文本（data URL / 裸 base64），
+         此时递归扫描所有字符串值，把图片摘出、原位替换成占位符。
+
+    为什么需要第 3 层：文本里混着 base64 时，只要体积一超 TOOL_RESULT_HARD_LIMIT，
+    JSON 就会被硬砍成非法结构，图片和文本一起废；摘出来以后文本永远很小，
+    硬截断再也不会碰到图片数据。
 
     返回 (context_result, images)：
-      - context_result：去掉 _mcp_images 后的结果字符串（纯文本）；无图片则原样返回；
-      - images：[{"base64","mimeType"}, ...]（无则 None），仅供主循环内部注入多模态消息/交辅助模型识别。
+      - context_result：去图后的结果字符串（元信息/占位符尚在）；无图则原样返回；
+      - images：[{"base64","mimeType"}, ...]（无则 None）。仅供主循环内部注入多模态消息
+        或交辅助模型识别，绝不写进上下文、也不参与上下文大小统计。
     """
-    if not isinstance(tool_result, str) or "_mcp_images" not in tool_result:
+    if not isinstance(tool_result, str):
         return tool_result, None
+
+    images = []
     try:
         obj = json.loads(tool_result)
     except (json.JSONDecodeError, TypeError):
+        obj = None
+
+    if isinstance(obj, (dict, list)):
+        note_added = False
+        if isinstance(obj, dict):
+            # 1) 新格式：token 引用 → 从内部通道取回
+            ref = obj.pop(ai_agent_tools.MCP_IMAGE_REF_KEY, None)
+            count = obj.pop("_mcp_image_count", None)
+            if ref:
+                stashed = ai_agent_tools.take_mcp_images(ref)
+                if stashed:
+                    images.extend(stashed)
+                else:
+                    # token 失效（被中断 / 被别的路径取走）——留个提示，别静默丢图
+                    obj["_mcp_images_note"] = (
+                        f"该工具返回了 {count or '若干'} 张图片，但图片数据已失效"
+                        "（内部通道未命中）。如需查看图片内容，请重新调用工具。"
+                    )
+                    note_added = True
+            # 2) 旧格式：内联 _mcp_images
+            inline = obj.pop("_mcp_images", None)
+            if inline:
+                images.extend(inline)
+        # 3) 兜底：文本里的内联图片（data URL / 裸 base64）
+        obj = _extract_inline_images_deep(obj, images)
+        if images or note_added:
+            return json.dumps(obj, ensure_ascii=False), (images or None)
         return tool_result, None
-    if not isinstance(obj, dict):
-        return tool_result, None
-    images = obj.pop("_mcp_images", None)
-    if not images:
-        return tool_result, None
-    return json.dumps(obj, ensure_ascii=False), images
+
+    # JSON 已经非法（多半是被硬截断过）：至少把 base64 段换掉，别把半截塞进上下文
+    # 注意：这里不能只判 `"base64" in tool_result` —— 很多服务器吐的是「裸 base64」，
+    # 结果里根本没有 "base64" 这个字面量，那样会整段漏掉。
+    if len(tool_result) >= _INLINE_BARE_B64_MIN:
+        cleaned = _extract_inline_images_from_str(tool_result, images, drop=True)
+        if cleaned != tool_result:
+            cleaned += (
+                "\n\n（注：该工具结果原本含内联图片数据，已摘出以避免被截断；"
+                "但结果本身并非合法 JSON，图片可能不完整，如需完整结果请重新调用工具。）"
+            )
+            return cleaned, (images or None)
+    return tool_result, None
 
 
 def get_context_size(msg_list):
@@ -1077,6 +1501,26 @@ def get_request_size(msg_list=None, tools=None):
         # 也要让后续的压缩逻辑有机会跑起来把内存降下去。
         return _rough_json_bytes(payload)
 
+
+def get_request_size_effective(msg_list=None, tools=None):
+    """与 `get_request_size` 同口径，但**图片按 token 折算**，不按 base64 体积计。
+
+    这是 token 折算（`_tokens_from_bytes`）、自动压缩阈值、大内容过期判定该用的口径。
+
+    反面教材（本次修的 bug）：一张 3MiB 截图 base64 有 4MB 字节，若照原始体积统计，
+    按「2~4 字节/token」一折就是 100 万+ token —— 直接越过 700k 的无人值守压缩阈值，
+    而压缩的第一件事就是丢掉多模态消息，图就这么"凭空消失"了。
+    实际这张图的 token 只有一两千，压根不该触发任何压缩。
+    """
+    if msg_list is None:
+        msg_list = messages
+    if tools is None:
+        tools = ai_agent_tools.tools
+    payload = {"messages": msg_list}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    return _effective_bytes_of(payload)
 
 # ---- 真实 token 用量（取自 API 响应的 usage 字段）----
 # 最近一次「主模型」调用的用量与请求体字节数，用于：
@@ -1199,7 +1643,10 @@ def _record_main_usage(usage, sent_messages, sent_tools=None):
     if not usage:
         return
     _last_usage = usage
-    _last_usage_ctx_bytes = get_request_size(sent_messages, sent_tools)
+    # 锚点必须用「等效字节」口径：图片按 token 折算。
+    # 否则一次带图请求会让 比例 = prompt_tokens / 体积 被拉得极小，
+    # 下一轮再遇到图就会估出天量 token，压缩阈值全线失真。
+    _last_usage_ctx_bytes = get_request_size_effective(sent_messages, sent_tools)
     # 记下发送时 messages 的对象 id 与条数，供 _pending_completion_tokens 判断
     # 「这次回复是否已写回 messages」（写回后列表变长 / 被整体替换，就视为已计入）
     _last_usage_sent_id = id(sent_messages)
@@ -1247,8 +1694,12 @@ def get_context_tokens(msg_list=None, tools=None):
 
     压缩判定在「上一轮回复已写回 messages」之后执行，此时返回值 ≈ 下一轮请求的
     prompt_tokens（过去所有输出都已沉淀为 prompt），与窗口口径 total_tokens 等价。
+
+    ⚠️ 口径：走 `get_request_size_effective`（图片按 token 折算）。
+    早年按原始字节统计，一张 3MiB 图就被算成上百万 token，直接误触发无人值守压缩。
+    需要「真实字节数」展示时请用 `get_request_size`，不要拿它当 token 依据。
     """
-    return _tokens_from_bytes(get_request_size(msg_list, tools)) + _pending_completion_tokens()
+    return _tokens_from_bytes(get_request_size_effective(msg_list, tools)) + _pending_completion_tokens()
 
 
 def format_usage_line():
@@ -1265,14 +1716,16 @@ def format_usage_line():
     """
     msg_bytes = get_context_size(messages)
     tools_bytes = get_tools_size()
-    cur_bytes = get_request_size(messages)
-    # 复用同一个 cur_bytes 换算 token，保证展示出的 tok 与字节严格对得上
-    prompt_tok = _tokens_from_bytes(cur_bytes)                        # 输入侧
+    cur_bytes = get_request_size(messages)                 # 真实体积（展示用）
+    eff_bytes = get_request_size_effective(messages)       # 折算口径（图片按 token 计）
+    # token 必须用「等效字节」换算，才能和 get_context_tokens / 压缩阈值同口径；
+    # 若拿含 base64 的真实体积去折，一张图就能让展示的 tok 虚高上百万。
+    prompt_tok = _tokens_from_bytes(eff_bytes)                        # 输入侧
     comp_tok = _pending_completion_tokens()                           # 输出侧（回复未写回时才补）
     total_tok = prompt_tok + comp_tok                                 # 总占用（≈ total_tokens）
     limit = CONTEXT_LIMIT or 0
     pct = round(total_tok / limit * 100, 1) if limit else 0.0
-    bpt = (cur_bytes / prompt_tok) if prompt_tok else 0.0
+    bpt = (eff_bytes / prompt_tok) if prompt_tok else 0.0
     approx = "" if _last_usage else "≈"
     segs = [f"上下文 {approx}{total_tok:,} tok / {limit:,}（{pct}%）"]
     if comp_tok:
@@ -1287,6 +1740,10 @@ def format_usage_line():
         breakdown = f"，消息 {msg_bytes/1024:.1f} KB + 工具 {tools_bytes/1024:.1f} KB"
     else:
         breakdown = ""
+    # 上下文里有图片时，真实体积会被 base64 撑得很大，但 token 占用其实很小；
+    # 把折算后的等效体积一并给出来，避免「字节数这么大、tok 怎么这么少」的误解。
+    if eff_bytes != cur_bytes:
+        breakdown += f"，含图片，按 token 折算后等效 {eff_bytes/1024:.1f} KB"
     segs.append(f"请求体 {cur_bytes:,} B（{cur_bytes/1024:.1f} KB{breakdown}）")
     segs.append(f"约 {bpt:.2f} B/tok")
     return "📊 " + " ｜ ".join(segs)
@@ -1320,8 +1777,10 @@ def format_usage_short():
     """
     msg_bytes = get_context_size(messages)
     tools_bytes = get_tools_size()
-    cur_bytes = get_request_size(messages)
-    prompt_tok = _tokens_from_bytes(cur_bytes)                        # 输入侧
+    cur_bytes = get_request_size(messages)                 # 真实体积（展示用）
+    # token 走「等效字节」口径，和 get_context_tokens / 压缩阈值保持一致。
+    # 早先这里用 cur_bytes（含 base64），一张 3MiB 图就能把状态栏刷成 100 万+ tok。
+    prompt_tok = _tokens_from_bytes(get_request_size_effective(messages))
     comp_tok = _pending_completion_tokens()                           # 输出侧（回复未写回时才补）
     total_tok = prompt_tok + comp_tok                                 # 总占用（≈ total_tokens）
     limit = CONTEXT_LIMIT or 0
@@ -1601,8 +2060,10 @@ def call_api(messages, tools=None, tool_choice="auto", config_override=None, gua
         为 None 时使用主配置（ai_agent_config.json）。
 
     guard_multimodal: 可选，默认 True。是否启用"多模态防护"：
-        True  → 主模型调用：HTTP 400 且上下文含多模态时自动剥离并重试，并记录
-                _main_model_no_multimodal 标记；
+        True  → 主模型调用：HTTP 400/413 且上下文含多模态时，先按错误原因分类
+                （_classify_multimodal_http_error）：
+                  · 明确"不支持图片/视觉/多模态" → 剥离并以 _main_model_no_multimodal 永久标记；
+                  · 图片/请求体过大、原因不明 → 只剥离本次并重试，**不**永久标记。
         False → 子 Agent（辅助模型）调用：HTTP 400 直接抛异常交给上层处理，
                 不做剥离、不触碰全局标记，避免辅助模型的失败污染主模型判定。
 
@@ -1682,6 +2143,63 @@ def _strip_multimodal(msgs):
         i -= 1
     return modified
 
+
+# ============================================================
+#  多模态请求失败的原因分类 —— 决定「要不要永久降级主模型读图」
+# ============================================================
+# 以前只要 HTTP 400 就认定「模型不支持多模态」并永久置位 _main_model_no_multimodal，
+# 于是一张「太大的图」或一次网络抽风，就能把之后所有图片的能力一起废掉。
+# 这里按错误文本分类：只有明确指向「不支持图片/视觉/多模态」才永久降级，
+# 体积类错误（payload too large / image too large / 413）只处理本次。
+_MULTIMODAL_TOO_LARGE_HINTS = (
+    "too large", "too big", "toolarge",
+    "payload", "entity too large", "request entity",
+    "exceed", "size limit", "maximum size", "max size", "max_size",
+    "request body", "body too",
+    "图片过大", "图像过大", "文件过大", "超出限制", "过大",
+)
+_MULTIMODAL_UNSUPPORTED_HINTS = (
+    "unsupported", "not supported", "doesn't support", "does not support",
+    "don't support", "no support",
+    "invalid image", "invalid_image", "image_url", "image url",
+    "vision", "multimodal", "multi-modal", "image input", "image content",
+    "不支持", "多模态", "不支持图片", "无法识别图片",
+)
+
+
+def _classify_multimodal_http_error(error_body, code=400):
+    """把「含多模态内容的 HTTP 错误」分成三类，决定要不要永久降级主模型。
+
+    返回：
+      "unsupported" —— 错误信息明确指向「不支持图片 / 视觉 / 多模态」：
+                       可以永久记住并降级（之后图片交给辅助模型或跳过）；
+      "too_large"   —— 明确是体积/尺寸问题（payload too large、图片过大、HTTP 413）：
+                       只处理本次（剥掉图片重试），**不**永久降级；
+      "unknown"     —— 判不出来：同样只处理本次，不永久降级
+                       （宁可多试一次，也不因为一次偶发错误误杀读图能力）。
+    """
+    text = str(error_body or "").lower()
+
+    # 体积类优先判定：payload too large 里也可能带 "image" 字样
+    if code == 413:
+        return "too_large"
+    for kw in _MULTIMODAL_TOO_LARGE_HINTS:
+        if kw in text:
+            return "too_large"
+
+    for kw in _MULTIMODAL_UNSUPPORTED_HINTS:
+        if kw in text:
+            return "unsupported"
+
+    return "unknown"
+
+
+def _as_int(v):
+    """尽量把 usage 字段转成 int，异常值一律当 0。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
 
 def _as_int(v):
     """尽量把 usage 字段转成 int，异常值一律当 0。"""
@@ -1879,23 +2397,38 @@ def _do_openai_request(url, headers, model, messages, tools=None, tool_choice="a
         if r["kind"] == "http":
             error_body = r["body"]
             code = r["code"]
-            # 🗑️ 检测到 400 错误且 messages 中包含多模态内容，删除并重试
-            # 不依赖错误信息中的关键字，直接检查我们发送的数据结构
+            # 🗑️ 检测到 400/413 错误且 messages 中含多模态内容：按错误原因分类处理
+            # 不依赖错误信息里的关键词来「全盘认定不支持」，这里只做分类：
+            #   不支持多模态 → 永久降级（记住别再注入图片）
+            #   图片/请求体过大、原因不明 → 只处理本次（剥图重试），不永久降级
             # 仅主模型调用（guard_multimodal=True）执行此防护，子 Agent 直接抛异常
-            if allow_retry and guard_multimodal and code == 400 and _has_multimodal_content(messages):
-                print(
-                    "   🗑️ HTTP 400 且上下文含多模态数据，自动清理后重试...",
-                    flush=True
-                )
-                _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
-                _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+            if (allow_retry and guard_multimodal and code in (400, 413)
+                    and _has_multimodal_content(messages)):
+                reason = _classify_multimodal_http_error(error_body, code)
+                if reason == "unsupported":
+                    print(
+                        f"   🗑️ HTTP {code} 且错误信息指向「不支持图片/多模态」，"
+                        "永久降级：之后图片交给辅助模型或跳过"
+                        f"（错误摘要：{str(error_body)[:160]}）",
+                        flush=True
+                    )
+                    _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+                    _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+                else:
+                    tag = "图片/请求体过大" if reason == "too_large" else "原因不明（保守处理）"
+                    print(
+                        f"   🗑️ HTTP {code} 且上下文含多模态数据，判定：{tag}。"
+                        "仅本次剥离图片后重试，**不永久降级**主模型读图能力"
+                        f"（错误摘要：{str(error_body)[:160]}）",
+                        flush=True
+                    )
+                    _strip_multimodal(messages)
                 return _do_openai_request(
                     url, headers, model, messages, tools, tool_choice,
                     allow_retry=False,  # 防止无限递归
                     guard_multimodal=guard_multimodal,
                     extra_body=extra_body,
                 )
-            raise RuntimeError(f"API 请求失败 (HTTP {code}): {error_body}")
         elif r["kind"] == "url":
             if _should_retry_timeout():
                 retry_left = _api_timeout_retry_remaining
@@ -2307,20 +2840,34 @@ def _call_anthropic_api(config, messages, tools=None, allow_retry=True, guard_mu
         if r["kind"] == "http":
             error_body = r["body"]
             code = r["code"]
-            # 🗑️ 检测到 400 错误且原始 messages 中包含多模态内容，清理并重试
-            if allow_retry and guard_multimodal and code == 400 and _has_multimodal_content(messages):
-                print(
-                    "   🗑️ Anthropic HTTP 400 且上下文含多模态数据，自动清理后重试...",
-                    flush=True
-                )
-                _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
-                _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+            # 🗑️ 检测到 400/413 错误且 messages 中含多模态内容：按错误原因分类处理
+            #   不支持多模态 → 永久降级；图片/请求体过大、原因不明 → 只处理本次
+            if (allow_retry and guard_multimodal and code in (400, 413)
+                    and _has_multimodal_content(messages)):
+                reason = _classify_multimodal_http_error(error_body, code)
+                if reason == "unsupported":
+                    print(
+                        f"   🗑️ Anthropic HTTP {code} 且错误信息指向「不支持图片/多模态」，"
+                        "永久降级：之后图片交给辅助模型或跳过"
+                        f"（错误摘要：{str(error_body)[:160]}）",
+                        flush=True
+                    )
+                    _strip_multimodal(messages)  # 直接修改全局 messages，一劳永逸
+                    _main_model_no_multimodal = True  # 记住：主模型不支持多模态
+                else:
+                    tag = "图片/请求体过大" if reason == "too_large" else "原因不明（保守处理）"
+                    print(
+                        f"   🗑️ Anthropic HTTP {code} 且上下文含多模态数据，判定：{tag}。"
+                        "仅本次剥离图片后重试，**不永久降级**主模型读图能力"
+                        f"（错误摘要：{str(error_body)[:160]}）",
+                        flush=True
+                    )
+                    _strip_multimodal(messages)
                 return _call_anthropic_api(
                     config, messages, tools,
                     allow_retry=False,  # 防止无限递归
                     guard_multimodal=guard_multimodal
                 )
-            raise RuntimeError(f"Anthropic API 请求失败 (HTTP {code}): {error_body}")
         elif r["kind"] == "url":
             if _should_retry_timeout():
                 retry_left = _api_timeout_retry_remaining
@@ -2599,13 +3146,20 @@ def _expire_large_content():
             content_size = len(content)
 
         elif role == "user" and isinstance(content, list):
-            # 多模态 user 消息：content 是 list 结构
-            content_str = json.dumps(content, ensure_ascii=False, sort_keys=True)
-            if len(content_str) <= LARGE_CONTENT_THRESHOLD:
+            # 多模态 user 消息：content 是 list 结构。
+            # ⚠️ 判定必须用「等效字节」（图片按 token 折算），不能按 base64 体积：
+            # 一张 3MiB 图 base64 有 4MB，按体积判必然是"大内容"，50 轮后就被替换成
+            # 「多模态数据已过期」—— 用户视角就是"图莫名其妙不见了"。
+            content_eff = _effective_bytes_of(content)
+            if content_eff <= LARGE_CONTENT_THRESHOLD:
                 continue
-            content_hash = hashlib.md5(content_str.encode()).hexdigest()[:16]
+            # hash 只取「非图片骨架」，避免每轮对几 MB base64 做一次 md5
+            content_hash = hashlib.md5(
+                json.dumps(_shrink_images_for_count(content, [0]),
+                           ensure_ascii=False, sort_keys=True).encode()
+            ).hexdigest()[:16]
             key = f"user_mm:{content_hash}"
-            content_size = len(content_str)
+            content_size = content_eff
 
         if key is None:
             continue
@@ -2726,14 +3280,18 @@ def _squash_tool_calls_automatically(msg_list):
             else:
                 break
 
-    # 🐛 修复：删除不在 keep_indices 中的多模态 user 消息（图片 base64 数据）
-    # 多模态 user 消息的 content 为 list（如图片+文本），纯文本 user 的 content 为 str。
-    # 之前只把 str 类型的纯文本 user 加入了 keep_indices，而多模态 user 既不在
-    # keep_indices 中，也不在 assistant/tool 的删除逻辑里，导致它们无限累积占用上下文。
-    for i, msg in enumerate(msg_list):
-        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            if i not in keep_indices:
-                to_delete.add(i)
+    # 🐛 多模态 user 消息（图片）也要参与压缩，但**只能丢老图，不能连刚注入的一起丢**。
+    # 多模态 user 的 content 是 list（图片+文本），纯文本 user 的 content 是 str。
+    # 之前只有「纯文本 user 进 keep_indices」，多模态既不在 keep_indices、也不在
+    # assistant/tool 的删除逻辑里，会无限累积；后来一刀切全删，又导致"压缩一次，
+    # 刚读进来的图立刻没了"。折中：最近 MULTIMODAL_KEEP_TAIL 条一律保留。
+    MULTIMODAL_KEEP_TAIL = 3
+    mm_idxs = [i for i, m in enumerate(msg_list)
+               if m.get("role") == "user" and isinstance(m.get("content"), list)]
+    keep_mm = set(mm_idxs[-MULTIMODAL_KEEP_TAIL:])
+    for i in mm_idxs:
+        if i not in keep_indices and i not in keep_mm:
+            to_delete.add(i)
 
     if not to_delete:
         return False
@@ -4036,13 +4594,16 @@ def _agent_worker(bus):
                 # 没有工具调用 → AI总结完毕，跳出内层循环
                 if not tool_calls:
                     # 🛡️ 空返回防御：模型啥也没说。
-                    # 若上下文含多模态 → 判定主模型不支持多模态：置标记、剥离毒消息、重试；
+                    # 若上下文含多模态 → 先「剥离本次图片再重试一次」，但**不永久降级**：
+                    #   空返回 ≠ 不支持读图。可能是这张图太大被服务端吞了、超时、
+                    #   或者内容被过滤。永久降级会让之后所有图片都读不了，代价太大。
+                    #   真不支持多模态时，HTTP 层会用 400 + 明确错误信息告诉我们（见分类函数）。
                     # 否则 → 不写入空消息污染历史，提示用户后结束本轮。
                     if not content:
                         if not reasoning_content and _has_multimodal_content(messages):
-                            _main_model_no_multimodal = True  # 记住：主模型不支持多模态
                             print(
-                                "   🗑️ 模型返回空内容且上下文含多模态数据，疑似不支持多模态，自动清理后重试...",
+                                "   🗑️ 模型返回空内容且上下文含多模态数据，先剥离图片后重试一次"
+                                "（**不永久降级**；若反复发生，可让模型调用 set_main_model_multimodal(False) 手动标记）...",
                                 flush=True
                             )
                             _strip_multimodal(messages)
@@ -4199,6 +4760,22 @@ def _agent_worker(bus):
                             result_data["base64"] = image_b64_internal
 
                         _is_url_src = result_data.get("source") == "url"
+
+                        # 👁️ 注入前最后把关：主模型读图上限（max_image_size_byte）
+                        # 源头（read_image / _read_image_from_url）已经拦过一次，
+                        # 这里兜住「配置在运行中被调小」「从旧结果里复活的大图」等情况。
+                        if (result_data.get("success") and not _is_url_src
+                                and result_data.get("base64")):
+                            _raw_bytes = ai_agent_tools.b64_image_bytes(result_data["base64"])
+                            if _raw_bytes > ai_agent_tools.MAX_IMAGE_SIZE:
+                                result_data["success"] = 0
+                                result_data["err"] = (
+                                    f"图片 {ai_agent_tools.format_byte_limit(_raw_bytes)} 超过主模型读图上限 "
+                                    f"{ai_agent_tools.format_byte_limit(ai_agent_tools.MAX_IMAGE_SIZE)}"
+                                    "（ai_agent_config.json 的 max_image_size_byte），已跳过注入"
+                                )
+                                result_data.pop("base64", None)
+
                         if result_data.get("success") and ("base64" in result_data or _is_url_src):
                             # 原多模态注入逻辑（未配置多模态辅助模型，或未传 description）
                             img_base64 = result_data.get("base64", "")
@@ -4295,7 +4872,8 @@ def _agent_worker(bus):
                                 print(f"   ⚠️ 图片读取失败: {result_data.get('err', '未知错误')}", flush=True)
                         continue  # 继续处理其他工具
 
-                    # 📸 MCP 图片：_mcp_images 已在硬截断之前摘出（走内部通道），此处直接取用；
+                    # 📸 MCP 图片：图片 base64 早在工具返回时就走了「内部通道」
+                    # （mcp_call_tool 只回一个 token；这里 strip 时已取回），
                     # 写进上下文的 clean_tool_content 只含纯文本，不含 base64。
                     mcp_images = mcp_images_internal
                     if mcp_images:
@@ -4404,24 +4982,84 @@ def _agent_worker(bus):
                             print(f"   ⚠️ 主模型不支持多模态，跳过 {len(mcp_images)} 张 MCP 图片注入", flush=True)
                             continue  # 跳过正常 tool response 追加（已追加）
 
+                        # 👁️ 主模型读图上限把关（ai_agent_config.json 的 max_image_size_byte）
+                        # 超过上限的图不注入主模型：否则大概率换来 HTTP 400 / 空返回，
+                        # 还白烧一次请求。有辅助模型就交给它读成文本（辅助模型不受限），
+                        # 没有辅助模型就在 tool response 里明确告知——绝不静默丢图。
+                        _limit = ai_agent_tools.MAX_IMAGE_SIZE
+                        _injectable = []
+                        _skipped = []
+                        for _img in mcp_images:
+                            if not isinstance(_img, dict) or not _img.get("base64"):
+                                continue
+                            _raw_bytes = ai_agent_tools.b64_image_bytes(_img["base64"])
+                            if _raw_bytes > _limit:
+                                _skipped.append((_img, _raw_bytes))
+                            else:
+                                _injectable.append((_img, _raw_bytes))
+
+                        _tool_content = clean_tool_content
+                        if _skipped:
+                            _mul_config = ai_agent_tools._build_mul_config()
+                            _notes = []
+                            for _img, _raw_bytes in _skipped:
+                                _size_txt = ai_agent_tools.format_byte_limit(_raw_bytes)
+                                if _mul_config is not None:
+                                    _sub_raw = ai_agent_tools._read_image_via_subagent(
+                                        f"[MCP 工具 {tool_name} 返回的超大图片]",
+                                        _img.get("mimeType", "image/png"),
+                                        _img["base64"], _raw_bytes // 1024,
+                                        "请详细描述这张图片的内容，包括所有可见的文字、物体、布局等细节。",
+                                        _mul_config,
+                                    )
+                                    try:
+                                        _sub = json.loads(_sub_raw)
+                                    except (json.JSONDecodeError, TypeError):
+                                        _sub = {"success": 0, "err": "辅助模型返回解析失败"}
+                                    if _sub.get("success"):
+                                        _notes.append(
+                                            f"（图片 {_size_txt}，超过主模型读图上限，"
+                                            f"已由辅助模型识别）{_sub.get('result', '')}"
+                                        )
+                                    else:
+                                        _notes.append(
+                                            f"（图片 {_size_txt}，超过主模型读图上限，"
+                                            f"辅助模型识别失败：{_sub.get('err', '未知错误')}）"
+                                        )
+                                else:
+                                    _notes.append(
+                                        f"（图片 {_size_txt}，超过主模型读图上限 "
+                                        f"{ai_agent_tools.format_byte_limit(_limit)}，已跳过注入；"
+                                        "如需识别请配置 mul_* 辅助模型，或压缩图片后重试）"
+                                    )
+                            try:
+                                _obj = json.loads(clean_tool_content)
+                                if not isinstance(_obj, dict):
+                                    raise ValueError
+                                _obj["image_notes"] = _notes
+                                _tool_content = json.dumps(_obj, ensure_ascii=False)
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                _tool_content = clean_tool_content + "\n" + "\n".join(_notes)
+                            print(
+                                f"   ⚠️ {len(_skipped)} 张 MCP 图片超过主模型读图上限"
+                                f"（{ai_agent_tools.format_byte_limit(_limit)}），已跳过注入主模型",
+                                flush=True,
+                            )
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool["id"],
                             "name": tool_name,
-                            "content": clean_tool_content
+                            "content": _tool_content
                         })
-                        # 为每张图片注入 role:user 的多模态消息
-                        for img_idx, img in enumerate(mcp_images):
-                            if not isinstance(img, dict):
-                                continue
-                            img_b64 = img.get("base64", "")
-                            img_mime = img.get("mimeType", "image/png")
-                            if not img_b64:
-                                continue
-                            img_size_kb = len(img_b64) * 3 // 4 // 1024
+                        # 为每张「未超限」图片注入 role:user 的多模态消息
+                        for img_idx, (_img, _raw_bytes) in enumerate(_injectable):
+                            img_b64 = _img.get("base64", "")
+                            img_mime = _img.get("mimeType", "image/png")
+                            img_size_kb = _raw_bytes // 1024
                             img_label = f"[MCP 工具 {tool_name} 返回的图片"
-                            if len(mcp_images) > 1:
-                                img_label += f" {img_idx + 1}/{len(mcp_images)}"
+                            if len(_injectable) > 1:
+                                img_label += f" {img_idx + 1}/{len(_injectable)}"
                             img_label += f" ({img_size_kb}KB)]"
                             pending_image_msgs.append({
                                 "role": "user",

@@ -675,13 +675,61 @@ def _merge_mcp_tools():
     return tools
 
 
+# ============================================================
+#  MCP 图片「内部通道」—— 图片 base64 不再随工具结果字符串流转
+# ============================================================
+# 背景：MCP（playwright 截图等）返回的图片是 base64，动辄几百 KB～几 MB。
+# 一旦把 base64 内联进工具结果的 JSON 字符串，任何「字符串级」处理都会踩坑：
+#   - TOOL_RESULT_HARD_LIMIT(512KB 字符) 会把 JSON 拦腰砍断 → 解析失败 → 图片丢失；
+#   - 半截 base64 还会被当成普通文本塞进上下文，白烧 token。
+# 因此这里把图片数据暂存在本模块的内存字典里，工具结果只留一个 token（几百字节）。
+# 上层（主循环）用 take_mcp_images(token) 取回，取一次即销毁；取不到也不影响文本结果。
+_MCP_IMAGE_STASH = {}
+_MCP_IMAGE_STASH_LOCK = threading.Lock()
+_MCP_IMAGE_STASH_MAX = 8          # 最多保留几组，防止异常路径下无限堆积
+_mcp_image_stash_seq = 0
+MCP_IMAGE_REF_KEY = "_mcp_images_ref"
+
+
+def _stash_mcp_images(images):
+    """把一组 MCP 图片放进内部通道，返回 token 字符串（无图返回 None）。"""
+    global _mcp_image_stash_seq
+    if not images:
+        return None
+    with _MCP_IMAGE_STASH_LOCK:
+        _mcp_image_stash_seq += 1
+        token = f"mcpimg-{_mcp_image_stash_seq}"
+        _MCP_IMAGE_STASH[token] = images
+        # 只保留最近 N 组（正常路径下上层会立刻 pop，这里只是断电兜底）
+        while len(_MCP_IMAGE_STASH) > _MCP_IMAGE_STASH_MAX:
+            oldest = next(iter(_MCP_IMAGE_STASH))
+            _MCP_IMAGE_STASH.pop(oldest, None)
+    return token
+
+
+def take_mcp_images(token):
+    """从内部通道取回图片组（取一次即销毁）。token 为空/已取过则返回 None。"""
+    if not token or not isinstance(token, str):
+        return None
+    with _MCP_IMAGE_STASH_LOCK:
+        return _MCP_IMAGE_STASH.pop(token, None)
+
+
+def mcp_image_stash_size():
+    """调试用：当前内部通道里还残留几组图片。"""
+    with _MCP_IMAGE_STASH_LOCK:
+        return len(_MCP_IMAGE_STASH)
+
+
 # MCP 工具调用路由 —— 所有 MCP 工具的调用都会走这个函数
 def mcp_call_tool(tool_name, **arguments):
     """调用 MCP 工具（由 tool_func_map 路由）
-    
-    MCP 工具返回的结果现在是结构化 dict: {"text": "...", "images": [...]}
-    如果包含图片数据，会在返回 JSON 中加入 _mcp_images 字段，
-    供主循环检测并注入多模态 user 消息（类似 read_image 的处理方式）。
+
+    MCP 管理器返回的结果是结构化 dict：{"text": "...", "images": [...]}。
+    图片 base64 **不走字符串**：这里把图片塞进内部通道（见 _stash_mcp_images），
+    工具结果里只留 {"_mcp_images_ref": token, "_mcp_image_count": N}，
+    由主循环用 take_mcp_images() 取回并注入多模态消息。
+    这样无论图片多大，工具结果字符串都只有几百字节，永远不会被硬截断砍坏。
     """
     try:
         mcp = get_mcp_manager()
@@ -697,9 +745,17 @@ def mcp_call_tool(tool_name, **arguments):
             images = result.get("images", [])
             response = {"success": 1, "result": text}
             if images:
-                response["_mcp_images"] = images
-                print(f"   📸 MCP 工具 {tool_name} 返回了 {len(images)} 张图片", flush=True)
-            return json.dumps(response)
+                token = _stash_mcp_images(images)
+                if token:
+                    response[MCP_IMAGE_REF_KEY] = token
+                    response["_mcp_image_count"] = len(images)
+                    total_kb = sum(len(i.get("base64", "")) * 3 // 4 for i in images) // 1024
+                    print(
+                        f"   📸 MCP 工具 {tool_name} 返回了 {len(images)} 张图片"
+                        f"（约 {total_kb}KB，走内部通道，不进工具结果字符串）",
+                        flush=True,
+                    )
+            return json.dumps(response, ensure_ascii=False)
         else:
             # 兼容旧格式（纯字符串）
             return json.dumps({"success": 1, "result": str(result)})
@@ -707,6 +763,9 @@ def mcp_call_tool(tool_name, **arguments):
         err_msg = f"MCP 工具 {tool_name} 调用失败: {e}"
         print(f"   ⚠️ {err_msg}", flush=True)
         return json.dumps({"success": 0, "err": err_msg})
+
+
+# ============================================================
 # ============================================================
 # MCP 进程控制工具 —— 让大模型可以查看和控制 MCP 服务状态
 # ============================================================
@@ -864,6 +923,54 @@ IMAGE_TOOLS = {"read_image"}
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 图片最大 5MB = 5242880 字节
 
 
+def b64_image_bytes(b64_or_len):
+    """base64（或其字符长度）→ 解码后的字节数。
+
+    用于把「base64 字符长度」换算成真实图片字节数：
+    base64 每 4 字符 ≈ 3 字节，所以 len*3//4。
+    """
+    if isinstance(b64_or_len, str):
+        s = b64_or_len
+        if s.startswith("data:"):
+            s = s.partition(",")[2]
+        n = len(s)
+    else:
+        try:
+            n = int(b64_or_len)
+        except (TypeError, ValueError):
+            return 0
+    return max(0, n * 3 // 4)
+
+
+def image_b64_exceeds_limit(b64, limit=None):
+    """判断一张 base64 图片是否超过「主模型读图上限」。
+
+    上限取自 ai_agent_config.json 的 max_image_size_byte（默认 5MB），
+    运行时由 _refresh_tool_limits() 刷新到模块全局 MAX_IMAGE_SIZE。
+
+    注意：这个上限**只约束主模型读图**（把图片注入成多模态消息）。
+    辅助模型（多模态子 Agent）读图不受它限制——子 Agent 请求失败了也不影响主流程。
+    """
+    if limit is None:
+        limit = MAX_IMAGE_SIZE
+    if not b64:
+        return False
+    return b64_image_bytes(b64) > limit
+
+
+def format_byte_limit(n):
+    """把字节数格式化成人看的大小（B/KB/MB）。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1024 * 1024:
+        return f"{n / 1024 / 1024:g}MB"
+    if n >= 1024:
+        return f"{n // 1024}KB"
+    return f"{n}B"
+
+
 def _refresh_tool_limits():
     """从 ai_agent_config.json 读取工具相关阈值，刷新本模块的全局常量。
 
@@ -955,18 +1062,29 @@ def read_image(filepath=None, url=None, description=""):
     if not os.path.exists(filepath):
         return json.dumps({"success": 0, "err": f"文件不存在: {filepath}"})
     
-    # 检查文件大小
-    file_size = os.path.getsize(filepath)
-    if file_size > MAX_IMAGE_SIZE:
-        return json.dumps({
-            "success": 0, 
-            "err": f"图片过大: {file_size // 1024}KB，最大支持 {MAX_IMAGE_SIZE / 1024 / 1024:g}MB"
-        })
-    
     # 猜测 MIME 类型
     mime_type, _ = mimetypes.guess_type(filepath)
     if not mime_type or not mime_type.startswith("image/"):
         return json.dumps({"success": 0, "err": f"不支持的文件类型或不是图片: {filepath} (mime: {mime_type})"})
+    
+    file_size = os.path.getsize(filepath)
+
+    # ---- 🔮 是否走多模态辅助模型（子 Agent 读图）----
+    # 配置了 mul_* 字段且传入了 description 时走辅助模型：
+    #   * 辅助模型读图 **不受 max_image_size_byte 限制**（它自己挂了也不影响主流程，没必要替它挡）；
+    #   * 主模型读图（把图片注入多模态消息）才受限，避免一张巨图把上下文/请求体撑爆。
+    mul_config = _build_mul_config()
+    use_subagent = mul_config is not None and isinstance(description, str) and description.strip()
+
+    if (not use_subagent) and file_size > MAX_IMAGE_SIZE:
+        return json.dumps({
+            "success": 0,
+            "err": (
+                f"图片过大: {file_size // 1024}KB，超过主模型读图上限 {format_byte_limit(MAX_IMAGE_SIZE)}"
+                f"（ai_agent_config.json 的 max_image_size_byte）。"
+                "如需读取更大的图片：压缩后再读，或配置多模态辅助模型（mul_*）并传 description。"
+            )
+        })
     
     try:
         with open(filepath, "rb") as f:
@@ -977,10 +1095,8 @@ def read_image(filepath=None, url=None, description=""):
     b64_size_kb = len(b64) * 3 // 4 // 1024  # base64 解码后的实际大小
     
     # ---- 🔮 多模态辅助模型（子 Agent 读图）模式 ----
-    # 若配置了 mul_* 字段且传入了 description，则调用辅助多模态模型识别图片，
     # 直接返回文本描述（不再注入多模态消息，兼容不支持多模态的主模型）
-    mul_config = _build_mul_config()
-    if mul_config is not None and isinstance(description, str) and description.strip():
+    if use_subagent:
         return _read_image_via_subagent(
             filepath, mime_type, b64, b64_size_kb, description, mul_config
         )
@@ -1005,13 +1121,78 @@ def read_image(filepath=None, url=None, description=""):
     })
 
 
+def _probe_url_image_size(url, timeout=8):
+    """尽力探测网络图片的大小与 MIME（HEAD 优先，失败退化为 Range GET 读首字节）。
+
+    返回 {"known": bool, "size": int, "mime": str}。
+    探测失败不算错误（known=False），按「大小未知」继续走原流程——
+    这里只是为了让 max_image_size_byte 也能管住 URL 源的主模型注入。
+
+    注意：只用于主模型读图把关；辅助模型读图不调用它（不限制大小）。
+    """
+    import urllib.request
+
+    info = {"known": False, "size": 0, "mime": ""}
+
+    def _parse_size(resp):
+        cl = resp.headers.get("Content-Length")
+        if cl and str(cl).isdigit():
+            return int(cl)
+        # Range 请求时服务器可能只给 Content-Range: bytes 0-0/123456
+        cr = resp.headers.get("Content-Range") or ""
+        if "/" in cr:
+            tail = cr.rsplit("/", 1)[-1].strip()
+            if tail.isdigit():
+                return int(tail)
+        return 0
+
+    # 1) HEAD：最便宜，很多静态图服务器都支持
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0"}, method="HEAD"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            size = _parse_size(resp)
+            ct = resp.headers.get_content_type() or ""
+            if size > 0:
+                info["size"] = size
+                info["known"] = True
+            if ct:
+                info["mime"] = ct
+            if info["known"]:
+                return info
+    except Exception:
+        pass
+
+    # 2) Range GET：只取 1 字节，从 Content-Range 里读总大小
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(2)
+            size = _parse_size(resp)
+            ct = resp.headers.get_content_type() or ""
+            if size > 0:
+                info["size"] = size
+                info["known"] = True
+            if ct and not info["mime"]:
+                info["mime"] = ct
+    except Exception:
+        pass
+
+    return info
+
+
 def _read_image_from_url(url, description=""):
     """按 URL 读取网络图片，默认不下载。
 
     - 主模型支持多模态：返回 url 源，由主循环把 http 链接作为 image_url.url，
-      交给多模态 API 在服务端获取（无需本地落盘）。
+      交给多模态 API 在服务端获取（无需本地落盘）；**注入前会按 max_image_size_byte 把关**。
     - 配置了多模态辅助模型且传了 description：调用辅助模型识别；优先把 URL 直接
       交给辅助模型，若其无法获取该 URL，则本地下载后回退为 base64 再识别。
+      辅助模型读图不受 max_image_size_byte 限制。
     """
     import mimetypes
 
@@ -1024,7 +1205,7 @@ def _read_image_from_url(url, description=""):
     if not mime_type or not mime_type.startswith("image/"):
         mime_type = "image/png"
 
-    # ---- 🔮 辅助多模态模型读图模式 ----
+    # ---- 🔮 辅助多模态模型读图模式（不限制图片大小）----
     mul_config = _build_mul_config()
     if mul_config is not None and isinstance(description, str) and description.strip():
         res = _read_image_via_subagent(
@@ -1045,9 +1226,30 @@ def _read_image_from_url(url, description=""):
                 )
         return res
 
+    # ---- 👁️ 主模型注入模式：按 max_image_size_byte 把关 ----
+    # 以前这里完全不设防（免下载直读），服务端拿到多大就得吃多大；
+    # 现在先探测一次大小，超过上限就不注入主模型，避免一张巨图把请求体/上下文撑爆。
+    probe = _probe_url_image_size(url)
+    if probe["mime"] and probe["mime"].startswith("image/"):
+        mime_type = probe["mime"]
+    if probe["known"] and probe["size"] > MAX_IMAGE_SIZE:
+        return json.dumps({
+            "success": 0,
+            "err": (
+                f"网络图片过大: {format_byte_limit(probe['size'])}，超过主模型读图上限 "
+                f"{format_byte_limit(MAX_IMAGE_SIZE)}（ai_agent_config.json 的 max_image_size_byte）。"
+                "如需读取：压缩图片后重传，或配置多模态辅助模型（mul_*）并传 description。"
+            ),
+            "size_kb": probe["size"] // 1024,
+        })
+    if not probe["known"]:
+        print(f"   ⚠️ 无法探测该 URL 图片大小（可能是动态内容），按原样注入: {url}", flush=True)
+
     print(
         f"\n🌐 网络图片已按 URL 读取（免下载，交由多模态 API 服务端获取）\n"
-        f"   URL: {url}\n",
+        f"   URL: {url}\n"
+        f"   大小: {format_byte_limit(probe['size']) if probe['known'] else '未知'}"
+        f"（主模型上限 {format_byte_limit(MAX_IMAGE_SIZE)}）\n",
         flush=True
     )
     return json.dumps({
@@ -1056,7 +1258,7 @@ def _read_image_from_url(url, description=""):
         "url": url,
         "filepath": url,
         "mime": mime_type,
-        "size_kb": 0,
+        "size_kb": probe["size"] // 1024,
         "message": f"已按 URL 读取网络图片（免下载）: {url}",
     })
 
